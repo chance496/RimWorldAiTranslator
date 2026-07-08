@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Defs>
+  <ThingDef>
+    <defName>Codex_TestWorkbench</defName>
+    <label>translation test bench</label>
+    <description>A small workbench used to verify Korean translation output. Requires {0} steel.</description>
+    <comps>
+      <li>
+        <compClass>CompPowerTrader</compClass>
+        <gizmoLabel>toggle test power</gizmoLabel>
+        <gizmoDescription>Turn the translation test bench on or off.</gizmoDescription>
+      </li>
+    </comps>
+  </ThingDef>
+  <JobDef>
+    <defName>Codex_TestJob</defName>
+    <reportString>testing translation at TargetA.</reportString>
+  </JobDef>
+</Defs>
