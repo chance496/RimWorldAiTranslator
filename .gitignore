@@ -1,0 +1,14 @@
+RimWorldAiTranslator.exe
+dist/
+reviews/
+_TranslationAudit/
+*.log
+*.tmp
+*.bak
+*.zip
+*.key
+.env
+.enb
+api-keys.txt
+glossary.ko.json
+glossary.generated.ko.conflicts.csv
