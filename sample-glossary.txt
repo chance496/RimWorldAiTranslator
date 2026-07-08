@@ -1,0 +1,23 @@
+# RimWorld AI Translator - 추가 용어집 샘플
+#
+# 사용법:
+# - 한 줄에 하나씩 적습니다.
+# - # 또는 // 로 시작하는 줄은 무시됩니다.
+# - 지원 형식:
+#   원문=번역
+#   원문 => 번역
+#   원문<Tab>번역<Tab>메모
+#
+# 이 파일은 샘플입니다. 기본 실행은 공식 본편+DLC 용어집만 사용합니다.
+# GUI에서 "추가 용어집 로드"로 이 파일 또는 직접 만든 TXT/JSON 파일을 선택하면 적용됩니다.
+
+Milira=밀리라
+Milira Imperium=밀리라 제국
+Milian=밀리언
+Lustrous Steel=광휘강
+Feather Thread=깃털 원단
+Solar Crystal=태양 수정
+Imperial Token=제국 징표
+Reserves points=예비 점수
+privateer fleet=사선대
+Shroud=장막
