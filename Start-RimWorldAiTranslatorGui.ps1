@@ -25,6 +25,7 @@ $script:lastLogWasSuppressed = $false
 $script:startedAt = $null
 $script:curatedGlossaryPath = ""
 $script:stopRequested = $false
+$script:lastReviewOutputPath = ""
 
 function New-Font([float]$Size, [System.Drawing.FontStyle]$Style = [System.Drawing.FontStyle]::Regular) {
     return New-Object System.Drawing.Font("Malgun Gothic", $Size, $Style)
@@ -221,6 +222,7 @@ function Set-RunningState([bool]$Running) {
     $btnBrowse.Enabled = -not $Running
     $btnGlossary.Enabled = -not $Running
     $btnApplyReview.Enabled = -not $Running
+    $btnOpenReview.Enabled = (-not $Running) -and $script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath)
     $txtModRoot.Enabled = -not $Running
     $txtApiKeys.Enabled = -not $Running
     $txtExtraPrompt.Enabled = -not $Running
@@ -228,6 +230,7 @@ function Set-RunningState([bool]$Running) {
     $chkOverwrite.Enabled = -not $Running
     $chkDryRun.Enabled = -not $Running
     $chkIncludePatches.Enabled = -not $Running
+    $cmbBatchSize.Enabled = -not $Running
 }
 
 function Update-ProgressFromLine([string]$Line) {
@@ -251,6 +254,12 @@ function Update-ProgressFromLine([string]$Line) {
     } elseif ($Line -match "^Pending entries:\s+(.+)$") {
         $lblStatus.Text = "번역 대상: $($matches[1])개"
     } elseif ($Line -match "^Review output:\s+(.+)$") {
+        $script:lastReviewOutputPath = $matches[1].Trim()
+        if (Test-Path -LiteralPath $script:lastReviewOutputPath) {
+            $btnOpenReview.Enabled = $true
+            Add-Log "검토 폴더: $script:lastReviewOutputPath"
+            Add-Log "비교표는 _TranslationAudit 폴더의 comparison.csv 파일입니다."
+        }
         $lblStatus.Text = "리뷰 출력 생성됨"
     }
 }
@@ -291,6 +300,8 @@ function Start-Translation {
     $script:logFileOffset = 0L
     $script:logPartialLine = ""
     $script:lastLogWasSuppressed = $false
+    $script:lastReviewOutputPath = ""
+    $btnOpenReview.Enabled = $false
 
     $promptFile = ""
     if (-not [string]::IsNullOrWhiteSpace($txtExtraPrompt.Text)) {
@@ -312,6 +323,10 @@ function Start-Translation {
         [void]$args.Add("-CuratedGlossaryPath")
         [void]$args.Add($script:curatedGlossaryPath)
     }
+    $batchSize = 40
+    if ($cmbBatchSize.SelectedItem) { $batchSize = [int]$cmbBatchSize.SelectedItem }
+    [void]$args.Add("-BatchSize")
+    [void]$args.Add([string]$batchSize)
     if ($chkReviewOnly.Checked) { [void]$args.Add("-ReviewOnly") }
     if ($chkOverwrite.Checked) { [void]$args.Add("-Overwrite") }
     if ($chkDryRun.Checked) { [void]$args.Add("-DryRun") }
@@ -321,6 +336,7 @@ function Start-Translation {
     Add-Log "번역기를 시작합니다."
     Add-Log "모드: $modRoot"
     Add-Log "API 키: $($keys.Count)개 입력됨. 키 값은 로그에 남기지 않습니다."
+    Add-Log "배치 크기: $batchSize"
     if ($keys.Count -gt 1) { Add-Log "여러 키는 입력 순서를 기준으로 요청 수/제한 상태에 맞춰 순환 사용됩니다." }
     if ($promptFile) { Add-Log "추가 프롬프트가 적용됩니다." }
     if ($script:curatedGlossaryPath) { Add-Log "추가 용어집: $script:curatedGlossaryPath" }
@@ -375,6 +391,21 @@ function Stop-Translation {
     }
 }
 
+function Open-ReviewFolder {
+    if ($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath)) {
+        Start-Process -FilePath "explorer.exe" -ArgumentList "`"$script:lastReviewOutputPath`""
+        return
+    }
+
+    $reviewsRoot = Join-Path $scriptRoot "reviews"
+    if (Test-Path -LiteralPath $reviewsRoot) {
+        Start-Process -FilePath "explorer.exe" -ArgumentList "`"$reviewsRoot`""
+        return
+    }
+
+    [System.Windows.Forms.MessageBox]::Show("아직 열 수 있는 검토 결과 폴더가 없습니다.", "RimWorld AI Translator") | Out-Null
+}
+
 function Apply-ReviewResults {
     if ($script:process -and -not $script:process.HasExited) {
         [System.Windows.Forms.MessageBox]::Show("번역 실행 중에는 검토 결과를 적용할 수 없습니다.", "RimWorld AI Translator") | Out-Null
@@ -394,7 +425,9 @@ function Apply-ReviewResults {
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
     $dlg.Description = "적용할 reviews\\모드명-날짜 검토 결과 폴더를 선택하세요."
     $reviewsRoot = Join-Path $scriptRoot "reviews"
-    if (Test-Path -LiteralPath $reviewsRoot) {
+    if ($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath)) {
+        $dlg.SelectedPath = $script:lastReviewOutputPath
+    } elseif (Test-Path -LiteralPath $reviewsRoot) {
         $dlg.SelectedPath = $reviewsRoot
     }
     if ($dlg.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
@@ -526,14 +559,28 @@ $chkIncludePatches.Size = New-Object System.Drawing.Size(120, 24)
 $chkIncludePatches.BackColor = [System.Drawing.Color]::Transparent
 $chkIncludePatches.Font = New-Font 9
 
-$btnApplyReview = New-Button "검토 결과 적용" 565 370 150 38 ([System.Drawing.Color]::FromArgb(226, 236, 248))
-$btnStart = New-Button "번역 시작" 735 370 120 38 ([System.Drawing.Color]::FromArgb(226, 244, 230))
-$btnStop = New-Button "중지" 865 370 80 38 ([System.Drawing.Color]::FromArgb(245, 224, 224))
+$lblBatchSize = New-Label "배치" 555 335 42 24 ([System.Drawing.Color]::FromArgb(70, 70, 70)) 9
+$cmbBatchSize = New-Object System.Windows.Forms.ComboBox
+$cmbBatchSize.Location = New-Object System.Drawing.Point(595, 332)
+$cmbBatchSize.Size = New-Object System.Drawing.Size(80, 28)
+$cmbBatchSize.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$cmbBatchSize.Font = New-Font 9
+[void]$cmbBatchSize.Items.Add("40")
+[void]$cmbBatchSize.Items.Add("60")
+[void]$cmbBatchSize.Items.Add("80")
+$cmbBatchSize.SelectedItem = "40"
+
+$btnOpenReview = New-Button "검토 폴더 열기" 520 370 130 38 ([System.Drawing.Color]::FromArgb(232, 238, 248))
+$btnApplyReview = New-Button "검토 결과 적용" 655 370 145 38 ([System.Drawing.Color]::FromArgb(226, 236, 248))
+$btnStart = New-Button "번역 시작" 815 370 95 38 ([System.Drawing.Color]::FromArgb(226, 244, 230))
+$btnStop = New-Button "중지" 915 370 60 38 ([System.Drawing.Color]::FromArgb(245, 224, 224))
+$btnOpenReview.Enabled = $false
 $btnStop.Enabled = $false
+$btnOpenReview.Add_Click({ Open-ReviewFolder })
 $btnApplyReview.Add_Click({ Apply-ReviewResults })
 $btnStart.Add_Click({ Start-Translation })
 $btnStop.Add_Click({ Stop-Translation })
-$form.Controls.AddRange(@($chkReviewOnly, $chkOverwrite, $chkDryRun, $chkIncludePatches, $btnApplyReview, $btnStart, $btnStop))
+$form.Controls.AddRange(@($chkReviewOnly, $chkOverwrite, $chkDryRun, $chkIncludePatches, $lblBatchSize, $cmbBatchSize, $btnOpenReview, $btnApplyReview, $btnStart, $btnStop))
 
 $lblProgress = New-Label "진행도 및 Debug" 55 420 170 24 ([System.Drawing.Color]::FromArgb(20, 20, 20)) 10.5 ([System.Drawing.FontStyle]::Bold)
 $lblStatus = New-Label "대기 중" 225 422 720 24 ([System.Drawing.Color]::FromArgb(70, 70, 70)) 9
@@ -578,6 +625,10 @@ $timer.Add_Tick({
         } elseif ($exitCode -eq 0) {
             if ($progress.Maximum -gt 0) { $progress.Value = $progress.Maximum }
             $lblStatus.Text = "완료"
+            if ($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath)) {
+                Add-Log "검토 결과 폴더를 엽니다."
+                Start-Process -FilePath "explorer.exe" -ArgumentList "`"$script:lastReviewOutputPath`""
+            }
         } else {
             $lblStatus.Text = "종료 코드 $exitCode"
         }
@@ -603,6 +654,7 @@ Add-Log "1. 모드 폴더를 선택하거나 위 칸에 드래그하세요."
 Add-Log "2. API 키는 한 줄에 하나씩 입력하세요. 여러 개면 입력 순서를 기준으로 순환 사용합니다."
 Add-Log "3. 추가 프롬프트와 추가 용어집은 선택 사항입니다. 기본은 공식 본편+DLC 용어집만 사용합니다."
 Add-Log "4. 바로 쓰기가 부담되면 먼저 Dry run 또는 비교/검토 모드로 확인하세요."
-Add-Log "5. 검토 결과가 마음에 들면 검토 결과 적용 버튼으로 안전 후보만 적용할 수 있습니다."
+Add-Log "5. 비교/검토가 끝나면 검토 폴더가 열립니다. comparison.csv로 비교하세요."
+Add-Log "6. 검토 결과가 마음에 들면 검토 결과 적용 버튼으로 안전 후보만 적용할 수 있습니다."
 
 [void][System.Windows.Forms.Application]::Run($form)
