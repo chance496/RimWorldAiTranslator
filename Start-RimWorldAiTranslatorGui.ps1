@@ -20,6 +20,7 @@ $script:tempFiles = New-Object "System.Collections.Generic.List[string]"
 $script:logFilePath = ""
 $script:logFileOffset = 0L
 $script:logPartialLine = ""
+$script:lastLogWasSuppressed = $false
 $script:startedAt = $null
 $script:curatedGlossaryPath = ""
 $script:stopRequested = $false
@@ -144,8 +145,31 @@ function Stop-ProcessTree([int]$ProcessId) {
     }
 }
 
+function ConvertTo-GuiLogLine([string]$Text) {
+    if ($null -eq $Text) { return "" }
+    $line = $Text.TrimEnd()
+    if ([string]::IsNullOrWhiteSpace($line)) { return "" }
+
+    if ($line -match '^\s*\{"translations"\s*:\s*\[') {
+        return "[로그 축약] 모델 응답 원문은 숨겼습니다. 재시도 로그와 감사 파일을 확인하세요."
+    }
+    if ($line -match '(\\u000a\s*){6,}') {
+        return "[로그 축약] 모델 응답의 반복 개행 escape를 숨겼습니다."
+    }
+    if ($line.Length -gt 1000) {
+        return $line.Substring(0, 1000) + "... [로그 축약]"
+    }
+    return $line
+}
+
 function Add-Log([string]$Text) {
     if ($null -eq $Text) { return }
+    $Text = ConvertTo-GuiLogLine $Text
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    $isSuppressed = $Text.StartsWith("[로그 축약]", [System.StringComparison]::Ordinal)
+    if ($isSuppressed -and $script:lastLogWasSuppressed) { return }
+    $script:lastLogWasSuppressed = $isSuppressed
+
     $stamp = Get-Date -Format "HH:mm:ss"
     $txtLog.AppendText("[$stamp] $Text`r`n")
     $txtLog.SelectionStart = $txtLog.TextLength
@@ -264,6 +288,7 @@ function Start-Translation {
     $script:logFilePath = $logFile
     $script:logFileOffset = 0L
     $script:logPartialLine = ""
+    $script:lastLogWasSuppressed = $false
 
     $promptFile = ""
     if (-not [string]::IsNullOrWhiteSpace($txtExtraPrompt.Text)) {

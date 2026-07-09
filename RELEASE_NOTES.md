@@ -1,3 +1,12 @@
+# RimWorld AI Translator v0.1.4
+
+## Fixes
+
+- Reduced the default batch size from 80 to 40 to lower malformed JSON risk on long description-heavy mods.
+- Added automatic split retry: if a batch keeps returning malformed JSON or missing ids, it is retried as smaller half-batches down to single entries.
+- The GUI now hides raw model JSON dumps and repeated `\u000a` escape spam from the debug log.
+- Added prompt guardrails against padding blank lines and repeated newline escapes without imposing a hard translation length limit.
+
 # RimWorld AI Translator v0.1.3
 
 ## Fixes

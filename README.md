@@ -120,7 +120,7 @@ powershell -ExecutionPolicy Bypass -File ".\Invoke-RimWorldAiTranslation.ps1" `
 -DailyTokenBudgetPerKey 1000000     # 실행 중 키별 일일 예산 가드
 -MaxInputTokensPerBatch 5500        # 5 RPM에서 30k TPM을 넘기지 않기 위한 기본 배치 크기
 -MaxCompletionTokens 32000          # 무료 티어 최대 출력
--BatchSize 80
+-BatchSize 40
 -Overwrite
 -DryRun
 -MockTranslations

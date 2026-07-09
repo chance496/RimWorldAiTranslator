@@ -12,7 +12,7 @@ param(
     [int]$RequestsPerMinutePerKey = 5,
     [int]$InputTokensPerMinutePerKey = 30000,
     [int]$DailyTokenBudgetPerKey = 1000000,
-    [int]$BatchSize = 80,
+    [int]$BatchSize = 40,
     [int]$MaxInputCharsPerBatch = 12000,
     [int]$MaxInputTokensPerBatch = 5500,
     [int]$MaxCompletionTokens = 32000,
@@ -569,6 +569,8 @@ Rules:
 - Preserve placeholders and markup exactly: {0}, {PAWN_nameDef}, [pawn_nameDef], `$variable, <color=...>, </color>, \n, %, and XML-like tags.
 - Keep label fields short, usually a noun phrase.
 - Use polite declarative Korean for descriptions and letters when appropriate.
+- Preserve meaningful line breaks, but never add padding blank lines or more than two consecutive \n escapes.
+- Do not output repeated \u000a escapes.
 - Keep RimWorld/DLC terms consistent with the glossary.
 - If a value is already a proper noun, keep the proper noun or transliterate naturally.
 - Do not add comments, explanations, markdown, or missing ids.
@@ -1056,6 +1058,71 @@ function Test-ContainsKorean([string]$Text) {
     return $Text -match "[\uAC00-\uD7AF]"
 }
 
+function Invoke-TranslationBatchWithSplit([object[]]$Batch, [string]$Label, [int]$Depth = 0) {
+    $batch = @($Batch)
+    if ($batch.Count -eq 0) { return @{} }
+
+    if ($MockTranslations) {
+        $mockMap = @{}
+        foreach ($entry in $batch) {
+            $mockMap[$entry.Id] = "MOCK: $($entry.Text)"
+        }
+        return $mockMap
+    }
+
+    $body = New-RequestBody `
+        -Model $Model `
+        -SystemPrompt (New-SystemPrompt -GlossaryText (Convert-GlossaryToPrompt (Select-GlossaryTermsForBatch -Terms $glossary -Batch $batch -MaxAlways $MaxAlwaysGlossaryTerms -MaxGenerated $MaxGeneratedGlossaryTermsPerBatch)) -ExtraPrompt $ExtraPrompt) `
+        -UserPayload (New-UserPayload $batch) `
+        -MaxCompletionTokens $MaxCompletionTokens `
+        -NoStructuredOutputs:$NoStructuredOutputs
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $response = Invoke-CerebrasChat `
+                -ChatUrl $chatUrl `
+                -Body $body `
+                -KeyStates $keyStates `
+                -RequestsPerMinutePerKey $RequestsPerMinutePerKey `
+                -InputTokensPerMinutePerKey $InputTokensPerMinutePerKey `
+                -DailyTokenBudgetPerKey $DailyTokenBudgetPerKey `
+                -TimeoutSec $TimeoutSec `
+                -MaxRetries $MaxRetries
+            $map = ConvertTo-TranslationMap $response
+            $missingIds = @($batch | Where-Object { -not $map.ContainsKey($_.Id) })
+            if ($missingIds.Count -eq 0) { return $map }
+
+            $sampleMissing = [string]::Join(", ", @($missingIds | Select-Object -First 5 | ForEach-Object { $_.Id }))
+            throw "Model response missed $($missingIds.Count) ids in $Label. Missing sample: $sampleMissing"
+        } catch {
+            $lastError = $_
+            if ($attempt -lt $MaxRetries) {
+                Write-Warning "Batch $Label failed on attempt $attempt; retrying. $(Format-CompactError $_)"
+                Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
+            }
+        }
+    }
+
+    if ($batch.Count -gt 1) {
+        $leftCount = [int][Math]::Ceiling($batch.Count / 2.0)
+        $left = @($batch[0..($leftCount - 1)])
+        $right = @($batch[$leftCount..($batch.Count - 1)])
+        Write-Warning ("Batch {0} failed after {1} attempts; splitting {2} entries into {3}+{4}. {5}" -f $Label, $MaxRetries, $batch.Count, $left.Count, $right.Count, (Format-CompactError $lastError))
+
+        $merged = @{}
+        $leftMap = Invoke-TranslationBatchWithSplit -Batch $left -Label "$Label.1" -Depth ($Depth + 1)
+        foreach ($key in $leftMap.Keys) { $merged[$key] = $leftMap[$key] }
+
+        $rightMap = Invoke-TranslationBatchWithSplit -Batch $right -Label "$Label.2" -Depth ($Depth + 1)
+        foreach ($key in $rightMap.Keys) { $merged[$key] = $rightMap[$key] }
+
+        return $merged
+    }
+
+    throw "Batch $Label failed at single-entry fallback. $(Format-CompactError $lastError)"
+}
+
 function New-ReviewRunRoot([string]$BaseRoot, [string]$ModFullPath, [string]$Stamp) {
     $leaf = Split-Path -Leaf $ModFullPath
     if (-not $leaf) { $leaf = "mod" }
@@ -1174,43 +1241,7 @@ $skippedUnsafe = 0
 for ($i = 0; $i -lt $batches.Count; $i++) {
     $batch = @($batches[$i])
     Write-Host ("Translating batch {0}/{1} ({2} entries)..." -f ($i + 1), $batches.Count, $batch.Count)
-
-    $map = $null
-    if ($MockTranslations) {
-        $map = @{}
-        foreach ($entry in $batch) {
-            $map[$entry.Id] = "MOCK: $($entry.Text)"
-        }
-    } else {
-        $body = New-RequestBody `
-            -Model $Model `
-            -SystemPrompt (New-SystemPrompt -GlossaryText (Convert-GlossaryToPrompt (Select-GlossaryTermsForBatch -Terms $glossary -Batch $batch -MaxAlways $MaxAlwaysGlossaryTerms -MaxGenerated $MaxGeneratedGlossaryTermsPerBatch)) -ExtraPrompt $ExtraPrompt) `
-            -UserPayload (New-UserPayload $batch) `
-            -MaxCompletionTokens $MaxCompletionTokens `
-            -NoStructuredOutputs:$NoStructuredOutputs
-
-        for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
-            try {
-                $response = Invoke-CerebrasChat `
-                    -ChatUrl $chatUrl `
-                    -Body $body `
-                    -KeyStates $keyStates `
-                    -RequestsPerMinutePerKey $RequestsPerMinutePerKey `
-                    -InputTokensPerMinutePerKey $InputTokensPerMinutePerKey `
-                    -DailyTokenBudgetPerKey $DailyTokenBudgetPerKey `
-                    -TimeoutSec $TimeoutSec `
-                    -MaxRetries $MaxRetries
-                $map = ConvertTo-TranslationMap $response
-                $missingIds = @($batch | Where-Object { -not $map.ContainsKey($_.Id) })
-                if ($missingIds.Count -eq 0) { break }
-                Write-Warning "Model response missed $($missingIds.Count) ids; retrying batch."
-            } catch {
-                if ($attempt -ge $MaxRetries) { throw }
-                Write-Warning "Batch parse/request failed on attempt $attempt; retrying. $(Format-CompactError $_)"
-                Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
-            }
-        }
-    }
+    $map = Invoke-TranslationBatchWithSplit -Batch $batch -Label ("{0}/{1}" -f ($i + 1), $batches.Count)
 
     foreach ($entry in $batch) {
         $translated = if ($map -and $map.ContainsKey($entry.Id)) { [string]$map[$entry.Id] } else { [string]$entry.Text }
