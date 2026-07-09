@@ -1,0 +1,162 @@
+name: Apply API key input cleanup
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/apply-api-key-cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch source files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = @'
+          from pathlib import Path
+
+          def read(path, encoding='utf-8'):
+              return Path(path).read_text(encoding=encoding)
+
+          def write(path, text, encoding='utf-8'):
+              Path(path).write_text(text, encoding=encoding, newline='')
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  if new in text:
+                      return text
+                  raise SystemExit(f'missing expected block: {label}')
+              return text.replace(old, new, 1)
+
+          invoke = read('Invoke-RimWorldAiTranslation.ps1')
+          invoke = replace_once(
+              invoke,
+              '    [string[]]$ApiKey = @(),\n    [string]$ApiKeyFile,\n',
+              '    [string[]]$ApiKey = @(),\n',
+              'Invoke param ApiKeyFile'
+          )
+          invoke = replace_once(
+              invoke,
+              'function Get-ApiKeys([string[]]$ApiKey, [string]$ApiKeyFile) {',
+              'function Get-ApiKeys([string[]]$ApiKey) {',
+              'Get-ApiKeys signature'
+          )
+          invoke = replace_once(
+              invoke,
+              '    if ($ApiKeyFile) {\n        if (-not (Test-Path -LiteralPath $ApiKeyFile)) { throw "API key file not found: $ApiKeyFile" }\n        foreach ($line in [System.IO.File]::ReadAllLines((Resolve-Path -LiteralPath $ApiKeyFile).Path)) {\n            Add-ApiKeyCandidate $all $line\n        }\n    }\n',
+              '',
+              'ApiKeyFile read block'
+          )
+          invoke = replace_once(
+              invoke,
+              '$keys = Get-ApiKeys -ApiKey $ApiKey -ApiKeyFile $ApiKeyFile',
+              '$keys = Get-ApiKeys -ApiKey $ApiKey',
+              'Get-ApiKeys call'
+          )
+          invoke = replace_once(
+              invoke,
+              'throw "No API key provided. Use -ApiKey, -ApiKeyFile, CEREBRAS_API_KEY, or RIMWORLD_TRANSLATOR_API_KEYS."',
+              'throw "No API key provided. Enter keys in the GUI or use -ApiKey, CEREBRAS_API_KEY, or RIMWORLD_TRANSLATOR_API_KEYS."',
+              'missing API key message'
+          )
+          write('Invoke-RimWorldAiTranslation.ps1', invoke)
+
+          gui = read('Start-RimWorldAiTranslatorGui.ps1', encoding='utf-8-sig')
+          gui = replace_once(
+              gui,
+              '    $keyFile = New-TempFilePath "api-keys" ".txt"\n    [System.IO.File]::WriteAllLines($keyFile, $keys, [System.Text.UTF8Encoding]::new($false))\n    [void]$script:tempFiles.Add($keyFile)\n',
+              '',
+              'GUI temp key file block'
+          )
+          gui = replace_once(
+              gui,
+              '    foreach ($item in @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $translatorScript, "-ModRoot", $modRoot, "-ApiKeyFile", $keyFile, "-LanguageFolderName", "Korean", "-MaxGeneratedGlossaryTermsPerBatch", "40")) {',
+              '    foreach ($item in @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $translatorScript, "-ModRoot", $modRoot, "-LanguageFolderName", "Korean", "-MaxGeneratedGlossaryTermsPerBatch", "40")) {',
+              'GUI command args'
+          )
+          gui = replace_once(
+              gui,
+              '    $psi.CreateNoWindow = $true\n',
+              '    $psi.CreateNoWindow = $true\n    if ($keys.Count -gt 0) {\n        $psi.EnvironmentVariables["RIMWORLD_TRANSLATOR_API_KEYS"] = [string]::Join("`n", $keys)\n    }\n',
+              'GUI environment key forwarding'
+          )
+          write('Start-RimWorldAiTranslatorGui.ps1', gui, encoding='utf-8-sig')
+
+          readme = read('README.md')
+          readme = replace_once(
+              readme,
+              'GUI에서 API 키는 한 줄에 하나씩 입력합니다. 여러 키를 넣으면 입력 순서를 기준으로 요청 수와 무료 티어 제한 상태에 맞춰 순환 사용합니다. 추가 프롬프트는 오른쪽 입력칸에 적고, 모드별 수동 용어집이 필요할 때만 `추가 용어집 로드`로 TXT/TSV/CSV/JSON 파일을 선택합니다.\n\n현재 키 파일이 `E:\\SteamLibrary\\steamapps\\common\\RimWorld\\Mods\\.enb`에 있고, `key=...` 형식이면 그대로 사용할 수 있습니다.\n\n```powershell\npowershell -ExecutionPolicy Bypass -File ".\\Invoke-RimWorldAiTranslation.ps1" `\n  -ModRoot "E:\\SteamLibrary\\steamapps\\workshop\\content\\294100\\모드ID" `\n  -ApiKeyFile "E:\\SteamLibrary\\steamapps\\common\\RimWorld\\Mods\\.enb"\n```\n\n여러 계정/키를 쓰려면 키 파일에 여러 줄로 넣으면 됩니다.\n\n```text\nkey=csk-첫번째키\nkey=csk-두번째키\n```\n\n또는 키만 한 줄씩 넣어도 됩니다.\n\n```text\ncsk-첫번째키\ncsk-두번째키\n```',
+              'GUI에서 API 키는 한 줄에 하나씩 입력합니다. 여러 키를 넣으면 입력 순서를 기준으로 요청 수와 무료 티어 제한 상태에 맞춰 순환 사용합니다. 추가 프롬프트는 오른쪽 입력칸에 적고, 모드별 수동 용어집이 필요할 때만 `추가 용어집 로드`로 TXT/TSV/CSV/JSON 파일을 선택합니다.\n\n```powershell\npowershell -ExecutionPolicy Bypass -File ".\\Invoke-RimWorldAiTranslation.ps1" `\n  -ModRoot "E:\\SteamLibrary\\steamapps\\workshop\\content\\294100\\모드ID" `\n  -ApiKey "csk-..."\n```\n\nCLI에서 여러 계정/키를 쓰려면 `-ApiKey`를 여러 번 넘기거나 `RIMWORLD_TRANSLATOR_API_KEYS` 환경변수에 줄바꿈으로 넣으면 됩니다.\n\n```powershell\n$env:RIMWORLD_TRANSLATOR_API_KEYS = @"\ncsk-첫번째키\ncsk-두번째키\n"@\n```',
+              'README API key file section'
+          )
+          readme = replace_once(
+              readme,
+              '  -ApiKeyFile "E:\\SteamLibrary\\steamapps\\common\\RimWorld\\Mods\\.enb" `',
+              '  -ApiKey "csk-..." `',
+              'README review example API option'
+          )
+          write('README.md', readme)
+
+          build = read('build-package.ps1')
+          build = build.replace('    "api-keys.example.txt",\n', '')
+          write('build-package.ps1', build)
+
+          notes = read('RELEASE_NOTES.md')
+          if not notes.startswith('# RimWorld AI Translator v0.1.1'):
+              notes = '# RimWorld AI Translator v0.1.1\n\n## Changes\n\n- Removed the `-ApiKeyFile` option and key-file documentation.\n- The GUI now passes API keys to the translator process through an environment variable instead of writing a temporary key file.\n- Removed `api-keys.example.txt` from the release package.\n\n' + notes
+          write('RELEASE_NOTES.md', notes)
+
+          Path('api-keys.example.txt').unlink(missing_ok=True)
+          Path('.github/workflows/apply-api-key-cleanup.yml').unlink(missing_ok=True)
+          '@
+          Set-Content -LiteralPath _patch_api_key_cleanup.py -Value $script -Encoding UTF8
+          python _patch_api_key_cleanup.py
+          Remove-Item -LiteralPath _patch_api_key_cleanup.py -Force
+
+      - name: Validate scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('Invoke-RimWorldAiTranslation.ps1', 'Start-RimWorldAiTranslatorGui.ps1', 'build-package.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { throw "$file parse errors: $($errors | ForEach-Object Message -join '; ')" }
+          }
+          if (Select-String -Path 'Invoke-RimWorldAiTranslation.ps1','Start-RimWorldAiTranslatorGui.ps1','README.md','build-package.ps1' -Pattern 'ApiKeyFile|api-keys\.example|키 파일|\.enb' -Quiet) {
+            throw 'Removed API key file references are still present.'
+          }
+
+      - name: Commit cleanup
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if (git diff --cached --quiet) {
+            Write-Host 'No changes to commit.'
+          } else {
+            git commit -m "Remove API key file support"
+            git push
+          }
+
+      - name: Build release package
+        shell: powershell
+        run: .\build-package.ps1
+
+      - name: Publish v0.1.1 release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.1.1 dist/RimWorldAiTranslator.zip --title "RimWorld AI Translator v0.1.1" --notes-file RELEASE_NOTES.md --latest
