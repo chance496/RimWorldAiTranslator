@@ -53,6 +53,17 @@ csk-두번째키
 -LanguageFolderName "Korean (한국어)"
 ```
 
+## 번역 범위와 한계
+
+이 도구는 림월드의 일반적인 LanguageData 구조를 우선 처리합니다.
+
+- `Languages\<언어>\Keyed`와 `DefInjected` 원문이 있으면 같은 구조로 한국어 파일을 만듭니다.
+- 원본 LanguageData가 없어도 `Defs` 안의 `label`, `description`, `jobString`, `reportString`, `gizmoLabel`, `letterText` 같은 XML 필드는 추출해 번역합니다.
+- DLL/C# 코드가 `GetInspectString()`, gizmo, 상태 표시문에서 영어 문장을 직접 반환하는 경우에는 단순 XML 키 생성만으로 번역할 수 없습니다. 예를 들어 선택창 왼쪽 아래 inspect 패널에 뜨는 `Tactical marker: searching` 같은 런타임 문자열이 여기에 해당할 수 있습니다.
+- 모드 코드가 `"SomeKey".Translate()`처럼 번역 키를 조회하도록 만들어져 있다면 `Keyed` XML 추가로 해결할 수 있지만, 코드에 원문이 하드코딩되어 있으면 원본 DLL 수정, 모드 제작자의 번역 키 추가, 또는 별도 Harmony 패치가 필요합니다.
+
+따라서 자동 번역 후에는 `-DryRun`, `-ReviewOnly`, 게임 안 확인을 같이 사용하는 것을 권장합니다.
+
 ## 공식 용어집
 
 `glossary.generated.ko.json`은 림월드 본편과 공식 DLC의 한국어 tar에서 생성한 용어집입니다. RMK/워크샵 모드 용어는 기본적으로 포함하지 않습니다.
