@@ -3,7 +3,7 @@ RimWorld AI Translator 패키지
 실행:
 1. RimWorldAiTranslator.exe 를 더블클릭합니다.
 2. 모드 폴더 위치를 선택합니다.
-3. Cerebras API 키를 입력합니다. 여러 키는 한 줄에 하나씩 입력합니다.
+3. API 키 입력 칸에 Cerebras API 키를 입력합니다. 여러 키는 Enter로 줄을 나눠 넣습니다. 키 파일은 만들 필요가 없습니다.
 4. 필요하면 추가 프롬프트나 sample-glossary.txt를 로드합니다.
 5. 처음에는 Dry run 또는 비교/검토 모드로 확인하는 것을 권장합니다.
 
