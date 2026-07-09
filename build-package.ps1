@@ -48,7 +48,6 @@ $packageFiles = @(
     "Build-RimWorldGlossary.ps1",
     "glossary.generated.ko.json",
     "sample-glossary.txt",
-    "api-keys.example.txt",
     "README.md",
     "PACKAGE_README.txt",
     "LICENSE"

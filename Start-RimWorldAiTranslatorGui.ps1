@@ -222,9 +222,6 @@ function Start-Translation {
     Remove-TempFiles
     Clear-EventSubscriptions
 
-    $keyFile = New-TempFilePath "api-keys" ".txt"
-    [System.IO.File]::WriteAllLines($keyFile, $keys, [System.Text.UTF8Encoding]::new($false))
-    [void]$script:tempFiles.Add($keyFile)
     $logFile = New-TempFilePath "run-output" ".log"
     [System.IO.File]::WriteAllText($logFile, "", [System.Text.UTF8Encoding]::new($false))
     [void]$script:tempFiles.Add($logFile)
@@ -240,7 +237,7 @@ function Start-Translation {
     }
 
     $args = New-Object "System.Collections.Generic.List[string]"
-    foreach ($item in @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $translatorScript, "-ModRoot", $modRoot, "-ApiKeyFile", $keyFile, "-LanguageFolderName", "Korean", "-MaxGeneratedGlossaryTermsPerBatch", "40")) {
+    foreach ($item in @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $translatorScript, "-ModRoot", $modRoot, "-LanguageFolderName", "Korean", "-MaxGeneratedGlossaryTermsPerBatch", "40")) {
         [void]$args.Add($item)
     }
     if ($promptFile) {
@@ -279,6 +276,9 @@ function Start-Translation {
     $psi.RedirectStandardOutput = $false
     $psi.RedirectStandardError = $false
     $psi.CreateNoWindow = $true
+    if ($keys.Count -gt 0) {
+        $psi.EnvironmentVariables["RIMWORLD_TRANSLATOR_API_KEYS"] = [string]::Join("`n", $keys)
+    }
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi

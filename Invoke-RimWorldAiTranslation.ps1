@@ -3,7 +3,6 @@ param(
     [string]$ModRoot,
 
     [string[]]$ApiKey = @(),
-    [string]$ApiKeyFile,
 
     [string]$BaseUrl = "https://api.cerebras.ai/v1",
     [string]$Model = "gemma-4-31b",
@@ -665,16 +664,10 @@ function Add-ApiKeyCandidate([System.Collections.Generic.List[string]]$List, [st
     }
 }
 
-function Get-ApiKeys([string[]]$ApiKey, [string]$ApiKeyFile) {
+function Get-ApiKeys([string[]]$ApiKey) {
     $all = New-Object "System.Collections.Generic.List[string]"
     foreach ($key in $ApiKey) {
         Add-ApiKeyCandidate $all $key
-    }
-    if ($ApiKeyFile) {
-        if (-not (Test-Path -LiteralPath $ApiKeyFile)) { throw "API key file not found: $ApiKeyFile" }
-        foreach ($line in [System.IO.File]::ReadAllLines((Resolve-Path -LiteralPath $ApiKeyFile).Path)) {
-            Add-ApiKeyCandidate $all $line
-        }
     }
     if ($env:CEREBRAS_API_KEY) { Add-ApiKeyCandidate $all $env:CEREBRAS_API_KEY }
     if ($env:RIMWORLD_TRANSLATOR_API_KEYS) {
@@ -1089,9 +1082,9 @@ Write-Host "Model: $Model"
 Write-Host "Free-tier guardrails: $RequestsPerMinutePerKey requests/min/key, $InputTokensPerMinutePerKey input tokens/min/key, $DailyTokenBudgetPerKey total tokens/day/key, $MaxCompletionTokens max output tokens"
 Write-Host "Glossary terms loaded: $($glossary.Count) total, $(@($glossary | Where-Object { $_.alwaysInclude }).Count) always-on, $MaxGeneratedGlossaryTermsPerBatch generated terms max/batch"
 
-$keys = Get-ApiKeys -ApiKey $ApiKey -ApiKeyFile $ApiKeyFile
+$keys = Get-ApiKeys -ApiKey $ApiKey
 if (-not $DryRun -and -not $MockTranslations -and $keys.Count -eq 0) {
-    throw "No API key provided. Use -ApiKey, -ApiKeyFile, CEREBRAS_API_KEY, or RIMWORLD_TRANSLATOR_API_KEYS."
+    throw "No API key provided. Enter keys in the GUI or use -ApiKey, CEREBRAS_API_KEY, or RIMWORLD_TRANSLATOR_API_KEYS."
 }
 if ($keys.Count -gt 0) { Write-Host "API keys loaded: $($keys.Count)" }
 if ($keys.Count -gt 1) { Write-Host "API key rotation: input order, balanced by per-key request/token availability." }

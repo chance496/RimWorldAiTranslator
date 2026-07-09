@@ -1,3 +1,11 @@
+# RimWorld AI Translator v0.1.1
+
+## Changes
+
+- Removed the `-ApiKeyFile` option and key-file documentation.
+- The GUI now passes API keys to the translator process through an environment variable instead of writing a temporary key file.
+- Removed `api-keys.example.txt` from the release package.
+
 # RimWorld AI Translator v0.1.0
 
 Initial public release.
