@@ -1,3 +1,9 @@
+# RimWorld AI Translator v0.1.7
+
+## Changes
+
+- Removed the batch-size dropdown and fixed GUI runs at the stable batch size of 40.
+
 # RimWorld AI Translator v0.1.6
 
 ## Changes
@@ -5,7 +11,6 @@
 - Review-only runs now open the generated review folder automatically when they finish successfully.
 - Added a `검토 폴더 열기` button to reopen the latest review folder from the GUI.
 - The GUI log now points users to `_TranslationAudit\*-comparison.csv` for side-by-side review.
-- Added a GUI batch-size dropdown for 40, 60, or 80 entries per request.
 
 # RimWorld AI Translator v0.1.5
 

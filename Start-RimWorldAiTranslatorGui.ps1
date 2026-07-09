@@ -230,7 +230,6 @@ function Set-RunningState([bool]$Running) {
     $chkOverwrite.Enabled = -not $Running
     $chkDryRun.Enabled = -not $Running
     $chkIncludePatches.Enabled = -not $Running
-    $cmbBatchSize.Enabled = -not $Running
 }
 
 function Update-ProgressFromLine([string]$Line) {
@@ -323,10 +322,8 @@ function Start-Translation {
         [void]$args.Add("-CuratedGlossaryPath")
         [void]$args.Add($script:curatedGlossaryPath)
     }
-    $batchSize = 40
-    if ($cmbBatchSize.SelectedItem) { $batchSize = [int]$cmbBatchSize.SelectedItem }
     [void]$args.Add("-BatchSize")
-    [void]$args.Add([string]$batchSize)
+    [void]$args.Add("40")
     if ($chkReviewOnly.Checked) { [void]$args.Add("-ReviewOnly") }
     if ($chkOverwrite.Checked) { [void]$args.Add("-Overwrite") }
     if ($chkDryRun.Checked) { [void]$args.Add("-DryRun") }
@@ -336,7 +333,7 @@ function Start-Translation {
     Add-Log "번역기를 시작합니다."
     Add-Log "모드: $modRoot"
     Add-Log "API 키: $($keys.Count)개 입력됨. 키 값은 로그에 남기지 않습니다."
-    Add-Log "배치 크기: $batchSize"
+    Add-Log "배치 크기: 40 (고정)"
     if ($keys.Count -gt 1) { Add-Log "여러 키는 입력 순서를 기준으로 요청 수/제한 상태에 맞춰 순환 사용됩니다." }
     if ($promptFile) { Add-Log "추가 프롬프트가 적용됩니다." }
     if ($script:curatedGlossaryPath) { Add-Log "추가 용어집: $script:curatedGlossaryPath" }
@@ -559,28 +556,17 @@ $chkIncludePatches.Size = New-Object System.Drawing.Size(120, 24)
 $chkIncludePatches.BackColor = [System.Drawing.Color]::Transparent
 $chkIncludePatches.Font = New-Font 9
 
-$lblBatchSize = New-Label "배치" 555 335 42 24 ([System.Drawing.Color]::FromArgb(70, 70, 70)) 9
-$cmbBatchSize = New-Object System.Windows.Forms.ComboBox
-$cmbBatchSize.Location = New-Object System.Drawing.Point(595, 332)
-$cmbBatchSize.Size = New-Object System.Drawing.Size(80, 28)
-$cmbBatchSize.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-$cmbBatchSize.Font = New-Font 9
-[void]$cmbBatchSize.Items.Add("40")
-[void]$cmbBatchSize.Items.Add("60")
-[void]$cmbBatchSize.Items.Add("80")
-$cmbBatchSize.SelectedItem = "40"
-
-$btnOpenReview = New-Button "검토 폴더 열기" 520 370 130 38 ([System.Drawing.Color]::FromArgb(232, 238, 248))
-$btnApplyReview = New-Button "검토 결과 적용" 655 370 145 38 ([System.Drawing.Color]::FromArgb(226, 236, 248))
-$btnStart = New-Button "번역 시작" 815 370 95 38 ([System.Drawing.Color]::FromArgb(226, 244, 230))
-$btnStop = New-Button "중지" 915 370 60 38 ([System.Drawing.Color]::FromArgb(245, 224, 224))
+$btnOpenReview = New-Button "검토 폴더 열기" 520 370 140 38 ([System.Drawing.Color]::FromArgb(232, 238, 248))
+$btnApplyReview = New-Button "검토 결과 적용" 670 370 145 38 ([System.Drawing.Color]::FromArgb(226, 236, 248))
+$btnStart = New-Button "번역 시작" 825 370 95 38 ([System.Drawing.Color]::FromArgb(226, 244, 230))
+$btnStop = New-Button "중지" 925 370 50 38 ([System.Drawing.Color]::FromArgb(245, 224, 224))
 $btnOpenReview.Enabled = $false
 $btnStop.Enabled = $false
 $btnOpenReview.Add_Click({ Open-ReviewFolder })
 $btnApplyReview.Add_Click({ Apply-ReviewResults })
 $btnStart.Add_Click({ Start-Translation })
 $btnStop.Add_Click({ Stop-Translation })
-$form.Controls.AddRange(@($chkReviewOnly, $chkOverwrite, $chkDryRun, $chkIncludePatches, $lblBatchSize, $cmbBatchSize, $btnOpenReview, $btnApplyReview, $btnStart, $btnStop))
+$form.Controls.AddRange(@($chkReviewOnly, $chkOverwrite, $chkDryRun, $chkIncludePatches, $btnOpenReview, $btnApplyReview, $btnStart, $btnStop))
 
 $lblProgress = New-Label "진행도 및 Debug" 55 420 170 24 ([System.Drawing.Color]::FromArgb(20, 20, 20)) 10.5 ([System.Drawing.FontStyle]::Bold)
 $lblStatus = New-Label "대기 중" 225 422 720 24 ([System.Drawing.Color]::FromArgb(70, 70, 70)) 9
