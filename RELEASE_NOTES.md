@@ -1,3 +1,10 @@
+# RimWorld AI Translator v0.1.3
+
+## Fixes
+
+- Shortened malformed model-response warnings so broken JSON is not dumped into the GUI log.
+- Treats pathological newline-spam translation candidates as unsafe writes and records them in audit/comparison output.
+
 # RimWorld AI Translator v0.1.2
 
 ## Fixes

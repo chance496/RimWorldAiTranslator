@@ -110,7 +110,7 @@ powershell -ExecutionPolicy Bypass -File ".\Invoke-RimWorldAiTranslation.ps1" `
 - `_TranslationAudit\*-comparison.json`
 - `_TranslationAudit\*-comparison.csv`
 
-보고서에는 원문, 기존 번역, 후보 번역, 토큰 누락 여부, 한글 포함 여부, 안전 적용 가능 여부가 같이 들어갑니다.
+보고서에는 원문, 기존 번역, 후보 번역, 토큰 누락 여부, 비정상 개행 후보 여부, 한글 포함 여부, 안전 적용 가능 여부가 같이 들어갑니다.
 
 ## 주요 옵션
 

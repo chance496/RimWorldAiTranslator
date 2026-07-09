@@ -902,6 +902,18 @@ function ConvertFrom-ModelJson([string]$Content) {
     return $trimmed | ConvertFrom-Json
 }
 
+function Format-CompactError([object]$ErrorRecord) {
+    $message = if ($ErrorRecord -and $ErrorRecord.Exception) { [string]$ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
+    if ([string]::IsNullOrWhiteSpace($message)) { return "unknown error" }
+    $message = [System.Text.RegularExpressions.Regex]::Replace($message, "\\u000a(\\u000a)+", "\\u000a...")
+    $message = [System.Text.RegularExpressions.Regex]::Replace($message, "[\r\n\t]+", " ")
+    $message = [System.Text.RegularExpressions.Regex]::Replace($message, "\s{2,}", " ").Trim()
+    if ($message.Length -gt 320) {
+        $message = $message.Substring(0, 320) + "..."
+    }
+    return $message
+}
+
 function ConvertTo-TranslationMap([object]$Response) {
     $content = [string]$Response.choices[0].message.content
     $parsed = ConvertFrom-ModelJson $content
@@ -983,6 +995,17 @@ function Read-LanguageFile([string]$Path) {
 function Remove-InvalidXmlChars([string]$Text) {
     if ($null -eq $Text) { return "" }
     return [System.Text.RegularExpressions.Regex]::Replace($Text, "[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD]", "")
+}
+
+function Test-PathologicalTranslation([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    if ($Text -match "(\r?\n\s*){8,}") { return $true }
+    if ($Text -match "(\\u000a\s*){8,}") { return $true }
+
+    $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($Text, "\r?\n").Count
+    if ($newlineCount -ge 20 -and $Text.Length -lt 4000) { return $true }
+
+    return $false
 }
 
 function Escape-XmlText([string]$Text) {
@@ -1183,7 +1206,7 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
                 Write-Warning "Model response missed $($missingIds.Count) ids; retrying batch."
             } catch {
                 if ($attempt -ge $MaxRetries) { throw }
-                Write-Warning "Batch parse/request failed on attempt $attempt; retrying. $($_.Exception.Message)"
+                Write-Warning "Batch parse/request failed on attempt $attempt; retrying. $(Format-CompactError $_)"
                 Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
             }
         }
@@ -1194,6 +1217,7 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
         $translated = Remove-InvalidXmlChars $translated
         $missingTokens = @(Test-TokenPreservation -Source ([string]$entry.Text) -Target $translated)
         $isBlankCandidate = [string]::IsNullOrWhiteSpace($translated)
+        $isPathologicalCandidate = Test-PathologicalTranslation $translated
         if ($missingTokens.Count -gt 0) {
             [void]$warnings.Add([pscustomobject]@{
                 id = $entry.Id
@@ -1201,12 +1225,23 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
                 source = $entry.Text
                 translation = $translated
                 missingTokens = $missingTokens
+                reason = "missing_tokens"
+            })
+        }
+        if ($isPathologicalCandidate) {
+            [void]$warnings.Add([pscustomobject]@{
+                id = $entry.Id
+                key = $entry.Key
+                source = $entry.Text
+                translation = $translated
+                missingTokens = @()
+                reason = "pathological_newlines"
             })
         }
 
         $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
         $targetPath = Join-Path $outputLanguageRoot $entry.TargetRelativePath
-        $safeToWrite = -not $isBlankCandidate -and $missingTokens.Count -eq 0
+        $safeToWrite = -not $isBlankCandidate -and -not $isPathologicalCandidate -and $missingTokens.Count -eq 0
         if ($ReviewOnly -or $safeToWrite) {
             if (-not $outputGroups.ContainsKey($targetPath)) { $outputGroups[$targetPath] = @{} }
             $outputGroups[$targetPath][$entry.Key] = $translated
@@ -1236,6 +1271,7 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
             candidateSameAsSource = $translated -eq ([string]$entry.Text)
             candidateBlank = $isBlankCandidate
             missingTokens = [string]::Join("|", $missingTokens)
+            pathologicalCandidate = $isPathologicalCandidate
             safeToApply = $safeToWrite
         })
     }
