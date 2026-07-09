@@ -206,6 +206,7 @@ jobs:
            ## Documentation
           '@
           $patch = $patch -replace "`r`n", "`n"
+          $patch = $patch -replace '(?m)^ {10}', ''
           Set-Content -Path fix-gui-controls.patch -Value $patch -Encoding UTF8
           git apply --check fix-gui-controls.patch
           git apply --whitespace=nowarn fix-gui-controls.patch
