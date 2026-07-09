@@ -1,3 +1,9 @@
+# Unreleased
+
+## Documentation
+
+- Documented that DLL/C# hardcoded runtime inspect strings, gizmo labels, and status text may require source changes or Harmony patches when the mod does not use RimWorld translation keys.
+
 # RimWorld AI Translator v0.1.1
 
 ## Changes
