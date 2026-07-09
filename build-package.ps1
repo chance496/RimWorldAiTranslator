@@ -45,6 +45,7 @@ $packageFiles = @(
     "Start-RimWorldAiTranslatorGui.ps1",
     "Start-RimWorldAiTranslatorGui.cmd",
     "Invoke-RimWorldAiTranslation.ps1",
+    "Apply-RimWorldAiReviewResults.ps1",
     "Build-RimWorldGlossary.ps1",
     "glossary.generated.ko.json",
     "sample-glossary.txt",

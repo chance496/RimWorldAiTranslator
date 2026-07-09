@@ -1,3 +1,11 @@
+# RimWorld AI Translator v0.1.5
+
+## Changes
+
+- Added an `Apply review results` workflow in the GUI so review-only candidates can be applied without calling the API again.
+- Added `Apply-RimWorldAiReviewResults.ps1` for CLI application of `safeToApply=true` comparison rows.
+- Review application respects the existing overwrite checkbox: unchecked keeps existing Korean keys, checked replaces them.
+
 # RimWorld AI Translator v0.1.4
 
 ## Fixes

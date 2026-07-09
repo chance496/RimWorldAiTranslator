@@ -112,6 +112,16 @@ powershell -ExecutionPolicy Bypass -File ".\Invoke-RimWorldAiTranslation.ps1" `
 
 보고서에는 원문, 기존 번역, 후보 번역, 토큰 누락 여부, 비정상 개행 후보 여부, 한글 포함 여부, 안전 적용 가능 여부가 같이 들어갑니다.
 
+GUI의 `검토 결과 적용` 버튼을 누르면 API를 다시 호출하지 않고 검토 결과 폴더의 `safeToApply=true` 후보만 원래 모드의 `Languages\Korean`에 적용합니다. `기존 번역 덮어쓰기`가 꺼져 있으면 이미 있는 키는 유지하고 없는 키만 채웁니다.
+
+CLI에서 검토 결과를 적용하려면:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ".\Apply-RimWorldAiReviewResults.ps1" `
+  -ModRoot "E:\SteamLibrary\steamapps\workshop\content\294100\모드ID" `
+  -ReviewRoot ".\reviews\모드ID-20260709-120000"
+```
+
 ## 주요 옵션
 
 ```powershell
@@ -135,6 +145,12 @@ powershell -ExecutionPolicy Bypass -File ".\Invoke-RimWorldAiTranslation.ps1" `
 -ExtraPrompt
 -ExtraPromptFile
 -MaxGeneratedGlossaryTermsPerBatch 140
+```
+
+검토 결과 적용:
+
+```powershell
+.\Apply-RimWorldAiReviewResults.ps1 -ModRoot <모드폴더> -ReviewRoot <검토결과폴더> -Overwrite
 ```
 
 ## 패키지 빌드

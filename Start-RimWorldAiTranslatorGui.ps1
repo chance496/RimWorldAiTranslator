@@ -13,6 +13,7 @@ Add-Type -AssemblyName System.Drawing
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $translatorScript = Join-Path $scriptRoot "Invoke-RimWorldAiTranslation.ps1"
+$reviewApplyScript = Join-Path $scriptRoot "Apply-RimWorldAiReviewResults.ps1"
 
 $script:process = $null
 $script:processExitHandled = $false
@@ -219,6 +220,7 @@ function Set-RunningState([bool]$Running) {
     $btnStop.Enabled = $Running
     $btnBrowse.Enabled = -not $Running
     $btnGlossary.Enabled = -not $Running
+    $btnApplyReview.Enabled = -not $Running
     $txtModRoot.Enabled = -not $Running
     $txtApiKeys.Enabled = -not $Running
     $txtExtraPrompt.Enabled = -not $Running
@@ -373,6 +375,69 @@ function Stop-Translation {
     }
 }
 
+function Apply-ReviewResults {
+    if ($script:process -and -not $script:process.HasExited) {
+        [System.Windows.Forms.MessageBox]::Show("번역 실행 중에는 검토 결과를 적용할 수 없습니다.", "RimWorld AI Translator") | Out-Null
+        return
+    }
+
+    $modRoot = $txtModRoot.Text.Trim()
+    if (-not $modRoot -or -not (Test-Path -LiteralPath $modRoot)) {
+        [System.Windows.Forms.MessageBox]::Show("먼저 적용할 모드 폴더 위치를 선택하세요.", "RimWorld AI Translator") | Out-Null
+        return
+    }
+    if (-not (Test-Path -LiteralPath $reviewApplyScript)) {
+        [System.Windows.Forms.MessageBox]::Show("검토 결과 적용 스크립트를 찾을 수 없습니다.`r`n$reviewApplyScript", "RimWorld AI Translator") | Out-Null
+        return
+    }
+
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = "적용할 reviews\\모드명-날짜 검토 결과 폴더를 선택하세요."
+    $reviewsRoot = Join-Path $scriptRoot "reviews"
+    if (Test-Path -LiteralPath $reviewsRoot) {
+        $dlg.SelectedPath = $reviewsRoot
+    }
+    if ($dlg.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $reviewRoot = $dlg.SelectedPath
+    $args = New-Object "System.Collections.Generic.List[string]"
+    foreach ($item in @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $reviewApplyScript, "-ModRoot", $modRoot, "-ReviewRoot", $reviewRoot, "-LanguageFolderName", "Korean")) {
+        [void]$args.Add($item)
+    }
+    if ($chkOverwrite.Checked) { [void]$args.Add("-Overwrite") }
+
+    Add-Log "검토 결과 적용을 시작합니다."
+    Add-Log "검토 폴더: $reviewRoot"
+    Add-Log "대상 모드: $modRoot"
+    if ($chkOverwrite.Checked) {
+        Add-Log "기존 번역도 덮어씁니다."
+    } else {
+        Add-Log "기존 번역은 유지하고 없는 키만 적용합니다."
+    }
+
+    $lblStatus.Text = "검토 결과 적용 중"
+    Set-RunningState $true
+    try {
+        $output = & powershell.exe @($args.ToArray()) 2>&1
+        $exitCode = $LASTEXITCODE
+        foreach ($line in @($output)) {
+            Add-Log ([string]$line)
+        }
+        if ($exitCode -eq 0) {
+            $lblStatus.Text = "검토 결과 적용 완료"
+            Add-Log "검토 결과 적용 완료."
+        } else {
+            $lblStatus.Text = "적용 실패"
+            Add-Log "검토 결과 적용 실패. ExitCode=$exitCode"
+        }
+    } catch {
+        $lblStatus.Text = "적용 실패"
+        Add-Log "검토 결과 적용 실패: $($_.Exception.Message)"
+    } finally {
+        Set-RunningState $false
+    }
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "RimWorld AI Translator"
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -461,12 +526,14 @@ $chkIncludePatches.Size = New-Object System.Drawing.Size(120, 24)
 $chkIncludePatches.BackColor = [System.Drawing.Color]::Transparent
 $chkIncludePatches.Font = New-Font 9
 
+$btnApplyReview = New-Button "검토 결과 적용" 565 370 150 38 ([System.Drawing.Color]::FromArgb(226, 236, 248))
 $btnStart = New-Button "번역 시작" 735 370 120 38 ([System.Drawing.Color]::FromArgb(226, 244, 230))
 $btnStop = New-Button "중지" 865 370 80 38 ([System.Drawing.Color]::FromArgb(245, 224, 224))
 $btnStop.Enabled = $false
+$btnApplyReview.Add_Click({ Apply-ReviewResults })
 $btnStart.Add_Click({ Start-Translation })
 $btnStop.Add_Click({ Stop-Translation })
-$form.Controls.AddRange(@($chkReviewOnly, $chkOverwrite, $chkDryRun, $chkIncludePatches, $btnStart, $btnStop))
+$form.Controls.AddRange(@($chkReviewOnly, $chkOverwrite, $chkDryRun, $chkIncludePatches, $btnApplyReview, $btnStart, $btnStop))
 
 $lblProgress = New-Label "진행도 및 Debug" 55 420 170 24 ([System.Drawing.Color]::FromArgb(20, 20, 20)) 10.5 ([System.Drawing.FontStyle]::Bold)
 $lblStatus = New-Label "대기 중" 225 422 720 24 ([System.Drawing.Color]::FromArgb(70, 70, 70)) 9
@@ -536,5 +603,6 @@ Add-Log "1. 모드 폴더를 선택하거나 위 칸에 드래그하세요."
 Add-Log "2. API 키는 한 줄에 하나씩 입력하세요. 여러 개면 입력 순서를 기준으로 순환 사용합니다."
 Add-Log "3. 추가 프롬프트와 추가 용어집은 선택 사항입니다. 기본은 공식 본편+DLC 용어집만 사용합니다."
 Add-Log "4. 바로 쓰기가 부담되면 먼저 Dry run 또는 비교/검토 모드로 확인하세요."
+Add-Log "5. 검토 결과가 마음에 들면 검토 결과 적용 버튼으로 안전 후보만 적용할 수 있습니다."
 
 [void][System.Windows.Forms.Application]::Run($form)
