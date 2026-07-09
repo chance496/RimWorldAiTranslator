@@ -1,3 +1,0 @@
-# Put one Cerebras API key per line.
-# Do not commit a real key.
-# csk-...
