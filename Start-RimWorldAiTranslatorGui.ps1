@@ -22,6 +22,7 @@ $script:logFileOffset = 0L
 $script:logPartialLine = ""
 $script:startedAt = $null
 $script:curatedGlossaryPath = ""
+$script:stopRequested = $false
 
 function New-Font([float]$Size, [System.Drawing.FontStyle]$Style = [System.Drawing.FontStyle]::Regular) {
     return New-Object System.Drawing.Font("Malgun Gothic", $Size, $Style)
@@ -80,12 +81,24 @@ function Quote-CmdArgument([string]$Value) {
 
 function Get-ApiKeyLines([string]$Text) {
     $keys = New-Object "System.Collections.Generic.List[string]"
-    foreach ($line in ($Text -split "\r?\n")) {
+    foreach ($line in ([System.Text.RegularExpressions.Regex]::Split($Text, "\r\n|\n|\r"))) {
         $trim = $line.Trim()
         if (-not $trim -or $trim.StartsWith("#")) { continue }
-        [void]$keys.Add($trim)
+
+        if ($trim -match "^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)\s*$") {
+            $trim = $matches[2].Trim()
+        }
+        $trim = $trim.Trim('"').Trim("'")
+        if ($trim.StartsWith("Bearer ", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $trim = $trim.Substring(7).Trim()
+        }
+
+        foreach ($part in ($trim -split "[,;]")) {
+            $key = $part.Trim().Trim('"').Trim("'")
+            if ($key) { [void]$keys.Add($key) }
+        }
     }
-    return ,$keys
+    return $keys.ToArray()
 }
 
 function New-TempFilePath([string]$Prefix, [string]$Extension) {
@@ -108,6 +121,29 @@ function Remove-TempFiles {
     $script:tempFiles.Clear()
 }
 
+function Stop-ProcessTree([int]$ProcessId) {
+    if ($ProcessId -le 0) { return }
+
+    $children = @()
+    try {
+        $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId" -ErrorAction SilentlyContinue)
+    } catch {
+        $children = @()
+    }
+
+    foreach ($child in $children) {
+        Stop-ProcessTree ([int]$child.ProcessId)
+    }
+
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($proc -and -not $proc.HasExited) {
+            Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+        }
+    } catch {
+    }
+}
+
 function Add-Log([string]$Text) {
     if ($null -eq $Text) { return }
     $stamp = Get-Date -Format "HH:mm:ss"
@@ -118,18 +154,18 @@ function Add-Log([string]$Text) {
 
 function Read-NewProcessLogLines {
     $lines = New-Object "System.Collections.Generic.List[string]"
-    if (-not $script:logFilePath -or -not (Test-Path -LiteralPath $script:logFilePath)) { return ,$lines }
+    if (-not $script:logFilePath -or -not (Test-Path -LiteralPath $script:logFilePath)) { return $lines.ToArray() }
 
     try {
         $fs = [System.IO.File]::Open($script:logFilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try {
-            if ($fs.Length -le $script:logFileOffset) { return ,$lines }
+            if ($fs.Length -le $script:logFileOffset) { return $lines.ToArray() }
             [void]$fs.Seek($script:logFileOffset, [System.IO.SeekOrigin]::Begin)
             $count = [int]($fs.Length - $script:logFileOffset)
             $bytes = New-Object byte[] $count
             $read = $fs.Read($bytes, 0, $count)
             $script:logFileOffset += $read
-            if ($read -le 0) { return ,$lines }
+            if ($read -le 0) { return $lines.ToArray() }
 
             $text = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $read)
             $combined = $script:logPartialLine + $text
@@ -151,7 +187,7 @@ function Read-NewProcessLogLines {
     } catch {
     }
 
-    return ,$lines
+    return $lines.ToArray()
 }
 
 function Set-RunningState([bool]$Running) {
@@ -286,6 +322,7 @@ function Start-Translation {
     $script:process = $proc
     $script:startedAt = Get-Date
     $script:processExitHandled = $false
+    $script:stopRequested = $false
 
     try {
         [void]$proc.Start()
@@ -300,8 +337,11 @@ function Start-Translation {
 function Stop-Translation {
     if ($script:process -and -not $script:process.HasExited) {
         try {
-            $script:process.Kill()
-            Add-Log "사용자 요청으로 실행을 중지했습니다."
+            $script:stopRequested = $true
+            $btnStop.Enabled = $false
+            $lblStatus.Text = "중지 요청 중"
+            Add-Log "사용자 요청으로 실행 중지를 요청했습니다."
+            Stop-ProcessTree $script:process.Id
         } catch {
             Add-Log "중지 실패: $($_.Exception.Message)"
         }
@@ -440,13 +480,17 @@ $timer.Add_Tick({
         $exitCode = $script:process.ExitCode
         $elapsed = if ($script:startedAt) { [Math]::Round(((Get-Date) - $script:startedAt).TotalSeconds, 1) } else { 0 }
         Add-Log "프로세스 종료. ExitCode=$exitCode, 경과 ${elapsed}s"
-        if ($exitCode -eq 0) {
+        if ($script:stopRequested) {
+            $lblStatus.Text = "중지됨"
+            Add-Log "사용자 요청으로 중지 완료."
+        } elseif ($exitCode -eq 0) {
             if ($progress.Maximum -gt 0) { $progress.Value = $progress.Maximum }
             $lblStatus.Text = "완료"
         } else {
             $lblStatus.Text = "종료 코드 $exitCode"
         }
         try { $script:process.Dispose() } catch {}
+        $script:stopRequested = $false
         Set-RunningState $false
         Remove-TempFiles
         Clear-EventSubscriptions
@@ -456,7 +500,7 @@ $timer.Start()
 
 $form.Add_FormClosing({
     if ($script:process -and -not $script:process.HasExited) {
-        try { $script:process.Kill() } catch {}
+        try { Stop-ProcessTree $script:process.Id } catch {}
     }
     Remove-TempFiles
     Clear-EventSubscriptions

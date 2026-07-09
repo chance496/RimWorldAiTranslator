@@ -1,4 +1,9 @@
-# Unreleased
+# RimWorld AI Translator v0.1.2
+
+## Fixes
+
+- Fixed GUI API key parsing so multiple keys entered on separate lines are counted and passed to the translator correctly.
+- Fixed the Stop button so it terminates the translator process tree instead of only killing the intermediate command wrapper.
 
 ## Documentation
 

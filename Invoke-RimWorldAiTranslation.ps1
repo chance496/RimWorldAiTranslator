@@ -681,7 +681,7 @@ function Get-ApiKeys([string[]]$ApiKey) {
     foreach ($key in $all) {
         if ($seen.Add($key)) { [void]$unique.Add($key) }
     }
-    return ,$unique
+    return $unique.ToArray()
 }
 
 function New-KeyStates([string[]]$Keys) {
@@ -700,7 +700,7 @@ function New-KeyStates([string[]]$Keys) {
             Disabled = $false
         })
     }
-    return ,$states
+    return $states.ToArray()
 }
 
 function Reset-InputTokenWindowIfNeeded([object]$State) {
