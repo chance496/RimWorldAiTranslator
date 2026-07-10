@@ -6,6 +6,9 @@ param(
 
     [string]$BaseUrl = "https://api.cerebras.ai/v1",
     [string]$Model = "gemma-4-31b",
+    [ValidateSet("Auto", "Cerebras", "Google")]
+    [string]$TranslationProvider = "Auto",
+    [string]$GoogleTranslateUrl = "https://translate.googleapis.com/translate_a/single",
     [string]$LanguageFolderName = "Korean",
     [string]$SourceLanguageFolder = "Auto",
 
@@ -24,6 +27,7 @@ param(
     [switch]$Overwrite,
     [switch]$DryRun,
     [switch]$MockTranslations,
+    [switch]$SourceOnly,
     [switch]$NoStructuredOutputs,
     [switch]$ReviewOnly,
 
@@ -53,6 +57,60 @@ function Resolve-FullPath([string]$Path) {
 
 function Get-FullPathAllowMissing([string]$Path) {
     return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Assert-SafePathSegment([string]$Value, [string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -in @(".", "..") -or $Value.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $Value.Contains("\") -or $Value.Contains("/")) {
+        throw "$Name must be a single safe folder or file-name segment."
+    }
+}
+
+function Assert-HttpsUri([string]$Value, [string]$Name) {
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Value, [System.UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne [System.Uri]::UriSchemeHttps) {
+        throw "$Name must be an absolute HTTPS URL."
+    }
+}
+
+function Read-SafeXmlDocument([string]$Path) {
+    $settings = New-Object System.Xml.XmlReaderSettings
+    $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver = $null
+    $settings.MaxCharactersFromEntities = 1024
+    $settings.MaxCharactersInDocument = 134217728
+    $reader = [System.Xml.XmlReader]::Create($Path, $settings)
+    try {
+        $doc = New-Object System.Xml.XmlDocument
+        $doc.PreserveWhitespace = $false
+        $doc.XmlResolver = $null
+        $doc.Load($reader)
+        return ,$doc
+    } finally {
+        $reader.Dispose()
+    }
+}
+
+function Get-PathInsideRoot([string]$Root, [string]$RelativePath) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or [System.IO.Path]::IsPathRooted($RelativePath)) {
+        throw "Relative output path is invalid: $RelativePath"
+    }
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd("\", "/")
+    $targetFull = [System.IO.Path]::GetFullPath((Join-Path $rootFull $RelativePath))
+    $prefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $targetFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Output path escapes the language root: $RelativePath"
+    }
+    return $targetFull
+}
+
+function Test-ValidXmlElementName([string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    try {
+        [void][System.Xml.XmlConvert]::VerifyName($Name)
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 function Get-ChatCompletionsUrl([string]$Url) {
@@ -130,9 +188,7 @@ function Get-ExistingLanguageKeys([string]$LanguageRoot) {
 
     Get-ChildItem -LiteralPath $LanguageRoot -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | ForEach-Object {
         try {
-            $doc = New-Object System.Xml.XmlDocument
-            $doc.PreserveWhitespace = $false
-            $doc.LoadXml([System.IO.File]::ReadAllText($_.FullName))
+            $doc = Read-SafeXmlDocument $_.FullName
             if ($doc.DocumentElement -and $doc.DocumentElement.LocalName -eq "LanguageData") {
                 foreach ($child in (Get-XmlElementChildren $doc.DocumentElement)) {
                     [void]$keys.Add($child.LocalName)
@@ -150,9 +206,7 @@ function Get-ExistingLanguageMap([string]$LanguageRoot) {
 
     Get-ChildItem -LiteralPath $LanguageRoot -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | ForEach-Object {
         try {
-            $doc = New-Object System.Xml.XmlDocument
-            $doc.PreserveWhitespace = $false
-            $doc.LoadXml([System.IO.File]::ReadAllText($_.FullName))
+            $doc = Read-SafeXmlDocument $_.FullName
             if ($doc.DocumentElement -and $doc.DocumentElement.LocalName -eq "LanguageData") {
                 foreach ($child in (Get-XmlElementChildren $doc.DocumentElement)) {
                     if (-not $map.ContainsKey($child.LocalName)) {
@@ -169,9 +223,7 @@ function Get-ExistingLanguageMap([string]$LanguageRoot) {
 function Import-LanguageDataEntries([string]$FilePath, [string]$TargetRelativePath, [string]$Kind, [string]$TypeName) {
     $entries = New-Object "System.Collections.Generic.List[object]"
     try {
-        $doc = New-Object System.Xml.XmlDocument
-        $doc.PreserveWhitespace = $false
-        $doc.LoadXml([System.IO.File]::ReadAllText($FilePath))
+        $doc = Read-SafeXmlDocument $FilePath
     } catch {
         Write-Warning "Skipping invalid XML: $FilePath"
         return ,$entries
@@ -298,9 +350,7 @@ function Import-DefEntriesFromDefs([string]$ModRoot, [string]$OutputFilePrefix, 
     foreach ($root in $candidateRoots) {
         Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object {
             try {
-                $doc = New-Object System.Xml.XmlDocument
-                $doc.PreserveWhitespace = $false
-                $doc.LoadXml([System.IO.File]::ReadAllText($_.FullName))
+                $doc = Read-SafeXmlDocument $_.FullName
             } catch {
                 Write-Warning "Skipping invalid XML: $($_.FullName)"
                 return
@@ -359,7 +409,7 @@ function Get-SourceLanguageRank([string]$Name) {
 function Get-SourceLanguageRoots([string]$ModRoot, [string]$SourceLanguageFolder) {
     $roots = New-Object "System.Collections.Generic.List[object]"
     $languagesRoot = Join-Path $ModRoot "Languages"
-    if (-not (Test-Path -LiteralPath $languagesRoot)) { return ,$roots }
+    if (-not (Test-Path -LiteralPath $languagesRoot)) { return $roots.ToArray() }
 
     if ($SourceLanguageFolder -and $SourceLanguageFolder -ne "Auto") {
         $explicitRoot = if ([System.IO.Path]::IsPathRooted($SourceLanguageFolder)) {
@@ -375,7 +425,7 @@ function Get-SourceLanguageRoots([string]$ModRoot, [string]$SourceLanguageFolder
             Path = [System.IO.Path]::GetFullPath($explicitRoot)
             Rank = -1
         })
-        return ,$roots
+        return $roots.ToArray()
     }
 
     $candidates = New-Object "System.Collections.Generic.List[object]"
@@ -391,7 +441,7 @@ function Get-SourceLanguageRoots([string]$ModRoot, [string]$SourceLanguageFolder
 
     $best = $candidates | Sort-Object Rank, Name | Select-Object -First 1
     if ($best) { [void]$roots.Add($best) }
-    return ,$roots
+    return $roots.ToArray()
 }
 
 function Import-SourceEntries([string]$ModRoot, [string]$OutputFilePrefix, [string]$SourceLanguageFolder, [switch]$IncludePatches) {
@@ -953,6 +1003,118 @@ function Test-TokenPreservation([string]$Source, [string]$Target) {
     return $missing.ToArray()
 }
 
+function ConvertTo-GoogleProtectedText([string]$Text) {
+    $protected = [ordered]@{}
+    $result = [string]$Text
+    $index = 0
+    foreach ($token in (@(Get-ProtectedTokens $Text) | Sort-Object Length -Descending)) {
+        $placeholder = "ZXQPROTECTED{0:D3}ZXQ" -f $index
+        $protected[$placeholder] = $token
+        $result = $result.Replace($token, $placeholder)
+        $index++
+    }
+    return [pscustomobject]@{ Text = $result; Map = $protected }
+}
+
+function Restore-GoogleProtectedText([string]$Text, [object]$Map) {
+    $result = [string]$Text
+    if ($Map) {
+        foreach ($item in $Map.GetEnumerator()) {
+            $result = $result.Replace([string]$item.Key, [string]$item.Value)
+        }
+    }
+    return $result
+}
+
+function Split-GoogleTextChunks([string]$Text, [int]$MaxChars = 3500) {
+    $chunks = New-Object "System.Collections.Generic.List[string]"
+    $remaining = [string]$Text
+    while ($remaining.Length -gt $MaxChars) {
+        $breakAt = $remaining.LastIndexOf("`n", $MaxChars)
+        if ($breakAt -lt [int]($MaxChars * 0.45)) { $breakAt = $remaining.LastIndexOf(". ", $MaxChars) }
+        if ($breakAt -lt [int]($MaxChars * 0.45)) { $breakAt = $remaining.LastIndexOf(" ", $MaxChars) }
+        if ($breakAt -lt 1) { $breakAt = $MaxChars }
+        [void]$chunks.Add($remaining.Substring(0, $breakAt + 1))
+        $remaining = $remaining.Substring($breakAt + 1)
+    }
+    if ($remaining.Length -gt 0) { [void]$chunks.Add($remaining) }
+    return $chunks.ToArray()
+}
+
+function Invoke-JsonGetUtf8([string]$Uri, [int]$TimeoutSec) {
+    $request = [System.Net.WebRequest]::Create($Uri)
+    $request.Method = "GET"
+    $request.Accept = "application/json"
+    $request.Timeout = $TimeoutSec * 1000
+    $request.ReadWriteTimeout = $TimeoutSec * 1000
+    $request.UserAgent = "Mozilla/5.0 RimWorldAiTranslator"
+
+    $response = $request.GetResponse()
+    try {
+        $responseStream = $response.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($responseStream, [System.Text.Encoding]::UTF8)
+        $raw = $reader.ReadToEnd()
+        return $raw | ConvertFrom-Json
+    } finally {
+        $response.Close()
+    }
+}
+
+function ConvertFrom-GoogleTranslateResponse([object]$Response) {
+    $parts = New-Object "System.Collections.Generic.List[string]"
+    foreach ($segment in @($Response[0])) {
+        if ($segment -and $segment.Count -gt 0 -and $null -ne $segment[0]) {
+            [void]$parts.Add([string]$segment[0])
+        }
+    }
+    return [string]::Join("", $parts)
+}
+
+function Invoke-GoogleTranslateText([string]$Text, [string]$Endpoint, [int]$TimeoutSec, [int]$MaxRetries) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+
+    $protected = ConvertTo-GoogleProtectedText $Text
+    $translatedChunks = New-Object "System.Collections.Generic.List[string]"
+    foreach ($chunk in (Split-GoogleTextChunks $protected.Text)) {
+        $lastError = $null
+        for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+            try {
+                $query = [System.Uri]::EscapeDataString($chunk)
+                $url = "$Endpoint`?client=gtx&sl=auto&tl=ko&dt=t&q=$query"
+                $response = Invoke-JsonGetUtf8 -Uri $url -TimeoutSec $TimeoutSec
+                [void]$translatedChunks.Add((ConvertFrom-GoogleTranslateResponse $response))
+                $lastError = $null
+                break
+            } catch {
+                $lastError = $_
+                if ($attempt -lt $MaxRetries) {
+                    Start-Sleep -Seconds ([Math]::Min(10, 1 + $attempt))
+                }
+            }
+        }
+        if ($lastError) { throw $lastError }
+        [System.Threading.Thread]::Sleep(120)
+    }
+
+    $translated = [string]::Join("", $translatedChunks)
+    return Restore-GoogleProtectedText -Text (ConvertTo-FlatString $translated) -Map $protected.Map
+}
+
+function Invoke-GoogleTranslateBatch([object[]]$Batch, [string]$Label) {
+    $map = @{}
+    $index = 0
+    foreach ($entry in $Batch) {
+        $index++
+        try {
+            $map[$entry.Id] = Invoke-GoogleTranslateText -Text ([string]$entry.Text) -Endpoint $GoogleTranslateUrl -TimeoutSec $TimeoutSec -MaxRetries $MaxRetries
+        } catch {
+            Write-Warning ("Google Translate failed for {0} entry {1}/{2}; keeping source text. {3}" -f $Label, $index, $Batch.Count, (Format-CompactError $_))
+            $map[$entry.Id] = [string]$entry.Text
+        }
+    }
+    return $map
+}
+
 function Split-IntoBatches([object[]]$Entries, [int]$BatchSize, [int]$MaxInputCharsPerBatch, [int]$MaxInputTokensPerBatch, [int]$FixedPromptTokens) {
     $batches = New-Object "System.Collections.Generic.List[object]"
     $current = New-Object "System.Collections.Generic.List[object]"
@@ -982,9 +1144,7 @@ function Read-LanguageFile([string]$Path) {
     $map = [ordered]@{}
     if (-not (Test-Path -LiteralPath $Path)) { return $map }
 
-    $doc = New-Object System.Xml.XmlDocument
-    $doc.PreserveWhitespace = $false
-    $doc.LoadXml([System.IO.File]::ReadAllText($Path))
+    $doc = Read-SafeXmlDocument $Path
     if (-not $doc.DocumentElement -or $doc.DocumentElement.LocalName -ne "LanguageData") {
         throw "Target XML is not LanguageData: $Path"
     }
@@ -1017,6 +1177,9 @@ function Escape-XmlText([string]$Text) {
 function Write-LanguageFile([string]$Path, [hashtable]$Entries, [switch]$Overwrite) {
     $existing = Read-LanguageFile $Path
     foreach ($key in ($Entries.Keys | Sort-Object)) {
+        if (-not (Test-ValidXmlElementName ([string]$key))) {
+            throw "Refusing to write an invalid XML localization key: $key"
+        }
         if ($Overwrite -or -not $existing.Contains($key)) {
             $existing[$key] = $Entries[$key]
         }
@@ -1068,6 +1231,10 @@ function Invoke-TranslationBatchWithSplit([object[]]$Batch, [string]$Label, [int
             $mockMap[$entry.Id] = "MOCK: $($entry.Text)"
         }
         return $mockMap
+    }
+
+    if ($script:ActiveTranslationProvider -eq "Google") {
+        return Invoke-GoogleTranslateBatch -Batch $batch -Label $Label
     }
 
     $body = New-RequestBody `
@@ -1132,9 +1299,11 @@ function New-ReviewRunRoot([string]$BaseRoot, [string]$ModFullPath, [string]$Sta
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $modFull = Resolve-FullPath $ModRoot
+Assert-SafePathSegment -Value $LanguageFolderName -Name "LanguageFolderName"
+Assert-SafePathSegment -Value $OutputFilePrefix -Name "OutputFilePrefix"
 $languageRoot = Join-Path (Join-Path $modFull "Languages") $LanguageFolderName
 $existingLanguageFull = if ($ExistingLanguageRoot) { Resolve-FullPath $ExistingLanguageRoot } else { $languageRoot }
-$chatUrl = Get-ChatCompletionsUrl $BaseUrl
+$chatUrl = ""
 if ($ExtraPromptFile) {
     if (-not (Test-Path -LiteralPath $ExtraPromptFile)) { throw "Extra prompt file not found: $ExtraPromptFile" }
     $filePrompt = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $ExtraPromptFile).Path, [System.Text.Encoding]::UTF8)
@@ -1161,24 +1330,50 @@ if ($ReviewOnly) {
     $outputLanguageRoot = $languageRoot
     $auditRoot = Join-Path $modFull "_TranslationAudit"
 }
-$auditBase = Join-Path $auditRoot "cerebras-$auditStamp"
+
+$keys = Get-ApiKeys -ApiKey $ApiKey
+if ($SourceOnly) {
+    $script:ActiveTranslationProvider = "SourceOnly"
+} elseif ($MockTranslations) {
+    $script:ActiveTranslationProvider = "Mock"
+} elseif ($TranslationProvider -eq "Auto") {
+    $script:ActiveTranslationProvider = if ($keys.Count -gt 0) { "Cerebras" } else { "Google" }
+} else {
+    $script:ActiveTranslationProvider = $TranslationProvider
+}
+
+if ($script:ActiveTranslationProvider -eq "Cerebras") {
+    Assert-HttpsUri -Value $BaseUrl -Name "BaseUrl"
+    $chatUrl = Get-ChatCompletionsUrl $BaseUrl
+} elseif ($script:ActiveTranslationProvider -eq "Google") {
+    Assert-HttpsUri -Value $GoogleTranslateUrl -Name "GoogleTranslateUrl"
+}
+
+if (-not $DryRun -and -not $MockTranslations -and $script:ActiveTranslationProvider -eq "Cerebras" -and $keys.Count -eq 0) {
+    throw "No Cerebras API key provided. Enter keys in the GUI, use -ApiKey, or set TranslationProvider Google."
+}
+
+$keyStates = if ($script:ActiveTranslationProvider -eq "Cerebras") { New-KeyStates $keys } else { @() }
+$auditBase = Join-Path $auditRoot "$($script:ActiveTranslationProvider.ToLowerInvariant())-$auditStamp"
 
 Write-Host "Mod root: $modFull"
 Write-Host "Output language: $outputLanguageRoot"
 Write-Host "Existing translation root: $existingLanguageFull"
 if ($ReviewOnly) { Write-Host "Review-only mode: source/existing translations will not be modified." }
-Write-Host "Cerebras chat endpoint: $chatUrl"
-Write-Host "Model: $Model"
-Write-Host "Free-tier guardrails: $RequestsPerMinutePerKey requests/min/key, $InputTokensPerMinutePerKey input tokens/min/key, $DailyTokenBudgetPerKey total tokens/day/key, $MaxCompletionTokens max output tokens"
-Write-Host "Glossary terms loaded: $($glossary.Count) total, $(@($glossary | Where-Object { $_.alwaysInclude }).Count) always-on, $MaxGeneratedGlossaryTermsPerBatch generated terms max/batch"
-
-$keys = Get-ApiKeys -ApiKey $ApiKey
-if (-not $DryRun -and -not $MockTranslations -and $keys.Count -eq 0) {
-    throw "No API key provided. Enter keys in the GUI or use -ApiKey, CEREBRAS_API_KEY, or RIMWORLD_TRANSLATOR_API_KEYS."
+Write-Host "Translation provider: $script:ActiveTranslationProvider"
+if ($script:ActiveTranslationProvider -eq "Cerebras") {
+    Write-Host "Cerebras chat endpoint: $chatUrl"
+    Write-Host "Model: $Model"
+    Write-Host "Free-tier guardrails: $RequestsPerMinutePerKey requests/min/key, $InputTokensPerMinutePerKey input tokens/min/key, $DailyTokenBudgetPerKey total tokens/day/key, $MaxCompletionTokens max output tokens"
+    if ($keys.Count -gt 0) { Write-Host "API keys loaded: $($keys.Count)" }
+    if ($keys.Count -gt 1) { Write-Host "API key rotation: input order, balanced by per-key request/token availability." }
+} elseif ($script:ActiveTranslationProvider -eq "Google") {
+    Write-Host "Google Translate endpoint: $GoogleTranslateUrl"
+    Write-Host "No Cerebras API key is required. Glossary and extra prompt are not applied by Google Translate."
+} elseif ($script:ActiveTranslationProvider -eq "SourceOnly") {
+    Write-Host "Source-only mode: no AI/API calls; translation candidates stay blank."
 }
-if ($keys.Count -gt 0) { Write-Host "API keys loaded: $($keys.Count)" }
-if ($keys.Count -gt 1) { Write-Host "API key rotation: input order, balanced by per-key request/token availability." }
-$keyStates = New-KeyStates $keys
+Write-Host "Glossary terms loaded: $($glossary.Count) total, $(@($glossary | Where-Object { $_.alwaysInclude }).Count) always-on, $MaxGeneratedGlossaryTermsPerBatch generated terms max/batch"
 
 $existingKeys = Get-ExistingLanguageKeys $existingLanguageFull
 $existingMap = Get-ExistingLanguageMap $existingLanguageFull
@@ -1224,6 +1419,43 @@ if ($DryRun) {
 }
 
 Write-AuditFile -Path "$auditBase-source.json" -Rows $pending
+
+if ($SourceOnly) {
+    $comparisonRows = New-Object "System.Collections.Generic.List[object]"
+    foreach ($entry in $pending) {
+        $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
+        $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
+        [void]$comparisonRows.Add([pscustomobject]@{
+            id = $entry.Id
+            key = $entry.Key
+            target = $targetPath
+            source = $entry.Text
+            existing = $existingTranslation
+            candidate = ""
+            existingPresent = -not [string]::IsNullOrWhiteSpace($existingTranslation)
+            existingHasKorean = Test-ContainsKorean $existingTranslation
+            candidateHasKorean = $false
+            existingSameAsSource = $existingTranslation -eq ([string]$entry.Text)
+            candidateSameAsSource = $false
+            candidateBlank = $true
+            missingTokens = ""
+            pathologicalCandidate = $false
+            safeToApply = $false
+        })
+    }
+    Write-AuditFile -Path "$auditBase-translated.json" -Rows @()
+    Write-AuditFile -Path "$auditBase-comparison.json" -Rows $comparisonRows
+    Write-CsvFile -Path "$auditBase-comparison.csv" -Rows $comparisonRows
+    Write-AuditFile -Path "$auditBase-token-warnings.json" -Rows @()
+    Write-Host "Done."
+    Write-Host "Written/updated files: 0"
+    Write-Host "Translated entries: 0"
+    Write-Host "Token warnings: 0"
+    Write-Host "Skipped unsafe writes: 0"
+    if ($ReviewOnly) { Write-Host "Review output: $reviewRunRoot" }
+    Write-Host "Audit: $auditBase-*.json"
+    return
+}
 
 $fixedPromptTokens = (Estimate-TokenCount $systemPrompt) + 1800 + ($MaxGeneratedGlossaryTermsPerBatch * 14)
 $batches = Split-IntoBatches `
@@ -1271,7 +1503,7 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
         }
 
         $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
-        $targetPath = Join-Path $outputLanguageRoot $entry.TargetRelativePath
+        $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
         $safeToWrite = -not $isBlankCandidate -and -not $isPathologicalCandidate -and $missingTokens.Count -eq 0
         if ($ReviewOnly -or $safeToWrite) {
             if (-not $outputGroups.ContainsKey($targetPath)) { $outputGroups[$targetPath] = @{} }

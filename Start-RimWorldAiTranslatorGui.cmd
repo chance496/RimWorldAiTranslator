@@ -1,2 +1,2 @@
 @echo off
-powershell.exe -WindowStyle Hidden -NoProfile -STA -ExecutionPolicy Bypass -File "%~dp0Start-RimWorldAiTranslatorGui.ps1"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -WindowStyle Hidden -NoProfile -STA -ExecutionPolicy Bypass -File "%~dp0Start-RimWorldAiReviewGui.ps1"

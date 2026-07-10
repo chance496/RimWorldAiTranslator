@@ -22,6 +22,24 @@ function Resolve-FullPathAllowMissing([string]$Path) {
     return [System.IO.Path]::GetFullPath($Path)
 }
 
+function Read-SafeXmlDocument([string]$Path) {
+    $settings = New-Object System.Xml.XmlReaderSettings
+    $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver = $null
+    $settings.MaxCharactersFromEntities = 1024
+    $settings.MaxCharactersInDocument = 134217728
+    $reader = [System.Xml.XmlReader]::Create($Path, $settings)
+    try {
+        $doc = New-Object System.Xml.XmlDocument
+        $doc.PreserveWhitespace = $false
+        $doc.XmlResolver = $null
+        $doc.Load($reader)
+        return ,$doc
+    } finally {
+        $reader.Dispose()
+    }
+}
+
 function ConvertTo-FlatString([object]$Value) {
     if ($null -eq $Value) { return "" }
     return ([string]$Value).Replace("`r`n", "`n").Replace("`r", "`n").Trim()
@@ -189,9 +207,7 @@ function Import-DefEntriesFromDefs([string]$ContentRoot, [switch]$IncludePatches
     foreach ($root in $candidateRoots) {
         Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object {
             try {
-                $doc = New-Object System.Xml.XmlDocument
-                $doc.PreserveWhitespace = $false
-                $doc.LoadXml([System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8))
+                $doc = Read-SafeXmlDocument $_.FullName
             } catch {
                 return
             }
@@ -235,9 +251,7 @@ function Import-LanguageDataMap([string]$LanguageRoot, [System.Collections.IDict
         $typeName = if ($kind -eq "DefInjected" -and $parts.Count -gt 1) { $parts[1] } else { "" }
 
         try {
-            $doc = New-Object System.Xml.XmlDocument
-            $doc.PreserveWhitespace = $false
-            $doc.LoadXml([System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8))
+            $doc = Read-SafeXmlDocument $_.FullName
         } catch {
             return
         }
@@ -383,7 +397,12 @@ function Remove-TempDirectory([string]$Path) {
 function Expand-LanguageTar([string]$TarPath) {
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("rimworld-ko-glossary-" + [System.Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
-    & tar -xf $TarPath -C $tempRoot
+    $tarExe = Join-Path $env:SystemRoot "System32\tar.exe"
+    if (-not (Test-Path -LiteralPath $tarExe -PathType Leaf)) {
+        Remove-TempDirectory $tempRoot
+        throw "Windows tar.exe was not found at the expected system path: $tarExe"
+    }
+    & $tarExe -xf $TarPath -C $tempRoot
     if ($LASTEXITCODE -ne 0) {
         Remove-TempDirectory $tempRoot
         throw "tar failed for $TarPath"

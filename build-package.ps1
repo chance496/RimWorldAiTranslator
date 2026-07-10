@@ -12,6 +12,24 @@ $zipPath = Join-Path $distRoot "RimWorldAiTranslator.zip"
 $launcherSource = Join-Path $projectRoot "launcher\RimWorldAiTranslatorLauncher.cs"
 $launcherExe = Join-Path $projectRoot "RimWorldAiTranslator.exe"
 
+function Assert-SafeBuildPath([string]$Path) {
+    $projectFull = [System.IO.Path]::GetFullPath($projectRoot).TrimEnd("\", "/")
+    $pathFull = [System.IO.Path]::GetFullPath($Path)
+    $prefix = $projectFull + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $pathFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to use a build path outside the project root: $pathFull"
+    }
+    if (Test-Path -LiteralPath $pathFull) {
+        $item = Get-Item -LiteralPath $pathFull -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing to use a reparse-point build path: $pathFull"
+        }
+    }
+}
+
+Assert-SafeBuildPath $distRoot
+Assert-SafeBuildPath $packageRoot
+
 $cscCandidates = @(
     (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
     (Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe")
@@ -36,14 +54,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if (Test-Path -LiteralPath $packageRoot) {
-    Remove-Item -LiteralPath $packageRoot -Recurse -Force
+    Get-ChildItem -LiteralPath $packageRoot -Force | Remove-Item -Recurse -Force
+} else {
+    New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 }
-New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 
 $packageFiles = @(
     "RimWorldAiTranslator.exe",
     "Start-RimWorldAiTranslatorGui.ps1",
     "Start-RimWorldAiTranslatorGui.cmd",
+    "Start-RimWorldAiReviewGui.ps1",
     "Invoke-RimWorldAiTranslation.ps1",
     "Apply-RimWorldAiReviewResults.ps1",
     "Build-RimWorldGlossary.ps1",
