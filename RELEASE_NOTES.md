@@ -1,3 +1,15 @@
+# RimWorld AI Translator v0.1.16
+
+## Changes
+
+- Added an optional bulk action for manual translations: when identical source text appears elsewhere in the project, the reviewer can apply one translation to every matching string.
+- Preserved notes and already reviewed identical translations during bulk changes; changed translations return to the translated state for review.
+- Fixed source refresh discarding translations that had not yet been written into the mod's `Languages\Korean` folder.
+- Source refresh now searches project run history for the latest valid review state, even when the most recent run is incomplete or has no decision file.
+- Changed source values retain their translation but return to untranslated with a persistent updated marker; genuinely new keys remain new untranslated entries.
+- Replaced unstable sequential-ID fallback matching with file-and-key or unique-key matching so inserted keys cannot inherit another string's translation.
+- Rewrote the repository and packaged Korean documentation with correct UTF-8 text and current project workflow details.
+
 # RimWorld AI Translator v0.1.15
 
 ## Changes

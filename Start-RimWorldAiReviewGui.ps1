@@ -75,6 +75,8 @@ $script:loadingProjectList = $false
 $script:loadingDashboard = $false
 $script:syncingSettings = $false
 $script:dirty = $false
+$script:translationEditedByUser = $false
+$script:translationEditBaseline = ""
 $script:glossary = @()
 $script:glossaryLoaded = $false
 $script:appDataRoot = Join-Path $env:LOCALAPPDATA "RimWorldAiTranslator"
@@ -1253,39 +1255,83 @@ function Load-Decisions {
     }
 }
 
+function Find-PreviousProjectDecisionFile([object]$Project, [string]$CurrentRoot) {
+    if (-not $Project -or [string]::IsNullOrWhiteSpace($CurrentRoot)) { return "" }
+
+    $currentFull = [System.IO.Path]::GetFullPath($CurrentRoot).TrimEnd("\", "/")
+    $candidateRoots = New-Object "System.Collections.Generic.List[string]"
+    if ($Project.latestReviewRoot) { [void]$candidateRoots.Add([string]$Project.latestReviewRoot) }
+    foreach ($run in @($Project.runs | Sort-Object createdAt -Descending)) {
+        if ($run.reviewRoot) { [void]$candidateRoots.Add([string]$run.reviewRoot) }
+    }
+
+    $seen = @{}
+    foreach ($candidateRoot in $candidateRoots) {
+        try {
+            $candidateFull = [System.IO.Path]::GetFullPath($candidateRoot).TrimEnd("\", "/")
+        } catch {
+            continue
+        }
+        $key = $candidateFull.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        if ($candidateFull -eq $currentFull) { continue }
+
+        $decisionFile = Join-Path $candidateFull "review-decisions.json"
+        if (Test-Path -LiteralPath $decisionFile -PathType Leaf) { return $decisionFile }
+    }
+    return ""
+}
+
 function Import-PreviousProjectDecisions {
     $path = Get-DecisionPath
     if ($path -and (Test-Path -LiteralPath $path)) { return }
     if (-not $script:selectedProjectId -or -not $script:reviewRoot) { return }
     $project = @($script:projects | Where-Object { $_.id -eq $script:selectedProjectId } | Select-Object -First 1)
-    if ($project.Count -eq 0 -or -not $project[0].latestReviewRoot) { return }
-
-    $previousRoot = [System.IO.Path]::GetFullPath([string]$project[0].latestReviewRoot)
+    if ($project.Count -eq 0) { return }
     $currentRoot = [System.IO.Path]::GetFullPath($script:reviewRoot)
-    if ($previousRoot.TrimEnd("\", "/") -eq $currentRoot.TrimEnd("\", "/")) { return }
-
-    $previousDecisionFile = Join-Path $previousRoot "review-decisions.json"
-    if (-not (Test-Path -LiteralPath $previousDecisionFile)) { return }
+    $previousDecisionFile = Find-PreviousProjectDecisionFile -Project $project[0] -CurrentRoot $currentRoot
+    if (-not $previousDecisionFile) { return }
 
     try {
         $json = [System.IO.File]::ReadAllText($previousDecisionFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-        $lookup = @{}
+        $targetKeyLookup = @{}
+        $uniqueKeyLookup = @{}
+        $ambiguousKeys = @{}
+        $idOnlyLookup = @{}
         foreach ($item in @($json.items)) {
             if (-not $item) { continue }
-            if ($item.target -and $item.key) { $lookup["target:$($item.target)|key:$($item.key)"] = $item }
-            if ($item.key) { $lookup["key:$($item.key)"] = $item }
-            if ($item.id) { $lookup["id:$($item.id)"] = $item }
+            if ($item.key) {
+                $plainKey = "key:$($item.key)"
+                if ($item.target) { $targetKeyLookup["target:$($item.target)|$plainKey"] = $item }
+                if ($ambiguousKeys.ContainsKey($plainKey)) { continue }
+                if ($uniqueKeyLookup.ContainsKey($plainKey)) {
+                    $uniqueKeyLookup.Remove($plainKey)
+                    $ambiguousKeys[$plainKey] = $true
+                } else {
+                    $uniqueKeyLookup[$plainKey] = $item
+                }
+            } elseif ($item.id) {
+                $idOnlyLookup["id:$($item.id)"] = $item
+            }
         }
 
         $imported = 0
+        $changedSources = 0
         foreach ($row in $script:rows) {
             $target = Get-RelativeTarget $row
             $item = $null
-            foreach ($lookupKey in @("target:$target|key:$($row.key)", "key:$($row.key)", "id:$($row.id)")) {
-                if ($lookup.ContainsKey($lookupKey)) {
-                    $item = $lookup[$lookupKey]
-                    break
+            if ($row.key) {
+                $plainKey = "key:$($row.key)"
+                $targetKey = "target:$target|$plainKey"
+                if ($targetKeyLookup.ContainsKey($targetKey)) {
+                    $item = $targetKeyLookup[$targetKey]
+                } elseif ($uniqueKeyLookup.ContainsKey($plainKey)) {
+                    $item = $uniqueKeyLookup[$plainKey]
                 }
+            } elseif ($row.id) {
+                $idKey = "id:$($row.id)"
+                if ($idOnlyLookup.ContainsKey($idKey)) { $item = $idOnlyLookup[$idKey] }
             }
             if (-not $item) { continue }
             $decision = [pscustomobject]@{
@@ -1302,11 +1348,13 @@ function Import-PreviousProjectDecisions {
                 updatedAt = [string]$item.updatedAt
             }
             Normalize-DecisionForRow -Row $row -Decision $decision
+            if (ConvertTo-BoolValue $decision.sourceChanged) { $changedSources++ }
             $script:decisions[(Get-RowIdentity $row)] = $decision
             $imported++
         }
         if ($imported -gt 0) {
-            Add-Log "이전 검수 상태 $imported개를 이어받았습니다."
+            Add-Log "이전 검수 상태 ${imported}개를 이어받았습니다."
+            if ($changedSources -gt 0) { Add-Log "원문이 바뀐 ${changedSources}개 항목을 변경됨·미번역 상태로 표시했습니다." }
             $script:dirty = $true
             Save-Decisions
         }
@@ -1365,6 +1413,101 @@ function Save-CurrentEdit {
         $decision.updatedAt = (Get-Date).ToString("o")
         $script:dirty = $true
         $lblSave.Text = "저장 필요"
+    }
+}
+
+function Get-DuplicateSourceRowIndexes([int]$RowIndex, [string]$Translation) {
+    $matches = New-Object "System.Collections.Generic.List[int]"
+    if ($RowIndex -lt 0 -or $RowIndex -ge $script:rows.Count) { return $matches.ToArray() }
+
+    $source = ConvertTo-FlatString $script:rows[$RowIndex].source
+    $translationText = ConvertTo-FlatString $Translation
+    if ([string]::IsNullOrWhiteSpace($source) -or [string]::IsNullOrWhiteSpace($translationText)) {
+        return $matches.ToArray()
+    }
+
+    for ($i = 0; $i -lt $script:rows.Count; $i++) {
+        if ($i -eq $RowIndex) { continue }
+        $candidateSource = ConvertTo-FlatString $script:rows[$i].source
+        if (-not [string]::Equals($source, $candidateSource, [System.StringComparison]::Ordinal)) { continue }
+
+        $decision = Get-Decision $script:rows[$i]
+        $sameTranslation = [string]::Equals(
+            $translationText,
+            (ConvertTo-FlatString $decision.text),
+            [System.StringComparison]::Ordinal
+        )
+        $settledStatus = [string]$decision.status -in @("translated", "approved")
+        if (-not $sameTranslation -or -not $settledStatus -or (ConvertTo-BoolValue $decision.sourceChanged)) {
+            [void]$matches.Add($i)
+        }
+    }
+    return $matches.ToArray()
+}
+
+function Apply-TranslationToDuplicateRows([int[]]$RowIndexes, [string]$Translation) {
+    $translationText = ConvertTo-FlatString $Translation
+    if ([string]::IsNullOrWhiteSpace($translationText)) { return 0 }
+
+    $changed = 0
+    $updatedAt = (Get-Date).ToString("o")
+    foreach ($index in @($RowIndexes | Select-Object -Unique)) {
+        if ($index -lt 0 -or $index -ge $script:rows.Count) { continue }
+        $decision = Get-Decision $script:rows[$index]
+        $decision.text = $translationText
+        $decision.status = "translated"
+        $decision.sourceChanged = $false
+        $decision.previousSourceText = ""
+        $decision.updatedAt = $updatedAt
+        $changed++
+    }
+    if ($changed -gt 0) {
+        $script:dirty = $true
+        $lblSave.Text = "저장 필요"
+    }
+    return $changed
+}
+
+function Confirm-DuplicateSourceTranslation {
+    if (-not $script:translationEditedByUser -or $script:currentRowIndex -lt 0 -or $script:currentRowIndex -ge $script:rows.Count) {
+        return 0
+    }
+
+    Save-CurrentEdit
+    $translation = ConvertTo-FlatString $txtTranslation.Text
+    $duplicates = @(Get-DuplicateSourceRowIndexes -RowIndex $script:currentRowIndex -Translation $translation)
+    $script:translationEditedByUser = $false
+    $script:translationEditBaseline = $translation
+    if ($duplicates.Count -eq 0) { return 0 }
+
+    $preview = $translation
+    if ($preview.Length -gt 240) { $preview = $preview.Substring(0, 237) + "..." }
+    $message = "같은 원문을 사용하는 항목 중 번역을 맞춰야 할 다른 항목이 $($duplicates.Count)개 있습니다.`r`n`r`n번역문:`r`n$preview`r`n`r`n다른 항목도 이 번역으로 통일할까요?`r`n`r`n예: 동일 원문 전체 통일`r`n아니요: 현재 항목만 적용"
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        $form,
+        $message,
+        "동일 원문 일괄 번역",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question,
+        [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+    )
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return 0 }
+
+    $changed = Apply-TranslationToDuplicateRows -RowIndexes $duplicates -Translation $translation
+    if ($changed -gt 0) {
+        Add-Log "동일 원문 번역을 현재 항목 외 $changed개에 일괄 적용했습니다."
+        Save-Decisions
+    }
+    return $changed
+}
+
+function Save-ReviewWithDuplicatePrompt {
+    $changed = Confirm-DuplicateSourceTranslation
+    Save-Decisions
+    if ($changed -gt 0) {
+        $current = $script:currentRowIndex
+        Refresh-FileList
+        Refresh-ItemList -SelectRowIndex $current
     }
 }
 
@@ -1647,6 +1790,15 @@ function Set-HistoryView([string]$Source, [string]$Existing, [string]$Candidate,
 
 function Select-RowIndex([int]$Index) {
     if ($Index -lt 0 -or $Index -ge $script:rows.Count) { return }
+    $previousIndex = $script:currentRowIndex
+    if ($previousIndex -ge 0 -and $previousIndex -ne $Index) {
+        $changed = Confirm-DuplicateSourceTranslation
+        if ($changed -gt 0) {
+            Refresh-FileList
+            Refresh-ItemList -SelectRowIndex $Index
+            return
+        }
+    }
     Save-CurrentEdit
     $script:loading = $true
     try {
@@ -1689,6 +1841,10 @@ function Select-RowIndex([int]$Index) {
     } finally {
         $script:loading = $false
     }
+    if ($previousIndex -ne $Index) {
+        $script:translationEditedByUser = $false
+        $script:translationEditBaseline = $translation
+    }
 }
 
 function Update-TermsForRow([object]$Row) {
@@ -1729,6 +1885,7 @@ function Move-Selection([int]$Delta) {
 function Mark-Current([string]$Status, [bool]$Advance) {
     if ($script:currentRowIndex -lt 0) { return }
     Save-CurrentEdit
+    [void](Confirm-DuplicateSourceTranslation)
     $row = $script:rows[$script:currentRowIndex]
     Set-DecisionStatus -Row $row -Status $Status
     Save-Decisions
@@ -1738,7 +1895,7 @@ function Mark-Current([string]$Status, [bool]$Advance) {
     if ($Advance) { Move-Selection 1 }
 }
 
-function Load-ReviewRoot([string]$Root, [switch]$NoImport) {
+function Load-ReviewRoot([string]$Root) {
     if (-not $Root -or -not (Test-Path -LiteralPath $Root -PathType Container)) {
         throw "검토 폴더를 찾을 수 없습니다: $Root"
     }
@@ -1763,7 +1920,7 @@ function Load-ReviewRoot([string]$Root, [switch]$NoImport) {
     $script:rows = @($parsed)
     $script:currentRowIndex = -1
     Load-Decisions
-    if (-not $NoImport) { Import-PreviousProjectDecisions }
+    Import-PreviousProjectDecisions
     foreach ($row in $script:rows) { [void](Get-Decision $row) }
     if ($script:dirty) { Save-Decisions }
     $script:currentFile = "__ALL__"
@@ -1939,7 +2096,7 @@ function Start-Translation {
         return
     }
 
-    Save-Decisions
+    Save-ReviewWithDuplicatePrompt
     Ensure-AppDataStore
     Remove-TempFiles
     $script:lastReviewOutputPath = ""
@@ -2024,7 +2181,7 @@ function Load-SourceOnlyForSelectedMod {
         return
     }
 
-    Save-Decisions
+    Save-ReviewWithDuplicatePrompt
     Ensure-AppDataStore
     Remove-TempFiles
     $script:lastReviewOutputPath = ""
@@ -2052,7 +2209,7 @@ function Load-SourceOnlyForSelectedMod {
             Update-ProgressFromLine ([string]$line)
         }
         if ($exitCode -eq 0 -and $script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath -PathType Container)) {
-            Load-ReviewRoot $script:lastReviewOutputPath -NoImport
+            Load-ReviewRoot $script:lastReviewOutputPath
             Register-ProjectRun -ReviewRoot $script:lastReviewOutputPath -Provider "sourceonly"
             $lblRunStatus.Text = "원문 로드 완료"
             Add-Log "원문 목록을 불러왔습니다. 기존 한국어 번역이 있으면 번역칸의 기본값으로 사용합니다."
@@ -2084,7 +2241,7 @@ function Apply-ReviewedTranslations([string]$ApplyStatus = "ApprovedOnly") {
         [System.Windows.Forms.MessageBox]::Show("검토 적용 스크립트를 찾을 수 없습니다.`r`n$script:reviewApplyScript", "RimWorld AI Translator") | Out-Null
         return
     }
-    Save-Decisions
+    Save-ReviewWithDuplicatePrompt
     $modeLabel = if ($ApplyStatus -eq "TranslatedAndApproved") { "번역됨 적용" } else { "검토됨 적용" }
     $eligibleCount = 0
     foreach ($row in $script:rows) {
@@ -2469,7 +2626,7 @@ function Focus-NextWorkRegion([int]$Direction = 1) {
 
 function Show-Dashboard([string]$Tab = "projects") {
     if (-not $dashboardPanel) { return }
-    Save-CurrentEdit
+    Save-ReviewWithDuplicatePrompt
     $top.Visible = $false
     $main.Visible = $false
     $dashboardPanel.Visible = $true
@@ -3711,6 +3868,7 @@ $cmbProject.Add_SelectedIndexChanged({
     if ($script:loadingProjectList -or -not $cmbProject.SelectedItem) { return }
     $project = $cmbProject.SelectedItem.Project
     if (-not $project) { return }
+    Save-ReviewWithDuplicatePrompt
     Set-ActiveProject $project
     if ($project.modRoot -and (Test-Path -LiteralPath $project.modRoot -PathType Container)) {
         return
@@ -3731,7 +3889,7 @@ $btnApplyTranslated.Add_Click({ Apply-ReviewedTranslations "TranslatedAndApprove
 $btnHome.Add_Click({ Show-Dashboard "projects" })
 $btnLoad.Add_Click({ Load-SourceOnlyForSelectedMod })
 $btnOpenFolder.Add_Click({ Open-ModFolder })
-$btnSave.Add_Click({ Save-Decisions })
+$btnSave.Add_Click({ Save-ReviewWithDuplicatePrompt })
 $btnDashProjects.Add_Click({ Show-Dashboard "projects" })
 $btnDashActivity.Add_Click({ Show-Dashboard "activity" })
 $btnDashSettings.Add_Click({ Show-Dashboard "settings" })
@@ -3800,6 +3958,11 @@ $txtTranslation.Add_Leave({
 })
 $txtTranslation.Add_TextChanged({
     if (-not $script:loading) {
+        $script:translationEditedByUser = -not [string]::Equals(
+            (ConvertTo-FlatString $txtTranslation.Text),
+            (ConvertTo-FlatString $script:translationEditBaseline),
+            [System.StringComparison]::Ordinal
+        )
         $script:dirty = $true
         $lblSave.Text = if ($script:autoSave) { "자동 저장 대기" } else { "저장 필요" }
         Queue-AutoSave
@@ -3833,6 +3996,8 @@ $btnResetEdit.Add_Click({
         $decision = Get-Decision $script:rows[$script:currentRowIndex]
         $script:loading = $true
         try { $txtTranslation.Text = ConvertTo-FlatString $decision.text } finally { $script:loading = $false }
+        $script:translationEditedByUser = $false
+        $script:translationEditBaseline = ConvertTo-FlatString $decision.text
         $lblSave.Text = ""
     }
 })
@@ -3857,7 +4022,7 @@ $form.Add_KeyDown({
         }
         $_.SuppressKeyPress = $true
     } elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::S) {
-        Save-Decisions
+        Save-ReviewWithDuplicatePrompt
         $_.SuppressKeyPress = $true
     } elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
         Mark-Current "approved" $true
@@ -3945,6 +4110,7 @@ $form.Add_FormClosing({
         try { Stop-ProcessTree $script:process.Id } catch {}
     }
     Remove-TempFiles
+    [void](Confirm-DuplicateSourceTranslation)
     if ($script:dirty) {
         $result = [System.Windows.Forms.MessageBox]::Show("저장하지 않은 검수 내용이 있습니다. 저장할까요?", "RimWorld AI Translator", [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, [System.Windows.Forms.MessageBoxIcon]::Question)
         if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
