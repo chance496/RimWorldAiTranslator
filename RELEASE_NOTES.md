@@ -1,3 +1,14 @@
+# RimWorld AI Translator v0.1.17
+
+## Changes
+
+- Changed translated-entry safety checks to validate the reviewer's current edited text instead of stale AI-candidate metadata.
+- Added protected-token, Korean-text, source-copy, blank-text, and pathological-newline checks to both the review UI and final apply path.
+- Cached translation validation and warning results, with automatic invalidation whenever source or translation text changes.
+- Optimized `Complete and next` to update only the active card and affected counters instead of serializing every decision and rebuilding the full list on each click.
+- Batched routine status saves through the existing 1.2-second autosave timer while preserving immediate saves for explicit save, apply, project changes, and shutdown.
+- Measured a 91.9 ms median transition time on a 749-entry review project, and 66.6 ms while using the translated-status filter.
+
 # RimWorld AI Translator v0.1.16
 
 ## Changes
