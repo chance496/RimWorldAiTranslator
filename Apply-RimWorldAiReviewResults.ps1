@@ -101,6 +101,32 @@ function Test-DecisionSourceChanged([object]$Item, [object]$Row) {
     return $false
 }
 
+function Get-ProtectedTokens([string]$Text) {
+    $tokens = New-Object "System.Collections.Generic.HashSet[string]"
+    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b)'
+    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
+        [void]$tokens.Add($match.Value)
+    }
+    $result = New-Object string[] $tokens.Count
+    $tokens.CopyTo($result)
+    return $result
+}
+
+function Test-TranslationSafe([object]$Row, [string]$Translation) {
+    $source = ConvertTo-FlatString $Row.source
+    $translationText = ConvertTo-FlatString $Translation
+    if ([string]::IsNullOrWhiteSpace($translationText)) { return $false }
+    if ([string]::Equals($source, $translationText, [System.StringComparison]::Ordinal)) { return $false }
+    if ($translationText -notmatch "[\uAC00-\uD7AF]") { return $false }
+    if ($translationText -match "(\r?\n\s*){8,}" -or $translationText -match "(\\u000a\s*){8,}") { return $false }
+    $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($translationText, "\r?\n").Count
+    if ($newlineCount -ge 20 -and $translationText.Length -lt 4000) { return $false }
+    foreach ($token in (Get-ProtectedTokens $source)) {
+        if (-not $translationText.Contains($token)) { return $false }
+    }
+    return $true
+}
+
 function Test-StatusIncluded([string]$Status, [string]$Mode) {
     if ($Status -eq "approved") { return $true }
     return $Mode -eq "TranslatedAndApproved" -and $Status -eq "translated"
@@ -283,7 +309,7 @@ if (Test-Path -LiteralPath $decisionFile) {
             $skippedNotApproved++
             continue
         }
-        if ($status -eq "translated" -and -not (ConvertTo-BoolValue $row.safeToApply)) {
+        if ($status -eq "translated" -and -not (Test-TranslationSafe -Row $row -Translation $candidateText)) {
             $skippedUnsafe++
             continue
         }
@@ -302,7 +328,7 @@ if (Test-Path -LiteralPath $decisionFile) {
     if ($ApplyStatus -eq "TranslatedAndApproved") {
         Write-Host "Applying safe translated candidates from comparison JSON."
         foreach ($row in $rows) {
-            if (-not (ConvertTo-BoolValue $row.safeToApply)) {
+            if (-not (Test-TranslationSafe -Row $row -Translation ([string]$row.candidate))) {
                 $skippedUnsafe++
                 continue
             }

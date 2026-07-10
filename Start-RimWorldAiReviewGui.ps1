@@ -64,7 +64,9 @@ $script:reviewRoot = ""
 $script:comparisonFile = ""
 $script:rows = @()
 $script:decisions = @{}
+$script:validationCache = @{}
 $script:fileGroups = @()
+$script:reviewStats = $null
 $script:visibleRowIndexes = @()
 $script:maxRenderedCards = 80
 $script:currentRowIndex = -1
@@ -1052,15 +1054,99 @@ function Refresh-StatusFilterButtons {
     }
 }
 
-function Get-RowWarnings([object]$Row) {
+function Get-ProtectedTokensForValidation([string]$Text) {
+    $tokens = New-Object "System.Collections.Generic.HashSet[string]"
+    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b)'
+    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
+        [void]$tokens.Add($match.Value)
+    }
+    $result = New-Object string[] $tokens.Count
+    $tokens.CopyTo($result)
+    return $result
+}
+
+function Get-MissingTranslationTokens([string]$Source, [string]$Translation) {
+    $missing = New-Object "System.Collections.Generic.List[string]"
+    foreach ($token in (Get-ProtectedTokensForValidation $Source)) {
+        if (-not $Translation.Contains($token)) { [void]$missing.Add($token) }
+    }
+    return $missing.ToArray()
+}
+
+function Test-PathologicalTranslationText([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    if ($Text -match "(\r?\n\s*){8,}") { return $true }
+    if ($Text -match "(\\u000a\s*){8,}") { return $true }
+    $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($Text, "\r?\n").Count
+    return $newlineCount -ge 20 -and $Text.Length -lt 4000
+}
+
+function Test-ContainsKoreanText([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return $Text -match "[\uAC00-\uD7AF]"
+}
+
+function Get-TranslationValidation([object]$Row, [string]$Translation) {
+    $source = ConvertTo-FlatString $Row.source
+    $translationText = ConvertTo-FlatString $Translation
+    $isBlank = [string]::IsNullOrWhiteSpace($translationText)
+    $isPathological = Test-PathologicalTranslationText $translationText
+    $missingTokens = @(Get-MissingTranslationTokens -Source $source -Translation $translationText)
+    $sameAsSource = [string]::Equals($source, $translationText, [System.StringComparison]::Ordinal)
+    $hasKorean = Test-ContainsKoreanText $translationText
+    $safeToApply = -not $isBlank -and -not $isPathological -and $missingTokens.Count -eq 0 -and -not $sameAsSource -and $hasKorean
+    return [pscustomobject]@{
+        SafeToApply = $safeToApply
+        IsBlank = $isBlank
+        IsPathological = $isPathological
+        MissingTokens = $missingTokens
+        SameAsSource = $sameAsSource
+        HasKorean = $hasKorean
+    }
+}
+
+function Get-TranslationValidationCacheEntry([object]$Row, [string]$Translation) {
+    $identity = Get-RowIdentity $Row
+    $source = ConvertTo-FlatString $Row.source
+    $translationText = ConvertTo-FlatString $Translation
+    if ($script:validationCache.ContainsKey($identity)) {
+        $cached = $script:validationCache[$identity]
+        if (
+            [string]::Equals([string]$cached.Source, $source, [System.StringComparison]::Ordinal) -and
+            [string]::Equals([string]$cached.Translation, $translationText, [System.StringComparison]::Ordinal)
+        ) {
+            return $cached
+        }
+    }
+
+    $entry = [pscustomobject]@{
+        Source = $source
+        Translation = $translationText
+        Validation = Get-TranslationValidation -Row $Row -Translation $translationText
+        Warnings = $null
+    }
+    $script:validationCache[$identity] = $entry
+    return $entry
+}
+
+function Get-CachedTranslationValidation([object]$Row, [string]$Translation) {
+    return (Get-TranslationValidationCacheEntry -Row $Row -Translation $Translation).Validation
+}
+
+function Get-RowWarnings([object]$Row, [string]$Translation) {
+    $cacheEntry = Get-TranslationValidationCacheEntry -Row $Row -Translation $Translation
+    if ($null -ne $cacheEntry.Warnings) { return @($cacheEntry.Warnings) }
+
+    $validation = $cacheEntry.Validation
     $warnings = New-Object "System.Collections.Generic.List[string]"
-    if (-not (ConvertTo-BoolValue $Row.safeToApply)) { [void]$warnings.Add("안전 적용 아님") }
-    if (ConvertTo-BoolValue $Row.candidateBlank) { [void]$warnings.Add("빈 후보") }
-    if (ConvertTo-BoolValue $Row.pathologicalCandidate) { [void]$warnings.Add("비정상 개행") }
-    if (-not [string]::IsNullOrWhiteSpace([string]$Row.missingTokens)) { [void]$warnings.Add("토큰 누락: $($Row.missingTokens)") }
-    if (ConvertTo-BoolValue $Row.candidateSameAsSource) { [void]$warnings.Add("원문과 동일") }
-    if (-not (ConvertTo-BoolValue $Row.candidateHasKorean)) { [void]$warnings.Add("한글 없음") }
-    return $warnings.ToArray()
+    if (-not $validation.SafeToApply) { [void]$warnings.Add("안전 적용 아님") }
+    if ($validation.IsBlank) { [void]$warnings.Add("빈 번역") }
+    if ($validation.IsPathological) { [void]$warnings.Add("비정상 개행") }
+    if ($validation.MissingTokens.Count -gt 0) { [void]$warnings.Add("토큰 누락: $([string]::Join('|', $validation.MissingTokens))") }
+    if ($validation.SameAsSource) { [void]$warnings.Add("원문과 동일") }
+    if (-not $validation.HasKorean) { [void]$warnings.Add("한글 없음") }
+    $cacheEntry.Warnings = $warnings.ToArray()
+    return @($cacheEntry.Warnings)
 }
 
 function Get-RelativeTarget([object]$Row) {
@@ -1401,6 +1487,7 @@ function Save-CurrentEdit {
     $row = $script:rows[$script:currentRowIndex]
     $decision = Get-Decision $row
     if ($decision.text -ne $txtTranslation.Text -or $decision.note -ne $txtMemo.Text) {
+        $before = if ($script:reviewStats) { Get-DecisionStateSnapshot $row } else { $null }
         $decision.text = ConvertTo-FlatString $txtTranslation.Text
         $decision.note = [string]$txtMemo.Text
         if ([string]::IsNullOrWhiteSpace($decision.text)) {
@@ -1413,6 +1500,13 @@ function Save-CurrentEdit {
         $decision.updatedAt = (Get-Date).ToString("o")
         $script:dirty = $true
         $lblSave.Text = "저장 필요"
+        if ($before) {
+            $after = Get-DecisionStateSnapshot $row
+            Update-ReviewStatsForDecisionChange -Before $before -After $after
+            Update-FileListGroupDisplay ([string]$after.File)
+            [void](Update-RenderedItemCard $script:currentRowIndex)
+            Refresh-Summary
+        }
     }
 }
 
@@ -1514,7 +1608,6 @@ function Save-ReviewWithDuplicatePrompt {
 function Get-RowPassesFilter([object]$Row) {
     $decision = Get-Decision $Row
     $status = [string]$cmbStatus.SelectedItem
-    $warnings = @(Get-RowWarnings $Row)
     if ($script:currentFile -ne "__ALL__" -and (Get-RelativeTarget $Row) -ne $script:currentFile) { return $false }
     switch ($status) {
         "미번역" { if ($decision.status -ne "pending") { return $false } }
@@ -1523,7 +1616,10 @@ function Get-RowPassesFilter([object]$Row) {
         "업데이트로 변경됨" { if (-not (ConvertTo-BoolValue $decision.sourceChanged)) { return $false } }
         "반려" { if ($decision.status -ne "rejected") { return $false } }
         "보류" { if ($decision.status -ne "hold") { return $false } }
-        "주의" { if ($warnings.Count -eq 0) { return $false } }
+        "주의" {
+            $warnings = @(Get-RowWarnings -Row $Row -Translation (ConvertTo-FlatString $decision.text))
+            if ($warnings.Count -eq 0) { return $false }
+        }
         "후보 있음" { if ([string]::IsNullOrWhiteSpace([string]$Row.candidate)) { return $false } }
         "기존 있음" { if ([string]::IsNullOrWhiteSpace([string]$Row.existing)) { return $false } }
     }
@@ -1558,26 +1654,13 @@ function Get-ItemPreview([object]$Row) {
 }
 
 function Refresh-Summary {
-    $total = $script:rows.Count
-    $approved = 0
-    $translated = 0
-    $rejected = 0
-    $hold = 0
-    $pending = 0
-    $updated = 0
-    $warn = 0
-    foreach ($row in $script:rows) {
-        $decision = Get-Decision $row
-        switch ($decision.status) {
-            "approved" { $approved++ }
-            "translated" { $translated++ }
-            "rejected" { $rejected++ }
-            "hold" { $hold++ }
-            default { $pending++ }
-        }
-        if (ConvertTo-BoolValue $decision.sourceChanged) { $updated++ }
-        if (@(Get-RowWarnings $row).Count -gt 0) { $warn++ }
-    }
+    if (-not $script:reviewStats) { Build-FileGroups }
+    $total = [int]$script:reviewStats.Total
+    $approved = [int]$script:reviewStats.Approved
+    $translated = [int]$script:reviewStats.Translated
+    $pending = [int]$script:reviewStats.Pending
+    $updated = [int]$script:reviewStats.Updated
+    $warn = [int]$script:reviewStats.Warnings
     $done = if ($total -gt 0) { [int](($approved / $total) * 100) } else { 0 }
     $lblProjectStats.Text = "전체 $total  ·  미번역 $pending  ·  번역 $translated`r`n검토 $approved  ·  업데이트 변경 $updated"
     if ($toolTip) { $toolTip.SetToolTip($lblProjectStats, "주의가 필요한 문자열: $warn개") }
@@ -1593,8 +1676,61 @@ function Refresh-Summary {
     $lblProgress.Text = "검토 진행률 $done%"
 }
 
+function Add-StatusToStats([object]$Stats, [string]$Status, [int]$Delta) {
+    if (-not $Stats -or $Delta -eq 0) { return }
+    switch ($Status) {
+        "approved" { $Stats.Approved = [Math]::Max(0, [int]$Stats.Approved + $Delta) }
+        "translated" { $Stats.Translated = [Math]::Max(0, [int]$Stats.Translated + $Delta) }
+        "rejected" { $Stats.Rejected = [Math]::Max(0, [int]$Stats.Rejected + $Delta) }
+        "hold" { $Stats.Hold = [Math]::Max(0, [int]$Stats.Hold + $Delta) }
+        default { $Stats.Pending = [Math]::Max(0, [int]$Stats.Pending + $Delta) }
+    }
+}
+
+function Add-StatusToFileGroup([object]$Group, [string]$Status, [int]$Delta) {
+    if (-not $Group -or $Delta -eq 0) { return }
+    switch ($Status) {
+        "approved" { $Group.Approved = [Math]::Max(0, [int]$Group.Approved + $Delta) }
+        "translated" { $Group.Translated = [Math]::Max(0, [int]$Group.Translated + $Delta) }
+        default { $Group.Pending = [Math]::Max(0, [int]$Group.Pending + $Delta) }
+    }
+}
+
+function Get-DecisionStateSnapshot([object]$Row) {
+    $decision = Get-Decision $Row
+    return [pscustomobject]@{
+        File = Get-RelativeTarget $Row
+        Status = [string]$decision.status
+        Updated = ConvertTo-BoolValue $decision.sourceChanged
+        Warning = @(Get-RowWarnings -Row $Row -Translation (ConvertTo-FlatString $decision.text)).Count -gt 0
+    }
+}
+
+function Update-ReviewStatsForDecisionChange([object]$Before, [object]$After) {
+    if (-not $Before -or -not $After -or -not $script:reviewStats) { return }
+
+    Add-StatusToStats -Stats $script:reviewStats -Status ([string]$Before.Status) -Delta -1
+    Add-StatusToStats -Stats $script:reviewStats -Status ([string]$After.Status) -Delta 1
+    if ([bool]$Before.Updated -ne [bool]$After.Updated) {
+        $script:reviewStats.Updated = [Math]::Max(0, [int]$script:reviewStats.Updated + $(if ($After.Updated) { 1 } else { -1 }))
+    }
+    if ([bool]$Before.Warning -ne [bool]$After.Warning) {
+        $script:reviewStats.Warnings = [Math]::Max(0, [int]$script:reviewStats.Warnings + $(if ($After.Warning) { 1 } else { -1 }))
+    }
+
+    $group = $script:fileGroups | Where-Object { $_.File -eq [string]$After.File } | Select-Object -First 1
+    if ($group) {
+        Add-StatusToFileGroup -Group $group -Status ([string]$Before.Status) -Delta -1
+        Add-StatusToFileGroup -Group $group -Status ([string]$After.Status) -Delta 1
+        if ([bool]$Before.Warning -ne [bool]$After.Warning) {
+            $group.Warnings = [Math]::Max(0, [int]$group.Warnings + $(if ($After.Warning) { 1 } else { -1 }))
+        }
+    }
+}
+
 function Build-FileGroups {
     $groups = @{}
+    $stats = [pscustomobject]@{ Total = 0; Approved = 0; Translated = 0; Rejected = 0; Hold = 0; Pending = 0; Updated = 0; Warnings = 0 }
     foreach ($row in $script:rows) {
         $rel = Get-RelativeTarget $row
         if (-not $groups.ContainsKey($rel)) {
@@ -1602,14 +1738,22 @@ function Build-FileGroups {
         }
         $group = $groups[$rel]
         $group.Total++
-        switch ((Get-Decision $row).status) {
+        $stats.Total++
+        $decision = Get-Decision $row
+        Add-StatusToStats -Stats $stats -Status ([string]$decision.status) -Delta 1
+        switch ($decision.status) {
             "approved" { $group.Approved++ }
             "translated" { $group.Translated++ }
             default { $group.Pending++ }
         }
-        if (@(Get-RowWarnings $row).Count -gt 0) { $group.Warnings++ }
+        if (ConvertTo-BoolValue $decision.sourceChanged) { $stats.Updated++ }
+        if (@(Get-RowWarnings -Row $row -Translation (ConvertTo-FlatString $decision.text)).Count -gt 0) {
+            $group.Warnings++
+            $stats.Warnings++
+        }
     }
     $script:fileGroups = @($groups.Values | Sort-Object File)
+    $script:reviewStats = $stats
 }
 
 function Refresh-FileList {
@@ -1650,7 +1794,7 @@ function Refresh-ItemList([int]$SelectRowIndex = -1) {
             $script:visibleRowIndexes += $i
             if ($rendered -ge $script:maxRenderedCards) { continue }
             $decision = Get-Decision $row
-            $warnings = @(Get-RowWarnings $row)
+            $warnings = @(Get-RowWarnings -Row $row -Translation (ConvertTo-FlatString $decision.text))
             $preview = Get-ItemPreview $row
             $isUpdated = ConvertTo-BoolValue $decision.sourceChanged
             $statusText = if ($isUpdated) { "변경됨" } else { Get-StatusText $decision.status }
@@ -1676,12 +1820,16 @@ function Refresh-ItemList([int]$SelectRowIndex = -1) {
             if ($keyText.Length -gt 46) { $keyText = $keyText.Substring(0, 43) + "..." }
             $statusWidth = if ($isUpdated) { 70 } else { 60 }
             $lblStatus = New-Label $statusText ($card.Width - $statusWidth - 14) 9 $statusWidth 20 $statusColor 8 ([System.Drawing.FontStyle]::Bold)
+            $lblStatus.Name = "StatusLabel"
             $lblStatus.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
             $lblSourcePreview = New-Label $preview[0] 18 9 ($card.Width - $statusWidth - 42) (23 + $textDelta) $script:itemText ([Math]::Max(8.5, $script:textSize - 0.5))
+            $lblSourcePreview.Name = "SourcePreviewLabel"
             $translationY = 34 + $textDelta
             $keyY = 62 + ($textDelta * 3)
             $lblTranslationPreview = New-Label $preview[1] 18 $translationY ($card.Width - 34) (22 + $textDelta) $script:itemMuted ([Math]::Max(8, $script:textSize - 1.5))
+            $lblTranslationPreview.Name = "TranslationPreviewLabel"
             $lblKey = New-Label $keyText 18 $keyY ($card.Width - 34) 18 $script:itemSubtle 7.8
+            $lblKey.Name = "KeyLabel"
             if ([string]::IsNullOrWhiteSpace($preview[1])) { $lblTranslationPreview.Text = "번역 대기" }
             if ($warnings.Count -gt 0) {
                 $lblTranslationPreview.Text = "주의 · " + $lblTranslationPreview.Text
@@ -1805,7 +1953,8 @@ function Select-RowIndex([int]$Index) {
         $script:currentRowIndex = $Index
         $row = $script:rows[$Index]
         $decision = Get-Decision $row
-        $warnings = @(Get-RowWarnings $row)
+        $translationValidation = Get-CachedTranslationValidation -Row $row -Translation (ConvertTo-FlatString $decision.text)
+        $warnings = @(Get-RowWarnings -Row $row -Translation (ConvertTo-FlatString $decision.text))
         $relative = Get-RelativeTarget $row
         $source = ConvertTo-FlatString $row.source
         $candidate = ConvertTo-FlatString $row.candidate
@@ -1829,7 +1978,7 @@ function Select-RowIndex([int]$Index) {
         $txtCandidate.Text = $candidate
         $txtMemo.Text = [string]$decision.note
         $wordCount = @($source -split '\s+' | Where-Object { $_ }).Count
-        $safeText = if (ConvertTo-BoolValue $row.safeToApply) { "예" } else { "아니요" }
+        $safeText = if ($translationValidation.SafeToApply) { "예" } else { "아니요" }
         $txtMeta.Text = "키  $($row.key)`r`n파일  $relative`r`nID  $($row.id)   ·   단어 $wordCount   ·   안전 적용 $safeText"
         $issueLines = New-Object "System.Collections.Generic.List[string]"
         if ($sourceChanged) { [void]$issueLines.Add("업데이트로 원문이 변경되었습니다. 다시 번역하거나 검토해야 적용할 수 있습니다.") }
@@ -1845,6 +1994,78 @@ function Select-RowIndex([int]$Index) {
         $script:translationEditedByUser = $false
         $script:translationEditBaseline = $translation
     }
+}
+
+function Update-FileListGroupDisplay([string]$RelativeFile) {
+    if (-not $lvFiles -or [string]::IsNullOrWhiteSpace($RelativeFile)) { return }
+    $group = $script:fileGroups | Where-Object { $_.File -eq $RelativeFile } | Select-Object -First 1
+    if (-not $group) { return }
+    foreach ($item in @($lvFiles.Items)) {
+        if ([string]$item.Tag -ne $RelativeFile) { continue }
+        if ($item.SubItems.Count -ge 3) {
+            $item.SubItems[1].Text = "$($group.Approved)/$($group.Total)"
+            $item.SubItems[2].Text = [string]$group.Warnings
+        }
+        break
+    }
+}
+
+function Update-RenderedItemCard([int]$RowIndex) {
+    if ($RowIndex -lt 0 -or $RowIndex -ge $script:rows.Count -or -not $flowItems) { return $false }
+
+    $card = $null
+    foreach ($control in @($flowItems.Controls)) {
+        if (($control.Tag -is [int]) -and [int]$control.Tag -eq $RowIndex) {
+            $card = $control
+            break
+        }
+    }
+    if (-not $card) { return $false }
+
+    $row = $script:rows[$RowIndex]
+    $decision = Get-Decision $row
+    $warnings = @(Get-RowWarnings -Row $row -Translation (ConvertTo-FlatString $decision.text))
+    $preview = Get-ItemPreview $row
+    $isUpdated = ConvertTo-BoolValue $decision.sourceChanged
+    $statusText = if ($isUpdated) { "변경됨" } else { Get-StatusText $decision.status }
+    $statusColor = if ($isUpdated) { Get-UpdateColor } else { Get-StatusColor $decision.status }
+    $statusWidth = if ($isUpdated) { 70 } else { 60 }
+
+    $stripe = @($card.Controls.Find("StatusStripe", $true) | Select-Object -First 1)[0]
+    $statusLabel = @($card.Controls.Find("StatusLabel", $true) | Select-Object -First 1)[0]
+    $sourceLabel = @($card.Controls.Find("SourcePreviewLabel", $true) | Select-Object -First 1)[0]
+    $translationLabel = @($card.Controls.Find("TranslationPreviewLabel", $true) | Select-Object -First 1)[0]
+    $keyLabel = @($card.Controls.Find("KeyLabel", $true) | Select-Object -First 1)[0]
+
+    if ($stripe) { $stripe.BackColor = $statusColor }
+    if ($statusLabel) {
+        $statusLabel.Text = $statusText
+        $statusLabel.ForeColor = $statusColor
+        $statusLabel.SetBounds($card.Width - $statusWidth - 14, $statusLabel.Top, $statusWidth, $statusLabel.Height)
+    }
+    if ($sourceLabel) {
+        $sourceLabel.Text = $preview[0]
+        $sourceLabel.Width = $card.Width - $statusWidth - 42
+    }
+    if ($translationLabel) {
+        $translationLabel.Text = if ([string]::IsNullOrWhiteSpace($preview[1])) { "번역 대기" } else { $preview[1] }
+        $translationLabel.ForeColor = $script:itemMuted
+        if ($warnings.Count -gt 0) {
+            $translationLabel.Text = "주의 · " + $translationLabel.Text
+            $translationLabel.ForeColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(238, 183, 92) } else { [System.Drawing.Color]::FromArgb(145, 91, 16) }
+        }
+    }
+    if ($keyLabel) {
+        $keyText = [string]$row.key
+        if ($keyText.Length -gt 46) { $keyText = $keyText.Substring(0, 43) + "..." }
+        $keyLabel.Text = $keyText
+    }
+
+    $card.AccessibleName = "$statusText, $([string]$row.key)"
+    $translationDescription = if ($translationLabel) { $translationLabel.Text } else { $preview[1] }
+    $card.AccessibleDescription = "$($preview[0]). 번역: $translationDescription"
+    Refresh-ResultSelection
+    return $true
 }
 
 function Update-TermsForRow([object]$Row) {
@@ -1882,17 +2103,58 @@ function Move-Selection([int]$Delta) {
     Select-RowIndex ([int]$script:visibleRowIndexes[$next])
 }
 
+function Get-AdjacentVisibleRowIndex([int]$RowIndex) {
+    if (-not $script:visibleRowIndexes -or $script:visibleRowIndexes.Count -eq 0) { return -1 }
+
+    $position = -1
+    for ($i = 0; $i -lt $script:visibleRowIndexes.Count; $i++) {
+        if ([int]$script:visibleRowIndexes[$i] -eq $RowIndex) {
+            $position = $i
+            break
+        }
+    }
+    if ($position -lt 0) { return [int]$script:visibleRowIndexes[0] }
+    if ($position + 1 -lt $script:visibleRowIndexes.Count) { return [int]$script:visibleRowIndexes[$position + 1] }
+    if ($position -gt 0) { return [int]$script:visibleRowIndexes[$position - 1] }
+    return -1
+}
+
 function Mark-Current([string]$Status, [bool]$Advance) {
     if ($script:currentRowIndex -lt 0) { return }
-    Save-CurrentEdit
-    [void](Confirm-DuplicateSourceTranslation)
-    $row = $script:rows[$script:currentRowIndex]
-    Set-DecisionStatus -Row $row -Status $Status
-    Save-Decisions
     $old = $script:currentRowIndex
-    Refresh-FileList
-    Refresh-ItemList -SelectRowIndex $old
-    if ($Advance) { Move-Selection 1 }
+    $fallback = Get-AdjacentVisibleRowIndex $old
+    $row = $script:rows[$old]
+    Save-CurrentEdit
+    $bulkChanged = Confirm-DuplicateSourceTranslation
+    $before = Get-DecisionStateSnapshot $row
+    Set-DecisionStatus -Row $row -Status $Status
+    $lblSave.Text = if ($script:autoSave) { "자동 저장 대기" } else { "저장 필요" }
+    Queue-AutoSave
+
+    $currentStillVisible = Get-RowPassesFilter $row
+    if ($bulkChanged -gt 0) {
+        Refresh-FileList
+        $target = if ($currentStillVisible) { $old } else { $fallback }
+        Refresh-ItemList -SelectRowIndex $target
+        if ($bulkChanged -gt 0 -and $currentStillVisible -and $Advance) { Move-Selection 1 }
+        return
+    }
+
+    $after = Get-DecisionStateSnapshot $row
+    Update-ReviewStatsForDecisionChange -Before $before -After $after
+    Update-FileListGroupDisplay ([string]$after.File)
+    if (-not $currentStillVisible) {
+        Refresh-ItemList -SelectRowIndex $fallback
+        return
+    }
+
+    [void](Update-RenderedItemCard $old)
+    Refresh-Summary
+    if ($Advance) {
+        Move-Selection 1
+    } else {
+        Select-RowIndex $old
+    }
 }
 
 function Load-ReviewRoot([string]$Root) {
@@ -1918,6 +2180,8 @@ function Load-ReviewRoot([string]$Root) {
     $script:comparisonFile = Find-ComparisonFile $script:reviewRoot
     $parsed = [System.IO.File]::ReadAllText($script:comparisonFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
     $script:rows = @($parsed)
+    $script:validationCache = @{}
+    $script:reviewStats = $null
     $script:currentRowIndex = -1
     Load-Decisions
     Import-PreviousProjectDecisions
@@ -2328,7 +2592,6 @@ function Get-ProjectReviewStats([object]$Project) {
 
         foreach ($row in $rows) {
             $stats.Total++
-            if (@(Get-RowWarnings $row).Count -gt 0) { $stats.Warnings++ }
 
             $decision = $null
             foreach ($identity in @("id:$($row.id)", "key:$($row.key)")) {
@@ -2337,6 +2600,8 @@ function Get-ProjectReviewStats([object]$Project) {
                     break
                 }
             }
+            $translation = if ($decision) { ConvertTo-FlatString $decision.text } else { Get-DefaultTranslationForRow $row }
+            if (@(Get-RowWarnings -Row $row -Translation $translation).Count -gt 0) { $stats.Warnings++ }
 
             $status = if ($decision -and $decision.status) { [string]$decision.status } else {
                 if ([string]::IsNullOrWhiteSpace((Get-DefaultTranslationForRow $row))) { "pending" } else { "translated" }
