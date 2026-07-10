@@ -1,3 +1,11 @@
+# RimWorld AI Translator v0.1.15
+
+## Changes
+
+- Fixed AI translation failing when a saved mod folder path ended with a directory separator.
+- Hardened Windows command-line argument quoting so trailing backslashes and embedded quotes cannot merge later translation options into a path.
+- Normalized project mod paths when projects are created, opened, or translated.
+
 # RimWorld AI Translator v0.1.14
 
 ## Changes

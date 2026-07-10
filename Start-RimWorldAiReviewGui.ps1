@@ -284,8 +284,42 @@ function Save-AppSettings {
 }
 
 function Quote-CmdArgument([string]$Value) {
-    if ($null -eq $Value) { return '""' }
-    return '"' + ($Value -replace '"', '\"') + '"'
+    if ($null -eq $Value -or $Value.Length -eq 0) { return '""' }
+
+    $quoted = New-Object System.Text.StringBuilder
+    [void]$quoted.Append('"')
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq [char]92) {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$quoted.Append([char]92, (($backslashes * 2) + 1))
+            [void]$quoted.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$quoted.Append([char]92, $backslashes)
+            $backslashes = 0
+        }
+        [void]$quoted.Append($character)
+    }
+    if ($backslashes -gt 0) {
+        [void]$quoted.Append([char]92, ($backslashes * 2))
+    }
+    [void]$quoted.Append('"')
+    return $quoted.ToString()
+}
+
+function Get-NormalizedDirectoryPath([string]$Path) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $rootPath = [System.IO.Path]::GetPathRoot($fullPath)
+    while ($fullPath.Length -gt $rootPath.Length -and ($fullPath.EndsWith("\") -or $fullPath.EndsWith("/"))) {
+        $fullPath = $fullPath.Substring(0, $fullPath.Length - 1)
+    }
+    return $fullPath
 }
 
 function New-TempFilePath([string]$Prefix, [string]$Extension) {
@@ -501,7 +535,7 @@ function Get-WorkshopIdFromPath([string]$Path) {
 }
 
 function Get-OrCreateProject([object]$ModInfo) {
-    $modRoot = [System.IO.Path]::GetFullPath([string]$ModInfo.Path)
+    $modRoot = Get-NormalizedDirectoryPath ([string]$ModInfo.Path)
     $projectId = Get-ProjectIdForMod -ModRoot $modRoot -PackageId ([string]$ModInfo.PackageId) -WorkshopId ([string]$ModInfo.WorkshopId)
     $existing = @($script:projects | Where-Object { $_.id -eq $projectId } | Select-Object -First 1)
     if ($existing.Count -gt 0) {
@@ -548,7 +582,7 @@ function Get-ActiveProjectModRoot([switch]$Require) {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($path)) {
-        try { $path = [System.IO.Path]::GetFullPath($path) } catch { $path = "" }
+        try { $path = Get-NormalizedDirectoryPath $path } catch { $path = "" }
     }
 
     if ($path -and (Test-Path -LiteralPath $path -PathType Container)) {
@@ -566,7 +600,7 @@ function Set-ActiveProject([object]$Project) {
     if (-not $Project) { return }
     $script:selectedProjectId = [string]$Project.id
     if ($Project.modRoot) {
-        try { $script:selectedModRoot = [System.IO.Path]::GetFullPath([string]$Project.modRoot) } catch { $script:selectedModRoot = [string]$Project.modRoot }
+        try { $script:selectedModRoot = Get-NormalizedDirectoryPath ([string]$Project.modRoot) } catch { $script:selectedModRoot = [string]$Project.modRoot }
     } else {
         $script:selectedModRoot = ""
     }
