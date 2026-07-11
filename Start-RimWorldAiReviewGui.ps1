@@ -17,16 +17,16 @@ if (-not (Test-Path -LiteralPath $systemPowerShell -PathType Leaf)) {
 if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
     $self = $PSCommandPath
     if (-not $self) { $self = $MyInvocation.MyCommand.Path }
-    $args = @("-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", "`"$self`"")
-    if ($ReviewRoot) { $args += @("-ReviewRoot", "`"$ReviewRoot`"") }
-    if ($LayoutSnapshotPath) { $args += @("-LayoutSnapshotPath", "`"$LayoutSnapshotPath`"") }
-    if ($LayoutSnapshotWidth -gt 0) { $args += @("-LayoutSnapshotWidth", [string]$LayoutSnapshotWidth) }
-    if ($LayoutSnapshotHeight -gt 0) { $args += @("-LayoutSnapshotHeight", [string]$LayoutSnapshotHeight) }
-    if ($InitialDashboardTab) { $args += @("-InitialDashboardTab", "`"$InitialDashboardTab`"") }
-    if ($PreviewTheme) { $args += @("-PreviewTheme", "`"$PreviewTheme`"") }
-    if ($PreviewTextSize -gt 0) { $args += @("-PreviewTextSize", [string]$PreviewTextSize) }
-    if ($PreviewHighContrast) { $args += "-PreviewHighContrast" }
-    Start-Process -FilePath $systemPowerShell -ArgumentList $args -WindowStyle Hidden
+    $relaunchArguments = @("-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", "`"$self`"")
+    if ($ReviewRoot) { $relaunchArguments += @("-ReviewRoot", "`"$ReviewRoot`"") }
+    if ($LayoutSnapshotPath) { $relaunchArguments += @("-LayoutSnapshotPath", "`"$LayoutSnapshotPath`"") }
+    if ($LayoutSnapshotWidth -gt 0) { $relaunchArguments += @("-LayoutSnapshotWidth", [string]$LayoutSnapshotWidth) }
+    if ($LayoutSnapshotHeight -gt 0) { $relaunchArguments += @("-LayoutSnapshotHeight", [string]$LayoutSnapshotHeight) }
+    if ($InitialDashboardTab) { $relaunchArguments += @("-InitialDashboardTab", "`"$InitialDashboardTab`"") }
+    if ($PreviewTheme) { $relaunchArguments += @("-PreviewTheme", "`"$PreviewTheme`"") }
+    if ($PreviewTextSize -gt 0) { $relaunchArguments += @("-PreviewTextSize", [string]$PreviewTextSize) }
+    if ($PreviewHighContrast) { $relaunchArguments += "-PreviewHighContrast" }
+    Start-Process -FilePath $systemPowerShell -ArgumentList $relaunchArguments -WindowStyle Hidden
     return
 }
 
@@ -34,6 +34,11 @@ $ErrorActionPreference = "Stop"
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$nativeAssemblyPath = Join-Path $scriptRoot "RimWorldAiTranslator.Native.dll"
+if ((Test-Path -LiteralPath $nativeAssemblyPath -PathType Leaf) -and -not ("RimWorldTranslatorNativeMethods" -as [type])) {
+    Add-Type -LiteralPath $nativeAssemblyPath -ErrorAction Stop
+}
 if (-not ("RimWorldTranslatorNativeMethods" -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
@@ -48,7 +53,6 @@ public static class RimWorldTranslatorNativeMethods
 }
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:powershellExe = $systemPowerShell
 $script:explorerExe = Join-Path $env:SystemRoot "explorer.exe"
 foreach ($systemExecutable in @($script:powershellExe, $script:explorerExe)) {
@@ -59,12 +63,18 @@ foreach ($systemExecutable in @($script:powershellExe, $script:explorerExe)) {
 $script:initialReviewRoot = $ReviewRoot
 $script:layoutSnapshotPath = $LayoutSnapshotPath
 $script:layoutSnapshotTimer = $null
+$script:startupCatalogTimer = $null
 $script:reviewRoot = ""
 $script:comparisonFile = ""
 $script:rows = @()
 $script:decisions = @{}
+$script:validateLoadedDecisionSources = $false
 $script:validationCache = @{}
 $script:fileGroups = @()
+$script:fileGroupMap = @{}
+$script:sourceRowIndex = $null
+$script:relativeTargetCache = @{}
+$script:textFingerprintSha256 = $null
 $script:reviewStats = $null
 $script:projectStatsCache = @{}
 $script:projectStatsCacheDirty = $false
@@ -75,7 +85,8 @@ $script:windowsDarkModeCacheValid = $false
 $script:windowsDarkModeCached = $false
 $script:windowsDarkModeCheckedAt = [datetime]::MinValue
 $script:visibleRowIndexes = @()
-$script:maxRenderedCards = 50
+$script:visibleRowPositionMap = [int[]]@()
+$script:syncingItemSelection = $false
 $script:currentRowIndex = -1
 $script:currentFile = "__ALL__"
 $script:loading = $false
@@ -86,10 +97,14 @@ $script:syncingSettings = $false
 $script:dirty = $false
 $script:translationEditedByUser = $false
 $script:translationEditBaseline = ""
+$script:translationEditorOrigin = ""
+$script:settingTranslationOrigin = $false
 $script:glossary = @()
 $script:glossaryLoaded = $false
 $script:glossaryIndexedTerms = @()
 $script:glossaryPrefixIndex = @{}
+$script:DisplayLocalizationFieldPattern = '^(label|labelshort|description|jobstring|reportstring|deathmessage|deathmessagefemale|deathmessagemale|letterlabel|lettertext|header|headertip|summary|formatstring|formatstringunfinalized|fixedname|reason|text|slateref)$'
+$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
 $script:appDataRoot = Join-Path $env:LOCALAPPDATA "RimWorldAiTranslator"
 $script:projectStorePath = Join-Path $script:appDataRoot "projects.json"
 $script:settingsPath = Join-Path $script:appDataRoot "settings.json"
@@ -139,16 +154,40 @@ $script:tabBack = [System.Drawing.Color]::FromArgb(245, 243, 236)
 $script:tabActive = [System.Drawing.Color]::FromArgb(92, 79, 58)
 $script:tabText = [System.Drawing.Color]::FromArgb(78, 74, 66)
 $script:tabActiveText = [System.Drawing.Color]::White
+$script:apiProviders = @(
+    [pscustomobject]@{ Id = "Cerebras"; Name = "Cerebras"; Description = "Gemma 4와 초고속 추론 모델"; Url = "https://api.cerebras.ai/v1/chat/completions"; Models = @("gemma-4-31b", "gpt-oss-120b"); Model = "gemma-4-31b"; Provider = "OpenAICompatible"; ResponseFormat = "JsonSchema"; TokenParameter = "max_completion_tokens"; ReasoningEffort = "none"; Rpm = 5; InputTpm = 30000; DailyTokens = 1000000; MaxOutput = 32000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "OpenAI"; Name = "OpenAI"; Description = "GPT 계열 공식 API"; Url = "https://api.openai.com/v1/chat/completions"; Models = @("gpt-5.6", "gpt-5.5", "gpt-5.4", "gpt-5"); Model = "gpt-5.6"; Temperature = -1; Provider = "OpenAICompatible"; ResponseFormat = "JsonSchema"; TokenParameter = "max_completion_tokens"; ReasoningEffort = "none"; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "Gemini"; Name = "Google Gemini"; Description = "Gemini OpenAI 호환 API"; Url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"; Models = @("gemini-3.5-flash", "gemini-3.5-pro", "gemini-flash-latest"); Model = "gemini-3.5-flash"; Provider = "OpenAICompatible"; ResponseFormat = "JsonSchema"; TokenParameter = "max_completion_tokens"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "DeepSeek"; Name = "DeepSeek"; Description = "DeepSeek V4 공식 API"; Url = "https://api.deepseek.com/chat/completions"; Models = @("deepseek-v4-flash", "deepseek-v4-pro"); Model = "deepseek-v4-flash"; Provider = "OpenAICompatible"; ResponseFormat = "JsonObject"; TokenParameter = "max_tokens"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "Qwen"; Name = "Qwen"; Description = "Alibaba Cloud Model Studio"; Url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"; Models = @("qwen3.7-plus", "qwen3.7-max", "qwen3.6-flash"); Model = "qwen3.7-plus"; Provider = "OpenAICompatible"; ResponseFormat = "JsonObject"; TokenParameter = "max_tokens"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "Groq"; Name = "Groq"; Description = "빠른 오픈 모델 추론"; Url = "https://api.groq.com/openai/v1/chat/completions"; Models = @("openai/gpt-oss-120b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"); Model = "openai/gpt-oss-120b"; Provider = "OpenAICompatible"; ResponseFormat = "JsonSchema"; TokenParameter = "max_completion_tokens"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "Mistral"; Name = "Mistral AI"; Description = "Mistral 공식 Chat API"; Url = "https://api.mistral.ai/v1/chat/completions"; Models = @("mistral-small-latest", "mistral-medium-latest", "mistral-large-latest"); Model = "mistral-small-latest"; Provider = "OpenAICompatible"; ResponseFormat = "JsonObject"; TokenParameter = "max_tokens"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "OpenRouter"; Name = "OpenRouter"; Description = "여러 모델을 한 API로 사용"; Url = "https://openrouter.ai/api/v1/chat/completions"; Models = @("~openai/gpt-latest", "openai/gpt-5.4", "google/gemini-3.5-flash"); Model = "~openai/gpt-latest"; Provider = "OpenAICompatible"; ResponseFormat = "JsonObject"; TokenParameter = "max_tokens"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "ZAI"; Name = "BigModel / Z.AI"; Description = "GLM 계열 공식 API"; Url = "https://api.z.ai/api/paas/v4/chat/completions"; Models = @("glm-5.1", "glm-5", "glm-4.7"); Model = "glm-5.1"; Provider = "OpenAICompatible"; ResponseFormat = "JsonObject"; TokenParameter = "max_tokens"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "Custom"; Name = "사용자 지정"; Description = "OpenAI 호환 Chat Completions"; Url = ""; Models = @(); Model = ""; Provider = "OpenAICompatible"; ResponseFormat = "JsonObject"; TokenParameter = "max_tokens"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 16000; NeedsKey = $true },
+    [pscustomobject]@{ Id = "Google"; Name = "Google 번역"; Description = "API 키 없이 빠른 기계 번역"; Url = "https://translate.googleapis.com/translate_a/single"; Models = @("Google Translate"); Model = "Google Translate"; Provider = "Google"; ResponseFormat = "PromptOnly"; TokenParameter = "none"; ReasoningEffort = ""; Rpm = 0; InputTpm = 0; DailyTokens = 0; MaxOutput = 0; NeedsKey = $false }
+)
+$script:selectedApiProviderId = "Cerebras"
+$script:apiProviderConfigs = @{}
+$script:apiProviderKeys = @{}
+$script:apiProviderButtons = @{}
+$script:syncingApiProvider = $false
+$script:fontCache = @{}
 
 function New-Font([float]$Size, [System.Drawing.FontStyle]$Style = [System.Drawing.FontStyle]::Regular) {
-    return New-Object System.Drawing.Font("Malgun Gothic", $Size, $Style)
+    $sizeKey = $Size.ToString("0.##", [System.Globalization.CultureInfo]::InvariantCulture)
+    $key = "$sizeKey|$([int]$Style)"
+    if (-not $script:fontCache.ContainsKey($key)) {
+        $script:fontCache[$key] = [System.Drawing.Font]::new("Malgun Gothic", $Size, $Style)
+    }
+    return $script:fontCache[$key]
 }
 
 function New-Label([string]$Text, [int]$X, [int]$Y, [int]$W, [int]$H, [System.Drawing.Color]$Color, [float]$Size = 9, [System.Drawing.FontStyle]$Style = [System.Drawing.FontStyle]::Regular) {
-    $label = New-Object System.Windows.Forms.Label
+    $label = [System.Windows.Forms.Label]::new()
     $label.Text = $Text
-    $label.Location = New-Object System.Drawing.Point($X, $Y)
-    $label.Size = New-Object System.Drawing.Size($W, $H)
+    $label.Location = [System.Drawing.Point]::new($X, $Y)
+    $label.Size = [System.Drawing.Size]::new($W, $H)
     $label.Font = New-Font $Size $Style
     $label.ForeColor = $Color
     $label.BackColor = [System.Drawing.Color]::Transparent
@@ -156,7 +195,7 @@ function New-Label([string]$Text, [int]$X, [int]$Y, [int]$W, [int]$H, [System.Dr
 }
 
 function New-TextBox([switch]$Multiline) {
-    $box = New-Object System.Windows.Forms.TextBox
+    $box = [System.Windows.Forms.TextBox]::new()
     $box.Font = New-Font 9.5
     $box.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $box.BackColor = [System.Drawing.Color]::White
@@ -175,7 +214,7 @@ function Set-CueBanner([System.Windows.Forms.TextBox]$TextBox, [string]$Text) {
 }
 
 function New-Button([string]$Text, [System.Drawing.Color]$BackColor) {
-    $button = New-Object System.Windows.Forms.Button
+    $button = [System.Windows.Forms.Button]::new()
     $button.Text = $Text
     $button.Font = New-Font 9 ([System.Drawing.FontStyle]::Bold)
     $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
@@ -272,7 +311,38 @@ function Ensure-AppDataStore {
     }
 }
 
+function Write-Utf8JsonFile([string]$Path, [object]$Value, [int]$Depth = 8) {
+    $json = ConvertTo-Json -InputObject $Value -Depth $Depth -Compress
+    [System.IO.File]::WriteAllText($Path, $json, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Reset-ApiProviderSettings {
+    $script:selectedApiProviderId = "Cerebras"
+    $script:apiProviderConfigs = @{}
+    $script:apiProviderKeys = @{}
+    foreach ($providerProfile in $script:apiProviders) {
+        $script:apiProviderConfigs[[string]$providerProfile.Id] = [pscustomobject]@{
+            name = [string]$providerProfile.Name
+            url = [string]$providerProfile.Url
+            model = [string]$providerProfile.Model
+            temperature = if ($providerProfile.PSObject.Properties["Temperature"]) { [double]$providerProfile.Temperature } else { 0.1 }
+        }
+        $script:apiProviderKeys[[string]$providerProfile.Id] = ""
+    }
+}
+
+function Get-ApiProviderProfile([string]$Id = "") {
+    $target = if ($Id) { $Id } else { $script:selectedApiProviderId }
+    return @($script:apiProviders | Where-Object { $_.Id -eq $target } | Select-Object -First 1)[0]
+}
+
+function Get-SelectedApiProviderConfig {
+    if (-not $script:apiProviderConfigs.ContainsKey($script:selectedApiProviderId)) { return $null }
+    return $script:apiProviderConfigs[$script:selectedApiProviderId]
+}
+
 function Load-AppSettings {
+    Reset-ApiProviderSettings
     $script:themeMode = "System"
     $script:textSize = 10
     $script:highContrast = $false
@@ -292,6 +362,21 @@ function Load-AppSettings {
         if ($null -ne $settings.autoSave) { $script:autoSave = [bool]$settings.autoSave }
         if ($settings.PSObject.Properties["rmkWorkspaceRoot"]) { $script:rmkWorkspaceRoot = [string]$settings.rmkWorkspaceRoot }
         if ($settings.PSObject.Properties["rmkUseExisting"]) { $script:rmkUseExisting = [bool]$settings.rmkUseExisting }
+        if ($settings.PSObject.Properties["apiProviderId"] -and (Get-ApiProviderProfile ([string]$settings.apiProviderId))) {
+            $script:selectedApiProviderId = [string]$settings.apiProviderId
+        }
+        if ($settings.PSObject.Properties["apiProviders"] -and $settings.apiProviders) {
+            foreach ($property in @($settings.apiProviders.PSObject.Properties)) {
+                $id = [string]$property.Name
+                if (-not $script:apiProviderConfigs.ContainsKey($id)) { continue }
+                $saved = $property.Value
+                $config = $script:apiProviderConfigs[$id]
+                if ($saved.PSObject.Properties["name"] -and -not [string]::IsNullOrWhiteSpace([string]$saved.name)) { $config.name = [string]$saved.name }
+                if ($saved.PSObject.Properties["url"]) { $config.url = [string]$saved.url }
+                if ($saved.PSObject.Properties["model"]) { $config.model = [string]$saved.model }
+                if ($saved.PSObject.Properties["temperature"]) { $config.temperature = [Math]::Max(-1, [Math]::Min(2, [double]$saved.temperature)) }
+            }
+        }
     } catch {
         $script:themeMode = "System"
         $script:textSize = 10
@@ -299,25 +384,33 @@ function Load-AppSettings {
         $script:autoSave = $true
         $script:rmkWorkspaceRoot = ""
         $script:rmkUseExisting = $true
+        Reset-ApiProviderSettings
     }
 }
 
 function Save-AppSettings {
     Ensure-AppDataStore
     $settings = [ordered]@{
-        version = 1
+        version = 2
         themeMode = $script:themeMode
         textSize = $script:textSize
         highContrast = $script:highContrast
         autoSave = $script:autoSave
         rmkWorkspaceRoot = $script:rmkWorkspaceRoot
         rmkUseExisting = $script:rmkUseExisting
+        apiProviderId = $script:selectedApiProviderId
+        apiProviders = [ordered]@{}
     }
-    [System.IO.File]::WriteAllText(
-        $script:settingsPath,
-        ($settings | ConvertTo-Json -Depth 4),
-        (New-Object System.Text.UTF8Encoding($false))
-    )
+    foreach ($providerProfile in $script:apiProviders) {
+        $config = $script:apiProviderConfigs[[string]$providerProfile.Id]
+        $settings.apiProviders[[string]$providerProfile.Id] = [ordered]@{
+            name = [string]$config.name
+            url = [string]$config.url
+            model = [string]$config.model
+            temperature = [double]$config.temperature
+        }
+    }
+    Write-Utf8JsonFile -Path $script:settingsPath -Value $settings -Depth 6
 }
 
 function Quote-WindowsProcessArgument([string]$Value) {
@@ -527,13 +620,22 @@ function Get-StableId([string]$Text) {
 }
 
 function Get-TextFingerprint([string]$Text) {
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-FlatString $Text))
-        return ([BitConverter]::ToString($sha.ComputeHash($bytes)).Replace("-", "")).ToLowerInvariant()
-    } finally {
-        $sha.Dispose()
+    if (-not $script:textFingerprintSha256) { $script:textFingerprintSha256 = [System.Security.Cryptography.SHA256]::Create() }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-FlatString $Text))
+    return ([BitConverter]::ToString($script:textFingerprintSha256.ComputeHash($bytes)).Replace("-", "")).ToLowerInvariant()
+}
+
+function Get-RowRuntimeCache([object]$Row) {
+    if ($Row.PSObject.Properties["_runtimeCache"] -and $Row._runtimeCache) { return $Row._runtimeCache }
+    $cache = [pscustomobject]@{
+        Identity = ""
+        RelativeTarget = ""
+        SourceFingerprint = ""
+        Decision = $null
+        DefContext = $null
     }
+    $Row | Add-Member -NotePropertyName _runtimeCache -NotePropertyValue $cache
+    return $cache
 }
 
 function Invalidate-DashboardProjectData([string]$ProjectId = "") {
@@ -578,11 +680,7 @@ function Save-ProjectStatsCache {
             }
         }
         $payload = [ordered]@{ version = 1; entries = @($entries) }
-        [System.IO.File]::WriteAllText(
-            $script:projectStatsCachePath,
-            ($payload | ConvertTo-Json -Depth 7),
-            (New-Object System.Text.UTF8Encoding($false))
-        )
+        Write-Utf8JsonFile -Path $script:projectStatsCachePath -Value $payload -Depth 7
         $script:projectStatsCacheDirty = $false
     } catch {
     }
@@ -600,9 +698,23 @@ function Load-ProjectStore {
             $script:projects = @()
         }
     }
+    $storeChanged = $false
     foreach ($project in @($script:projects)) {
         if ($project -and -not $project.PSObject.Properties["sourceLanguageFolder"]) {
             $project | Add-Member -NotePropertyName sourceLanguageFolder -NotePropertyValue "Auto"
+            $storeChanged = $true
+        }
+        if ($project -and $project.modRoot -and (Test-Path -LiteralPath ([string]$project.modRoot) -PathType Container)) {
+            try {
+                $resolvedContentRoot = Resolve-RimWorldModContentRoot ([string]$project.modRoot)
+                $storedRoot = [System.IO.Path]::GetFullPath([string]$project.modRoot).TrimEnd("\", "/")
+                if ($resolvedContentRoot -and -not $storedRoot.Equals($resolvedContentRoot.TrimEnd("\", "/"), [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $project.modRoot = $resolvedContentRoot
+                    $project.updatedAt = (Get-Date).ToString("o")
+                    $storeChanged = $true
+                }
+            } catch {
+            }
         }
     }
 
@@ -618,6 +730,15 @@ function Load-ProjectStore {
         }
     }
     Save-ProjectStatsCache
+    if ($storeChanged) { Save-ProjectStore }
+}
+
+function Get-RowSourceFingerprint([object]$Row) {
+    $cache = Get-RowRuntimeCache $Row
+    if ($cache.SourceFingerprint) { return [string]$cache.SourceFingerprint }
+    $hash = Get-TextFingerprint (ConvertTo-FlatString $Row.source)
+    $cache.SourceFingerprint = $hash
+    return $hash
 }
 
 function Save-ProjectStore {
@@ -627,7 +748,7 @@ function Save-ProjectStore {
         updatedAt = (Get-Date).ToString("o")
         projects = @($script:projects)
     }
-    $payload | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $script:projectStorePath -Encoding UTF8
+    Write-Utf8JsonFile -Path $script:projectStorePath -Value $payload -Depth 12
     $script:dashboardProjectsDirty = $true
 }
 
@@ -824,11 +945,7 @@ function Write-ProjectReviewMarker([object]$Project, [string]$ReviewRoot) {
             workshopId = [string]$Project.workshopId
             createdAt = (Get-Date).ToString("o")
         }
-        [System.IO.File]::WriteAllText(
-            (Join-Path $safeRoot ".rimworld-ai-project.json"),
-            ($marker | ConvertTo-Json -Depth 4),
-            (New-Object System.Text.UTF8Encoding($false))
-        )
+        Write-Utf8JsonFile -Path (Join-Path $safeRoot ".rimworld-ai-project.json") -Value $marker -Depth 4
     } catch {
         Add-Log "프로젝트 검수 기록 표식 저장 실패: $($_.Exception.Message)"
     }
@@ -1104,18 +1221,33 @@ function Get-PreferredLoadFolderRoot([string]$ModPath) {
                 if ($li -is [System.Xml.XmlElement] -and ($li.HasAttribute("IfModActive") -or $li.HasAttribute("IfModNotActive"))) { continue }
                 $relative = if ($li -is [System.Xml.XmlElement]) { ([string]$li.InnerText).Trim() } else { ([string]$li).Trim() }
                 if ([string]::IsNullOrWhiteSpace($relative)) { continue }
-                $candidate = Join-Path $ModPath $relative
+                $candidate = if ($relative -in @("/", "\", ".")) { $ModPath } else { Join-Path $ModPath $relative }
                 if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
+                $modFull = [System.IO.Path]::GetFullPath($ModPath).TrimEnd("\", "/")
+                $candidateFull = [System.IO.Path]::GetFullPath($candidate).TrimEnd("\", "/")
+                $modPrefix = $modFull + [System.IO.Path]::DirectorySeparatorChar
+                if (-not $candidateFull.Equals($modFull, [System.StringComparison]::OrdinalIgnoreCase) -and
+                    -not $candidateFull.StartsWith($modPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
                 if ((Test-Path -LiteralPath (Join-Path $candidate "Defs") -PathType Container) -or
-                    (Test-Path -LiteralPath (Join-Path $candidate "Languages") -PathType Container) -or
-                    (Test-Path -LiteralPath (Join-Path $candidate "About\About.xml") -PathType Leaf)) {
-                    return [System.IO.Path]::GetFullPath($candidate)
+                    (Test-Path -LiteralPath (Join-Path $candidate "Languages") -PathType Container)) {
+                    return $candidateFull
                 }
             }
         }
     } catch {
     }
     return $null
+}
+
+function Resolve-RimWorldModContentRoot([string]$ModPath) {
+    $full = Get-NormalizedDirectoryPath $ModPath
+    if ((Test-Path -LiteralPath (Join-Path $full "Defs") -PathType Container) -or
+        (Test-Path -LiteralPath (Join-Path $full "Languages") -PathType Container)) {
+        return $full
+    }
+    $preferred = Get-PreferredLoadFolderRoot $full
+    if ($preferred) { return Get-NormalizedDirectoryPath $preferred }
+    return $full
 }
 
 function Get-RimWorldModInfo([string]$ModPath, [string]$Source) {
@@ -1226,11 +1358,11 @@ function Select-ProjectSourceLanguage([object]$ModInfo) {
     if ($options.Count -eq 0) { return "Auto" }
     if ($options.Count -eq 1) { return [string]$options[0].Folder }
 
-    $dialog = New-Object System.Windows.Forms.Form
+    $dialog = [System.Windows.Forms.Form]::new()
     $dialog.Text = "원문 언어 선택"
     $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
     $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $dialog.ClientSize = New-Object System.Drawing.Size(570, 360)
+    $dialog.ClientSize = [System.Drawing.Size]::new(570, 360)
     $dialog.MinimizeBox = $false
     $dialog.MaximizeBox = $false
     $dialog.ShowInTaskbar = $false
@@ -1239,13 +1371,13 @@ function Select-ProjectSourceLanguage([object]$ModInfo) {
     $dialog.Font = New-Font 9
     $dialog.Tag = ""
 
-    $accent = New-Object System.Windows.Forms.Panel
+    $accent = [System.Windows.Forms.Panel]::new()
     $accent.SetBounds(0, 0, 570, 4)
     $accent.BackColor = $script:accentColor
     $title = New-Label "번역 기준 원문을 선택하세요" 28 24 514 30 $script:textColor 13 ([System.Drawing.FontStyle]::Bold)
     $body = New-Label "'$($ModInfo.Name)' 모드에 원문 언어가 여러 개 있습니다. 이 프로젝트에서 계속 사용할 언어를 선택하세요." 28 62 514 54 $script:mutedColor 9.5
 
-    $list = New-Object System.Windows.Forms.ListBox
+    $list = [System.Windows.Forms.ListBox]::new()
     $list.DisplayMember = "Display"
     $list.Font = New-Font 10
     $list.BackColor = $script:surfaceColor
@@ -1383,16 +1515,12 @@ function Save-ModCatalogCache {
     try {
         Ensure-AppDataStore
         $payload = [ordered]@{
-            version = 1
+            version = 2
             updatedAt = (Get-Date).ToString("o")
             containers = @(Get-ModContainerState)
             mods = @($script:modCatalog | Select-Object Display, Name, Path, Source, Folder, PackageId, WorkshopId, Search)
         }
-        [System.IO.File]::WriteAllText(
-            $script:modCatalogCachePath,
-            ($payload | ConvertTo-Json -Depth 7),
-            (New-Object System.Text.UTF8Encoding($false))
-        )
+        Write-Utf8JsonFile -Path $script:modCatalogCachePath -Value $payload -Depth 7
     } catch {
         Add-Log "모드 목록 캐시 저장 실패: $($_.Exception.Message)"
     }
@@ -1402,7 +1530,7 @@ function Try-LoadModCatalogCache([switch]$FastValidation) {
     if (-not (Test-Path -LiteralPath $script:modCatalogCachePath -PathType Leaf)) { return $false }
     try {
         $cache = [System.IO.File]::ReadAllText($script:modCatalogCachePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-        if ([int]$cache.version -ne 1) { return $false }
+        if ([int]$cache.version -ne 2) { return $false }
         if ($FastValidation) {
             if (-not (Test-ModContainerStateFast -Cached @($cache.containers))) { return $false }
         } else {
@@ -1581,10 +1709,14 @@ function Get-RmkYamlInfo([string]$YamlPath) {
         $root = Split-Path -Parent $YamlPath
         $leaf = Split-Path -Leaf $root
         $version = if ($leaf -match '^\d+\.\d+$') { $leaf } else { $defaultVersion }
+        $workbook = Get-ChildItem -LiteralPath $root -File -Filter "*.xlsx" -ErrorAction SilentlyContinue |
+            Sort-Object @{ Expression = { if ($workshopId -and $_.BaseName -match [System.Text.RegularExpressions.Regex]::Escape($workshopId)) { 0 } else { 1 } } }, Name |
+            Select-Object -First 1
         return [pscustomobject]@{
             Root = [System.IO.Path]::GetFullPath($root)
             YamlPath = [System.IO.Path]::GetFullPath($YamlPath)
             LanguageRoot = Join-Path (Join-Path $root "Languages") "Korean (한국어)"
+            WorkbookPath = if ($workbook) { [System.IO.Path]::GetFullPath($workbook.FullName) } else { "" }
             WorkshopId = $workshopId
             ModName = $modName
             Version = $version
@@ -1605,14 +1737,14 @@ function Find-RmkTargets([string]$Root, [object]$Project) {
     if ($script:rmkTargetCache.ContainsKey($cacheKey)) { return @($script:rmkTargetCache[$cacheKey]) }
 
     $rows = @(Get-RmkModListEntries $rootFull)
-    $matches = if ($workshopId) { @($rows | Where-Object { $_.WorkshopId -eq $workshopId }) } else { @() }
-    if ($matches.Count -eq 0 -and $packageId) {
-        $matches = @($rows | Where-Object { $_.PackageId -ieq $packageId })
+    $targetMatches = if ($workshopId) { @($rows | Where-Object { $_.WorkshopId -eq $workshopId }) } else { @() }
+    if ($targetMatches.Count -eq 0 -and $packageId) {
+        $targetMatches = @($rows | Where-Object { $_.PackageId -ieq $packageId })
     }
 
     $yamlPaths = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
     $dataRoot = Join-Path $rootFull "Data"
-    foreach ($row in $matches) {
+    foreach ($row in $targetMatches) {
         $relativeLocation = ([string]$row.RelativeLocation).Replace('/', '\').TrimStart('\')
         $location = [System.IO.Path]::GetFullPath((Join-Path $rootFull $relativeLocation))
         if (-not (Test-PathStrictlyInsideRoot -Path $location -Root $rootFull)) { continue }
@@ -1751,9 +1883,11 @@ function Refresh-RmkPanel([switch]$Force) {
     $script:rmkCurrentTarget = $referenceTarget
     if ($referenceTarget) {
         $relative = Get-RelativePathPortable -Root $referenceTarget.SourceRoot -Path $referenceTarget.Root
-        $xmlCount = 0
-        try { $xmlCount = @(Get-ChildItem -LiteralPath $referenceTarget.LanguageRoot -Recurse -File -Filter "*.xml" -ErrorAction Stop).Count } catch {}
-        $lblRmkStatus.Text = "기존 번역 연결됨 · $($referenceTarget.SourceKind) · $xmlCount개 XML"
+        try {
+            $lblRmkStatus.Text = "기존 번역 연결됨 · $($referenceTarget.SourceKind) · $(@(Get-ChildItem -LiteralPath $referenceTarget.LanguageRoot -Recurse -File -Filter "*.xml" -ErrorAction Stop).Count)개 XML"
+        } catch {
+            $lblRmkStatus.Text = "기존 번역 연결됨 · $($referenceTarget.SourceKind) · 0개 XML"
+        }
         $txtRmkDetails.Text = "참조 경로`r`n$relative`r`n`r`n버전 $($referenceTarget.Version)`r`n$($referenceTarget.LanguageRoot)"
     } else {
         $lblRmkStatus.Text = "RMK 기존 번역 없음"
@@ -1767,7 +1901,7 @@ function Refresh-RmkPanel([switch]$Force) {
 }
 
 function Choose-RmkWorkspace {
-    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog = [System.Windows.Forms.FolderBrowserDialog]::new()
     $dialog.Description = "RMK Git 클론의 루트 폴더를 선택하세요."
     if ($script:rmkWorkspaceRoot -and (Test-Path -LiteralPath $script:rmkWorkspaceRoot -PathType Container)) {
         $dialog.SelectedPath = $script:rmkWorkspaceRoot
@@ -2004,7 +2138,7 @@ function Export-ReviewedTranslationsToRmk([string]$ApplyStatus = "ApprovedOnly")
     $lblRunStatus.Text = "RMK 내보내기 중"
     try {
         if (-not $target) { $target = New-RmkTarget -Project $project -WorkspaceRoot $script:rmkWorkspaceRoot }
-        $args = @(
+        $exportArguments = @(
             "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script:rmkExportScript,
             "-RmkEntryRoot", [string]$target.Root,
             "-ReviewRoot", $script:reviewRoot,
@@ -2014,7 +2148,7 @@ function Export-ReviewedTranslationsToRmk([string]$ApplyStatus = "ApprovedOnly")
             "-Overwrite"
         )
         Add-Log "RMK 내보내기 시작: $($target.Root)"
-        $output = @(& $script:powershellExe @args 2>&1)
+        $output = @(& $script:powershellExe @exportArguments 2>&1)
         $exitCode = $LASTEXITCODE
         foreach ($line in $output) { Add-Log ([string]$line) }
         if ($exitCode -ne 0) { throw "RMK 번역 병합이 실패했습니다. ExitCode=$exitCode" }
@@ -2076,8 +2210,9 @@ function Build-RmkWorkspace {
 }
 
 function Get-RowIdentity([object]$Row) {
-    if ($Row.id) { return "id:$($Row.id)" }
-    return "key:$($Row.key)"
+    $cache = Get-RowRuntimeCache $Row
+    if (-not $cache.Identity) { $cache.Identity = if ($Row.id) { "id:$($Row.id)" } else { "key:$($Row.key)" } }
+    return [string]$cache.Identity
 }
 
 function Get-DecisionPath {
@@ -2139,9 +2274,9 @@ function Update-StopButtonAppearance {
 
 function Get-CurrentDisplayName {
     if ($script:selectedProjectId) {
-        $project = @($script:projects | Where-Object { $_.id -eq $script:selectedProjectId } | Select-Object -First 1)
-        if ($project.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$project[0].name)) {
-            return [string]$project[0].name
+        $project = Get-SelectedProject
+        if ($project -and -not [string]::IsNullOrWhiteSpace([string]$project.name)) {
+            return [string]$project.name
         }
     }
     if ($script:selectedModRoot) {
@@ -2194,7 +2329,7 @@ function Refresh-StatusFilterButtons {
 
 function Get-ProtectedTokensForValidation([string]$Text) {
     $tokens = New-Object "System.Collections.Generic.HashSet[string]"
-    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b)'
+    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
     foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
         [void]$tokens.Add($match.Value)
     }
@@ -2208,7 +2343,34 @@ function Get-MissingTranslationTokens([string]$Source, [string]$Translation) {
     foreach ($token in (Get-ProtectedTokensForValidation $Source)) {
         if (-not $Translation.Contains($token)) { [void]$missing.Add($token) }
     }
+    $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($Source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
+    if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($Translation, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) {
+        if (-not $missing.Contains($grammarPrefix.Groups[1].Value)) { [void]$missing.Add($grammarPrefix.Groups[1].Value) }
+    }
     return $missing.ToArray()
+}
+
+function Get-RmkReferenceWorkbookPath([object]$Project = $null) {
+    $target = Get-RmkReferenceTarget $Project
+    if ($target -and $target.PSObject.Properties["WorkbookPath"] -and (Test-Path -LiteralPath $target.WorkbookPath -PathType Leaf)) {
+        return [string]$target.WorkbookPath
+    }
+    return ""
+}
+
+function Get-InternalLocalizationIdentifierReason([object]$Row) {
+    if (-not $Row -or [string]::IsNullOrWhiteSpace([string]$Row.key) -or [string]$Row.kind -ne "DefInjected") { return "" }
+
+    $keyLower = ([string]$Row.key).Trim().ToLowerInvariant()
+    $typeLower = if ($Row.PSObject.Properties["defClass"] -and $Row.defClass) { ([string]$Row.defClass).Trim().ToLowerInvariant() } else { "" }
+    $fieldLower = if ($Row.PSObject.Properties["field"] -and $Row.field) { ([string]$Row.field).Trim().ToLowerInvariant() } else { ($keyLower -replace "^.*\.", "") }
+    $isDisplayField = $fieldLower -match $script:DisplayLocalizationFieldPattern
+    if ($fieldLower -match $script:TechnicalLocalizationFieldPattern) { return "내부 참조 필드 '$fieldLower'" }
+    if ($keyLower -match "\.alienrace\.generalsettings\.alienpartgenerator\.colorchannels\.") { return "AlienRace 색상 채널 식별자" }
+    if ($fieldLower -eq "name" -and $keyLower -match "\.alienrace\.") { return "AlienRace 내부 이름" }
+    if ($keyLower -match "\.(graphicpaths?|rendernodes?|rendertree)\." -and -not $isDisplayField) { return "렌더링 또는 그래픽 경로 식별자" }
+    if ($typeLower -match "pawnrendertreedef" -and -not $isDisplayField) { return "PawnRenderTreeDef 내부 식별자" }
+    return ""
 }
 
 function Test-PathologicalTranslationText([string]$Text) {
@@ -2224,6 +2386,17 @@ function Test-ContainsKoreanText([string]$Text) {
     return $Text -match "[\uAC00-\uD7AF]"
 }
 
+function Get-InvalidKoreanParticleNotations([string]$Text) {
+    $result = New-Object "System.Collections.Generic.List[string]"
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $result.ToArray() }
+    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+    $pattern = '(은\(는\)|는\(은\)|이\(가\)|가\(이\)|을\(를\)|를\(을\)|과\(와\)|와\(과\)|으로\(로\)|로\(으로\)|(?:\[[^\]\r\n]+\]|\{[^}\r\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:으로|은|는|이|가|을|를|과|와|로)(?=$|[\s.,!?…:;，。！？、]))'
+    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
+        if ($seen.Add($match.Value)) { [void]$result.Add($match.Value) }
+    }
+    return $result.ToArray()
+}
+
 function Get-TranslationValidation([object]$Row, [string]$Translation) {
     $source = ConvertTo-FlatString $Row.source
     $translationText = ConvertTo-FlatString $Translation
@@ -2232,12 +2405,14 @@ function Get-TranslationValidation([object]$Row, [string]$Translation) {
     $missingTokens = @(Get-MissingTranslationTokens -Source $source -Translation $translationText)
     $sameAsSource = [string]::Equals($source, $translationText, [System.StringComparison]::Ordinal)
     $hasKorean = Test-ContainsKoreanText $translationText
-    $safeToApply = -not $isBlank -and -not $isPathological -and $missingTokens.Count -eq 0 -and -not $sameAsSource -and $hasKorean
+    $invalidKoreanParticles = @(Get-InvalidKoreanParticleNotations $translationText)
+    $safeToApply = -not $isBlank -and -not $isPathological -and $missingTokens.Count -eq 0 -and $invalidKoreanParticles.Count -eq 0 -and -not $sameAsSource -and $hasKorean
     return [pscustomobject]@{
         SafeToApply = $safeToApply
         IsBlank = $isBlank
         IsPathological = $isPathological
         MissingTokens = $missingTokens
+        InvalidKoreanParticles = $invalidKoreanParticles
         SameAsSource = $sameAsSource
         HasKorean = $hasKorean
     }
@@ -2281,6 +2456,7 @@ function Get-RowWarnings([object]$Row, [string]$Translation) {
     if ($validation.IsBlank) { [void]$warnings.Add("빈 번역") }
     if ($validation.IsPathological) { [void]$warnings.Add("비정상 개행") }
     if ($validation.MissingTokens.Count -gt 0) { [void]$warnings.Add("토큰 누락: $([string]::Join('|', $validation.MissingTokens))") }
+    if ($validation.InvalidKoreanParticles.Count -gt 0) { [void]$warnings.Add("림월드 조사 표기 오류: $([string]::Join('|', $validation.InvalidKoreanParticles))") }
     if ($validation.SameAsSource) { [void]$warnings.Add("원문과 동일") }
     if (-not $validation.HasKorean) { [void]$warnings.Add("한글 없음") }
     $cacheEntry.Warnings = $warnings.ToArray()
@@ -2289,23 +2465,25 @@ function Get-RowWarnings([object]$Row, [string]$Translation) {
 
 function Get-RelativeTarget([object]$Row) {
     $target = [string]$Row.target
-    if (-not $target) { return "(unknown)" }
-    if (-not $script:reviewRoot) { return $target }
-    try {
-        $reviewFull = [System.IO.Path]::GetFullPath($script:reviewRoot).TrimEnd("\", "/")
-        $reviewPrefix = $reviewFull + [System.IO.Path]::DirectorySeparatorChar
-        $targetFull = [System.IO.Path]::GetFullPath($target)
-        if ($targetFull.StartsWith($reviewPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $relative = $targetFull.Substring($reviewPrefix.Length)
-            $prefix = "Languages\Korean\"
-            if ($relative.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $relative = $relative.Substring($prefix.Length)
+    if ($script:relativeTargetCache.ContainsKey($target)) { return [string]$script:relativeTargetCache[$target] }
+    $result = if (-not $target) { "(unknown)" } else { $target }
+    if ($target -and $script:reviewRoot) {
+        try {
+            $reviewFull = [System.IO.Path]::GetFullPath($script:reviewRoot).TrimEnd("\", "/")
+            $reviewPrefix = $reviewFull + [System.IO.Path]::DirectorySeparatorChar
+            $targetFull = [System.IO.Path]::GetFullPath($target)
+            if ($targetFull.StartsWith($reviewPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $result = $targetFull.Substring($reviewPrefix.Length)
+                $prefix = "Languages\Korean\"
+                if ($result.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $result = $result.Substring($prefix.Length)
+                }
             }
-            return $relative
+        } catch {
         }
-    } catch {
     }
-    return $target
+    $script:relativeTargetCache[$target] = $result
+    return $result
 }
 
 function Get-OptionalRowText([object]$Row, [string[]]$Names) {
@@ -2368,6 +2546,8 @@ function Get-NodeDescription([string]$Field) {
 }
 
 function Get-RowDefContext([object]$Row) {
+    $cache = Get-RowRuntimeCache $Row
+    if ($cache.DefContext) { return $cache.DefContext }
     $relative = Get-RelativeTarget $Row
     $kind = Get-OptionalRowText -Row $Row -Names @("kind", "Kind")
     $defClass = Get-OptionalRowText -Row $Row -Names @("defClass", "defType", "typeName", "TypeName")
@@ -2403,7 +2583,7 @@ function Get-RowDefContext([object]$Row) {
         }
     }
 
-    return [pscustomobject]@{
+    $context = [pscustomobject]@{
         DefClass = $displayClass
         Node = $node
         DefName = $defName
@@ -2412,6 +2592,8 @@ function Get-RowDefContext([object]$Row) {
         NodeDescription = $nodeDescription
         Explanation = $explanation
     }
+    $cache.DefContext = $context
+    return $context
 }
 
 function Get-DefaultTranslationForRow([object]$Row) {
@@ -2422,40 +2604,123 @@ function Get-DefaultTranslationForRow([object]$Row) {
     return ""
 }
 
+function Get-DefaultTranslationOriginForRow([object]$Row) {
+    $candidate = ConvertTo-FlatString $Row.candidate
+    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        $candidateOrigin = Get-OptionalRowText -Row $Row -Names @("translationOrigin")
+        return $(if ($candidateOrigin) { $candidateOrigin } else { "ai" })
+    }
+    $existing = ConvertTo-FlatString $Row.existing
+    if (-not [string]::IsNullOrWhiteSpace($existing)) {
+        $existingOrigin = Get-OptionalRowText -Row $Row -Names @("existingOrigin")
+        return $(if ($existingOrigin) { $existingOrigin } else { "existing" })
+    }
+    return ""
+}
+
+function Get-InferredTranslationOrigin([object]$Row, [object]$Decision) {
+    if ($Decision.PSObject.Properties["translationOrigin"] -and -not [string]::IsNullOrWhiteSpace([string]$Decision.translationOrigin)) {
+        return ([string]$Decision.translationOrigin).ToLowerInvariant()
+    }
+    $text = ConvertTo-FlatString $Decision.text
+    if ([string]::IsNullOrWhiteSpace($text)) { return "" }
+    $candidate = ConvertTo-FlatString $Row.candidate
+    if ($candidate -and [string]::Equals($text, $candidate, [System.StringComparison]::Ordinal)) { return "ai" }
+    $existing = ConvertTo-FlatString $Row.existing
+    if ($existing -and [string]::Equals($text, $existing, [System.StringComparison]::Ordinal)) {
+        $existingOrigin = Get-OptionalRowText -Row $Row -Names @("existingOrigin")
+        return $(if ($existingOrigin) { $existingOrigin.ToLowerInvariant() } else { "existing" })
+    }
+    if ($Decision.PSObject.Properties["updatedAt"] -and $Decision.updatedAt) { return "local" }
+    return Get-DefaultTranslationOriginForRow $Row
+}
+
+function Get-TranslationOriginText([string]$Origin) {
+    $normalized = if ($Origin) { $Origin.ToLowerInvariant() } else { "" }
+    switch ($normalized) {
+        "rmk" { return "RMK 가져옴" }
+        "local" { return "내 번역" }
+        "ai" { return "AI 초벌" }
+        "mod" { return "모드 기존" }
+        "existing" { return "기존 번역" }
+        default { return "출처 없음" }
+    }
+}
+
+function Get-TranslationOriginShortText([string]$Origin) {
+    $normalized = if ($Origin) { $Origin.ToLowerInvariant() } else { "" }
+    switch ($normalized) {
+        "rmk" { return "RMK" }
+        "local" { return "내 번역" }
+        "ai" { return "AI" }
+        "mod" { return "모드 기존" }
+        "existing" { return "기존" }
+        default { return "" }
+    }
+}
+
+function Format-TranslationTimestamp([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+    $parsed = [datetime]::MinValue
+    if ([datetime]::TryParse($Value, [ref]$parsed)) { return $parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm") }
+    return ""
+}
+
 function New-Decision([object]$Row) {
     $defaultTranslation = Get-DefaultTranslationForRow $Row
+    $translationOrigin = Get-DefaultTranslationOriginForRow $Row
     $source = ConvertTo-FlatString $Row.source
+    $rmkSourceChanged = $translationOrigin -eq "rmk" -and $Row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $Row.rmkSourceChanged)
+    $rmkHistoricalSource = if ($rmkSourceChanged -and $Row.PSObject.Properties["rmkHistoricalSource"]) { ConvertTo-FlatString $Row.rmkHistoricalSource } else { "" }
+    $translationUpdatedAt = Get-OptionalRowText -Row $Row -Names @("translationUpdatedAt")
     return [pscustomobject]@{
         id = [string]$Row.id
         key = [string]$Row.key
         target = Get-RelativeTarget $Row
-        status = if ([string]::IsNullOrWhiteSpace($defaultTranslation)) { "pending" } else { "translated" }
+        status = if ([string]::IsNullOrWhiteSpace($defaultTranslation) -or $rmkSourceChanged) { "pending" } else { "translated" }
         text = $defaultTranslation
         note = ""
-        sourceHash = Get-TextFingerprint $source
+        translationOrigin = $translationOrigin
+        translationUpdatedAt = $translationUpdatedAt
+        sourceHash = ""
         sourceText = $source
-        sourceChanged = $false
-        previousSourceText = ""
+        sourceChanged = $rmkSourceChanged
+        previousSourceText = $rmkHistoricalSource
         updatedAt = ""
     }
 }
 
 function Get-Decision([object]$Row) {
+    $cache = Get-RowRuntimeCache $Row
+    if ($cache.Decision) { return $cache.Decision }
     $identity = Get-RowIdentity $Row
     if (-not $script:decisions.ContainsKey($identity)) {
         $script:decisions[$identity] = New-Decision $Row
+    } elseif ($script:validateLoadedDecisionSources) {
+        Normalize-DecisionForRow -Row $Row -Decision $script:decisions[$identity]
     }
-    Normalize-DecisionForRow -Row $Row -Decision $script:decisions[$identity]
-    return $script:decisions[$identity]
+    $cache.Decision = $script:decisions[$identity]
+    return $cache.Decision
 }
 
 function Normalize-DecisionForRow([object]$Row, [object]$Decision) {
     $source = ConvertTo-FlatString $Row.source
-    $sourceHash = Get-TextFingerprint $source
+    $sourceHash = Get-RowSourceFingerprint $Row
     $defaultTranslation = Get-DefaultTranslationForRow $Row
     $status = [string]$Decision.status
     if ([string]::IsNullOrWhiteSpace($status)) { $status = if ($defaultTranslation) { "translated" } else { "pending" } }
     if ($status -eq "reviewed") { $status = "approved" }
+
+    $translationOrigin = Get-InferredTranslationOrigin -Row $Row -Decision $Decision
+    if ($Decision.PSObject.Properties["translationOrigin"]) {
+        $Decision.translationOrigin = $translationOrigin
+    } else {
+        $Decision | Add-Member -NotePropertyName translationOrigin -NotePropertyValue $translationOrigin
+    }
+    if (-not $Decision.PSObject.Properties["translationUpdatedAt"]) {
+        $legacyTranslationTime = if ($translationOrigin -eq "local" -and $Decision.PSObject.Properties["updatedAt"]) { [string]$Decision.updatedAt } else { "" }
+        $Decision | Add-Member -NotePropertyName translationUpdatedAt -NotePropertyValue $legacyTranslationTime
+    }
 
     $sourceChangedNow = $false
     $storedSourceText = if ($Decision.PSObject.Properties["sourceText"]) { ConvertTo-FlatString $Decision.sourceText } else { "" }
@@ -2464,7 +2729,8 @@ function Normalize-DecisionForRow([object]$Row, [object]$Decision) {
     } elseif ($Decision.PSObject.Properties["sourceText"] -and -not [string]::IsNullOrWhiteSpace([string]$Decision.sourceText)) {
         $sourceChangedNow = $storedSourceText -ne $source
     }
-    $sourceChanged = $sourceChangedNow -or ($Decision.PSObject.Properties["sourceChanged"] -and (ConvertTo-BoolValue $Decision.sourceChanged))
+    $rmkSourceChangedNow = $translationOrigin -eq "rmk" -and $Row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $Row.rmkSourceChanged)
+    $sourceChanged = $sourceChangedNow -or $rmkSourceChangedNow -or ($Decision.PSObject.Properties["sourceChanged"] -and (ConvertTo-BoolValue $Decision.sourceChanged))
 
     if ($sourceChanged) {
         $Decision.status = "pending"
@@ -2472,7 +2738,8 @@ function Normalize-DecisionForRow([object]$Row, [object]$Decision) {
             $Decision.text = $defaultTranslation
         }
         if ($sourceChangedNow) {
-            $previousSource = if (-not [string]::IsNullOrWhiteSpace($storedSourceText)) { $storedSourceText } else { ConvertTo-FlatString $Decision.previousSourceText }
+            $rmkHistoricalSource = if ($rmkSourceChangedNow -and $Row.PSObject.Properties["rmkHistoricalSource"]) { ConvertTo-FlatString $Row.rmkHistoricalSource } else { "" }
+            $previousSource = if ($rmkHistoricalSource) { $rmkHistoricalSource } elseif (-not [string]::IsNullOrWhiteSpace($storedSourceText)) { $storedSourceText } else { ConvertTo-FlatString $Decision.previousSourceText }
             if ($Decision.PSObject.Properties["previousSourceText"]) {
                 $Decision.previousSourceText = $previousSource
             } else {
@@ -2480,6 +2747,8 @@ function Normalize-DecisionForRow([object]$Row, [object]$Decision) {
             }
             $Decision.updatedAt = (Get-Date).ToString("o")
             $script:dirty = $true
+        } elseif ($rmkSourceChangedNow -and [string]::IsNullOrWhiteSpace((ConvertTo-FlatString $Decision.previousSourceText))) {
+            $Decision.previousSourceText = ConvertTo-FlatString $Row.rmkHistoricalSource
         }
         if ($Decision.PSObject.Properties["sourceChanged"]) {
             $Decision.sourceChanged = $true
@@ -2583,19 +2852,29 @@ function Load-Glossary {
 
 function Load-Decisions {
     $script:decisions = @{}
+    $script:validateLoadedDecisionSources = $false
     $path = Get-DecisionPath
     if (-not $path -or -not (Test-Path -LiteralPath $path)) { return }
     try {
+        if ($script:comparisonFile -and (Test-Path -LiteralPath $script:comparisonFile -PathType Leaf)) {
+            $decisionInfo = Get-Item -LiteralPath $path -ErrorAction Stop
+            $comparisonInfo = Get-Item -LiteralPath $script:comparisonFile -ErrorAction Stop
+            $script:validateLoadedDecisionSources = $comparisonInfo.LastWriteTimeUtc -gt $decisionInfo.LastWriteTimeUtc
+        }
         $json = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
         foreach ($item in @($json.items)) {
             $key = if ($item.id) { "id:$($item.id)" } else { "key:$($item.key)" }
+            $loadedStatus = if ($item.status) { [string]$item.status } else { "pending" }
+            if ($loadedStatus -eq "reviewed") { $loadedStatus = "approved" }
             $script:decisions[$key] = [pscustomobject]@{
                 id = [string]$item.id
                 key = [string]$item.key
                 target = [string]$item.target
-                status = if ($item.status) { [string]$item.status } else { "pending" }
+                status = $loadedStatus
                 text = ConvertTo-FlatString $item.text
                 note = [string]$item.note
+                translationOrigin = if ($item.PSObject.Properties["translationOrigin"]) { [string]$item.translationOrigin } else { "" }
+                translationUpdatedAt = if ($item.PSObject.Properties["translationUpdatedAt"]) { [string]$item.translationUpdatedAt } else { "" }
                 sourceHash = [string]$item.sourceHash
                 sourceText = ConvertTo-FlatString $item.sourceText
                 sourceChanged = if ($item.PSObject.Properties["sourceChanged"]) { ConvertTo-BoolValue $item.sourceChanged } else { $false }
@@ -2694,6 +2973,8 @@ function Import-PreviousProjectDecisions {
                 status = if ($item.status) { [string]$item.status } else { "pending" }
                 text = ConvertTo-FlatString $item.text
                 note = [string]$item.note
+                translationOrigin = if ($item.PSObject.Properties["translationOrigin"]) { [string]$item.translationOrigin } else { "" }
+                translationUpdatedAt = if ($item.PSObject.Properties["translationUpdatedAt"]) { [string]$item.translationUpdatedAt } else { "" }
                 sourceHash = [string]$item.sourceHash
                 sourceText = ConvertTo-FlatString $item.sourceText
                 sourceChanged = if ($item.PSObject.Properties["sourceChanged"]) { ConvertTo-BoolValue $item.sourceChanged } else { $false }
@@ -2721,30 +3002,81 @@ function Save-Decisions {
     Save-CurrentEdit
     $items = New-Object "System.Collections.Generic.List[object]"
     foreach ($row in $script:rows) {
-        $decision = Get-Decision $row
+        $identity = if ($row.id) { "id:$($row.id)" } else { "key:$($row.key)" }
+        $decision = if ($script:decisions.ContainsKey($identity)) { $script:decisions[$identity] } else { $null }
+        $candidate = ConvertTo-FlatString $row.candidate
+        $existing = ConvertTo-FlatString $row.existing
+        $defaultText = if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidate } else { $existing }
+        $defaultOrigin = if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            if ($row.PSObject.Properties["translationOrigin"] -and $row.translationOrigin) { [string]$row.translationOrigin } else { "ai" }
+        } elseif (-not [string]::IsNullOrWhiteSpace($existing)) {
+            if ($row.PSObject.Properties["existingOrigin"] -and $row.existingOrigin) { [string]$row.existingOrigin } else { "existing" }
+        } else { "" }
+        $defaultChanged = $defaultOrigin -eq "rmk" -and $row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $row.rmkSourceChanged)
+        $defaultStatus = if ([string]::IsNullOrWhiteSpace($defaultText) -or $defaultChanged) { "pending" } else { "translated" }
+        $defaultTranslationUpdatedAt = if ($row.PSObject.Properties["translationUpdatedAt"]) { [string]$row.translationUpdatedAt } else { "" }
+
+        if ($decision) {
+            $status = [string]$decision.status
+            $text = ConvertTo-FlatString $decision.text
+            $note = [string]$decision.note
+            $origin = [string]$decision.translationOrigin
+            $translationUpdatedAt = [string]$decision.translationUpdatedAt
+            $sourceHash = [string]$decision.sourceHash
+            $sourceText = ConvertTo-FlatString $decision.sourceText
+            $sourceChanged = ConvertTo-BoolValue $decision.sourceChanged
+            $previousSourceText = ConvertTo-FlatString $decision.previousSourceText
+            $updatedAt = [string]$decision.updatedAt
+        } else {
+            $status = $defaultStatus
+            $text = $defaultText
+            $note = ""
+            $origin = $defaultOrigin
+            $translationUpdatedAt = $defaultTranslationUpdatedAt
+            $sourceHash = ""
+            $sourceText = ConvertTo-FlatString $row.source
+            $sourceChanged = $defaultChanged
+            $previousSourceText = if ($defaultChanged -and $row.PSObject.Properties["rmkHistoricalSource"]) { ConvertTo-FlatString $row.rmkHistoricalSource } else { "" }
+            $updatedAt = ""
+        }
+
+        $durableDefault = -not [string]::IsNullOrWhiteSpace($candidate) -or $defaultOrigin -in @("ai", "local")
+        $changedFromDefault = $status -ne $defaultStatus -or
+            -not [string]::Equals($text, $defaultText, [System.StringComparison]::Ordinal) -or
+            -not [string]::IsNullOrWhiteSpace($note) -or
+            $origin -ne $defaultOrigin -or
+            $translationUpdatedAt -ne $defaultTranslationUpdatedAt -or
+            $sourceChanged -ne $defaultChanged -or
+            -not [string]::IsNullOrWhiteSpace($updatedAt) -or
+            ($sourceChanged -and -not [string]::IsNullOrWhiteSpace($previousSourceText))
+        if (-not $durableDefault -and -not $changedFromDefault) { continue }
+
         [void]$items.Add([pscustomobject]@{
             id = [string]$row.id
             key = [string]$row.key
             target = Get-RelativeTarget $row
-            status = [string]$decision.status
-            text = ConvertTo-FlatString $decision.text
-            note = [string]$decision.note
-            sourceHash = [string]$decision.sourceHash
-            sourceText = ConvertTo-FlatString $decision.sourceText
-            sourceChanged = ConvertTo-BoolValue $decision.sourceChanged
-            previousSourceText = ConvertTo-FlatString $decision.previousSourceText
-            updatedAt = [string]$decision.updatedAt
+            status = $status
+            text = $text
+            note = $note
+            translationOrigin = $origin
+            translationUpdatedAt = $translationUpdatedAt
+            sourceHash = $sourceHash
+            sourceText = $sourceText
+            sourceChanged = $sourceChanged
+            previousSourceText = $previousSourceText
+            updatedAt = $updatedAt
         })
     }
     $payload = [ordered]@{
-        version = 3
+        version = 5
+        sparse = $true
         reviewRoot = $script:reviewRoot
         comparison = $script:comparisonFile
         updatedAt = (Get-Date).ToString("o")
         items = $items.ToArray()
     }
     $path = Get-DecisionPath
-    $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding UTF8
+    Write-Utf8JsonFile -Path $path -Value $payload -Depth 8
     $script:dirty = $false
     Invalidate-DashboardProjectData ([string]$script:selectedProjectId)
     $lblSave.Text = "저장됨 " + (Get-Date -Format "HH:mm:ss")
@@ -2754,10 +3086,16 @@ function Save-CurrentEdit {
     if ($script:loading -or $script:currentRowIndex -lt 0 -or $script:currentRowIndex -ge $script:rows.Count) { return }
     $row = $script:rows[$script:currentRowIndex]
     $decision = Get-Decision $row
-    if ($decision.text -ne $txtTranslation.Text -or $decision.note -ne $txtMemo.Text) {
+    $textChanged = $decision.text -ne $txtTranslation.Text
+    $noteChanged = $decision.note -ne $txtMemo.Text
+    if ($textChanged -or $noteChanged) {
         $before = if ($script:reviewStats) { Get-DecisionStateSnapshot $row } else { $null }
         $decision.text = ConvertTo-FlatString $txtTranslation.Text
         $decision.note = [string]$txtMemo.Text
+        if ($textChanged) {
+            $decision.translationOrigin = if ($script:translationEditorOrigin) { [string]$script:translationEditorOrigin } else { "local" }
+            $decision.translationUpdatedAt = (Get-Date).ToString("o")
+        }
         if ([string]::IsNullOrWhiteSpace($decision.text)) {
             $decision.status = "pending"
         } elseif ($decision.status -eq "pending" -or $decision.status -eq "approved") {
@@ -2775,24 +3113,47 @@ function Save-CurrentEdit {
             [void](Update-RenderedItemCard $script:currentRowIndex)
             Refresh-Summary
         }
+        $script:translationEditorOrigin = [string]$decision.translationOrigin
     }
 }
 
+function Set-TranslationEditorValue([string]$Text, [string]$Origin) {
+    $script:settingTranslationOrigin = $true
+    try {
+        $txtTranslation.Text = ConvertTo-FlatString $Text
+        $script:translationEditorOrigin = if ($Origin) { $Origin.ToLowerInvariant() } else { "local" }
+    } finally {
+        $script:settingTranslationOrigin = $false
+    }
+}
+
+function Build-SourceRowIndex {
+    $index = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+    for ($i = 0; $i -lt $script:rows.Count; $i++) {
+        $source = ConvertTo-FlatString $script:rows[$i].source
+        if ([string]::IsNullOrWhiteSpace($source)) { continue }
+        if (-not $index.ContainsKey($source)) {
+            $index[$source] = New-Object 'System.Collections.Generic.List[int]'
+        }
+        [void]$index[$source].Add($i)
+    }
+    $script:sourceRowIndex = $index
+}
+
 function Get-DuplicateSourceRowIndexes([int]$RowIndex, [string]$Translation) {
-    $matches = New-Object "System.Collections.Generic.List[int]"
-    if ($RowIndex -lt 0 -or $RowIndex -ge $script:rows.Count) { return $matches.ToArray() }
+    $duplicateIndexes = New-Object "System.Collections.Generic.List[int]"
+    if ($RowIndex -lt 0 -or $RowIndex -ge $script:rows.Count) { return $duplicateIndexes.ToArray() }
 
     $source = ConvertTo-FlatString $script:rows[$RowIndex].source
     $translationText = ConvertTo-FlatString $Translation
     if ([string]::IsNullOrWhiteSpace($source) -or [string]::IsNullOrWhiteSpace($translationText)) {
-        return $matches.ToArray()
+        return $duplicateIndexes.ToArray()
     }
 
-    for ($i = 0; $i -lt $script:rows.Count; $i++) {
+    if (-not $script:sourceRowIndex) { Build-SourceRowIndex }
+    if (-not $script:sourceRowIndex.ContainsKey($source)) { return $duplicateIndexes.ToArray() }
+    foreach ($i in $script:sourceRowIndex[$source]) {
         if ($i -eq $RowIndex) { continue }
-        $candidateSource = ConvertTo-FlatString $script:rows[$i].source
-        if (-not [string]::Equals($source, $candidateSource, [System.StringComparison]::Ordinal)) { continue }
-
         $decision = Get-Decision $script:rows[$i]
         $sameTranslation = [string]::Equals(
             $translationText,
@@ -2801,10 +3162,10 @@ function Get-DuplicateSourceRowIndexes([int]$RowIndex, [string]$Translation) {
         )
         $settledStatus = [string]$decision.status -in @("translated", "approved")
         if (-not $sameTranslation -or -not $settledStatus -or (ConvertTo-BoolValue $decision.sourceChanged)) {
-            [void]$matches.Add($i)
+            [void]$duplicateIndexes.Add($i)
         }
     }
-    return $matches.ToArray()
+    return $duplicateIndexes.ToArray()
 }
 
 function Apply-TranslationToDuplicateRows([int[]]$RowIndexes, [string]$Translation) {
@@ -2818,6 +3179,8 @@ function Apply-TranslationToDuplicateRows([int[]]$RowIndexes, [string]$Translati
         $decision = Get-Decision $script:rows[$index]
         $decision.text = $translationText
         $decision.status = "translated"
+        $decision.translationOrigin = "local"
+        $decision.translationUpdatedAt = $updatedAt
         $decision.sourceChanged = $false
         $decision.previousSourceText = ""
         $decision.updatedAt = $updatedAt
@@ -2927,6 +3290,8 @@ function Get-RowPassesFilter([object]$Row) {
         "번역됨" { if ($decision.status -ne "translated") { return $false } }
         "검토됨" { if ($decision.status -ne "approved") { return $false } }
         "업데이트로 변경됨" { if (-not (ConvertTo-BoolValue $decision.sourceChanged)) { return $false } }
+        "RMK 가져옴" { if ([string]$decision.translationOrigin -ne "rmk") { return $false } }
+        "내 번역" { if ([string]$decision.translationOrigin -ne "local") { return $false } }
         "반려" { if ($decision.status -ne "rejected") { return $false } }
         "보류" { if ($decision.status -ne "hold") { return $false } }
         "주의" {
@@ -3018,7 +3383,7 @@ function Update-ReviewStatsForDecisionChange([object]$Before, [object]$After) {
         $script:reviewStats.Warnings = [Math]::Max(0, [int]$script:reviewStats.Warnings + $(if ($After.Warning) { 1 } else { -1 }))
     }
 
-    $group = $script:fileGroups | Where-Object { $_.File -eq [string]$After.File } | Select-Object -First 1
+    $group = if ($script:fileGroupMap -and $script:fileGroupMap.ContainsKey([string]$After.File)) { $script:fileGroupMap[[string]$After.File] } else { $null }
     if ($group) {
         Add-StatusToFileGroup -Group $group -Status ([string]$Before.Status) -Delta -1
         Add-StatusToFileGroup -Group $group -Status ([string]$After.Status) -Delta 1
@@ -3029,26 +3394,38 @@ function Update-ReviewStatsForDecisionChange([object]$Before, [object]$After) {
 }
 
 function Build-FileGroups {
-    $groups = @{}
     $stats = [pscustomobject]@{ Total = 0; Approved = 0; Translated = 0; Rejected = 0; Hold = 0; Pending = 0; Updated = 0; Warnings = 0 }
     foreach ($row in $script:rows) {
-        $rel = Get-RelativeTarget $row
-        if (-not $groups.ContainsKey($rel)) {
-        $groups[$rel] = [pscustomobject]@{ File = $rel; Total = 0; Approved = 0; Translated = 0; Pending = 0; Warnings = 0 }
-        }
-        $group = $groups[$rel]
-        $group.Total++
         $stats.Total++
-        $decision = Get-Decision $row
-        Add-StatusToStats -Stats $stats -Status ([string]$decision.status) -Delta 1
-        switch ($decision.status) {
-            "approved" { $group.Approved++ }
-            "translated" { $group.Translated++ }
-            default { $group.Pending++ }
+        $identity = if ($row.id) { "id:$($row.id)" } else { "key:$($row.key)" }
+        $decision = if ($script:decisions.ContainsKey($identity)) { $script:decisions[$identity] } else { $null }
+        if ($decision -and $script:validateLoadedDecisionSources) { $decision = Get-Decision $row }
+        if ($decision) {
+            $rowStatus = [string]$decision.status
+            $rowUpdated = ConvertTo-BoolValue $decision.sourceChanged
+        } else {
+            $candidate = [string]$row.candidate
+            $existing = [string]$row.existing
+            $defaultText = if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidate } else { $existing }
+            $defaultOrigin = if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                if ($row.translationOrigin) { [string]$row.translationOrigin } else { "ai" }
+            } elseif (-not [string]::IsNullOrWhiteSpace($existing)) {
+                if ($row.existingOrigin) { [string]$row.existingOrigin } else { "existing" }
+            } else { "" }
+            $rowUpdated = $defaultOrigin -eq "rmk" -and (ConvertTo-BoolValue $row.rmkSourceChanged)
+            $rowStatus = if ([string]::IsNullOrWhiteSpace($defaultText) -or $rowUpdated) { "pending" } else { "translated" }
         }
-        if (ConvertTo-BoolValue $decision.sourceChanged) { $stats.Updated++ }
+        switch ($rowStatus) {
+            "approved" { $stats.Approved++ }
+            "translated" { $stats.Translated++ }
+            "rejected" { $stats.Rejected++ }
+            "hold" { $stats.Hold++ }
+            default { $stats.Pending++ }
+        }
+        if ($rowUpdated) { $stats.Updated++ }
     }
-    $script:fileGroups = @($groups.Values | Sort-Object File)
+    $script:fileGroups = @()
+    $script:fileGroupMap = @{}
     $script:reviewStats = $stats
 }
 
@@ -3057,111 +3434,83 @@ function Refresh-FileList {
     $lvFiles.BeginUpdate()
     try {
         $lvFiles.Items.Clear()
-        $all = New-Object System.Windows.Forms.ListViewItem("전체")
+        $all = [System.Windows.Forms.ListViewItem]::new("전체")
         $all.Tag = "__ALL__"
         [void]$all.SubItems.Add([string]$script:rows.Count)
         [void]$all.SubItems.Add("")
         [void]$lvFiles.Items.Add($all)
-        foreach ($group in $script:fileGroups) {
-            $item = New-Object System.Windows.Forms.ListViewItem($group.File)
-            $item.Tag = $group.File
-            [void]$item.SubItems.Add("$($group.Approved)/$($group.Total)")
-            [void]$item.SubItems.Add([string]$group.Warnings)
-            [void]$lvFiles.Items.Add($item)
-        }
     } finally {
         $lvFiles.EndUpdate()
     }
 }
 
+function Get-TranslationSortTicks([object]$Decision) {
+    if (-not $Decision -or [string]$Decision.translationOrigin -ne "local") { return [long]0 }
+    $value = [string]$Decision.translationUpdatedAt
+    $parsed = [datetime]::MinValue
+    if ($value -and [datetime]::TryParse($value, [ref]$parsed)) { return $parsed.ToUniversalTime().Ticks }
+    return [long]0
+}
+
 function Refresh-ItemList([int]$SelectRowIndex = -1) {
     Save-CurrentEdit
-    $visibleIndexes = New-Object "System.Collections.Generic.List[int]"
-    $flowItems.SuspendLayout()
+    $script:syncingItemSelection = $true
+    $flowItems.BeginUpdate()
     try {
         $lvItems.Items.Clear()
-        $flowItems.Controls.Clear()
-        $rendered = 0
-        $matched = 0
-        for ($i = 0; $i -lt $script:rows.Count; $i++) {
-            $row = $script:rows[$i]
-            if (-not (Get-RowPassesFilter $row)) { continue }
-            $matched++
-            [void]$visibleIndexes.Add($i)
-            if ($rendered -ge $script:maxRenderedCards) { continue }
-            $decision = Get-Decision $row
-            $warnings = @(Get-RowWarnings -Row $row -Translation (ConvertTo-FlatString $decision.text))
-            $preview = Get-ItemPreview $row
-            $isUpdated = ConvertTo-BoolValue $decision.sourceChanged
-            $statusText = if ($isUpdated) { "변경됨" } else { Get-StatusText $decision.status }
-            $statusColor = if ($isUpdated) { Get-UpdateColor } else { Get-StatusColor $decision.status }
-            $textDelta = [Math]::Max(-1, [Math]::Min(2, $script:textSize - 10))
-
-            $card = New-Object System.Windows.Forms.Panel
-            $card.Width = [Math]::Max(240, $flowItems.ClientSize.Width - 18)
-            $card.Height = 88 + ($textDelta * 4)
-            $card.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
-            $card.Tag = $i
-            $card.BorderStyle = [System.Windows.Forms.BorderStyle]::None
-            $card.BackColor = $script:itemCardBack
-            $card.Cursor = [System.Windows.Forms.Cursors]::Hand
-            $card.AccessibleRole = [System.Windows.Forms.AccessibleRole]::ListItem
-
-            $stripe = New-Object System.Windows.Forms.Panel
-            $stripe.Name = "StatusStripe"
-            $stripe.SetBounds(0, 0, 3, $card.Height)
-            $stripe.BackColor = $statusColor
-
-            $defContext = Get-RowDefContext $row
-            $keyText = "$($defContext.DefClass)  ·  $($defContext.Node)"
-            if ($keyText.Length -gt 46) { $keyText = $keyText.Substring(0, 43) + "..." }
-            $statusWidth = if ($isUpdated) { 70 } else { 60 }
-            $lblStatus = New-Label $statusText ($card.Width - $statusWidth - 14) 9 $statusWidth 20 $statusColor 8 ([System.Drawing.FontStyle]::Bold)
-            $lblStatus.Name = "StatusLabel"
-            $lblStatus.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-            $lblSourcePreview = New-Label $preview[0] 18 9 ($card.Width - $statusWidth - 42) (23 + $textDelta) $script:itemText ([Math]::Max(8.5, $script:textSize - 0.5))
-            $lblSourcePreview.Name = "SourcePreviewLabel"
-            $translationY = 34 + $textDelta
-            $keyY = 62 + ($textDelta * 3)
-            $lblTranslationPreview = New-Label $preview[1] 18 $translationY ($card.Width - 34) (22 + $textDelta) $script:itemMuted ([Math]::Max(8, $script:textSize - 1.5))
-            $lblTranslationPreview.Name = "TranslationPreviewLabel"
-            $lblKey = New-Label $keyText 18 $keyY ($card.Width - 34) 18 $script:itemSubtle 7.8
-            $lblKey.Name = "KeyLabel"
-            if ([string]::IsNullOrWhiteSpace($preview[1])) { $lblTranslationPreview.Text = "번역 대기" }
-            if ($warnings.Count -gt 0) {
-                $lblTranslationPreview.Text = "주의 · " + $lblTranslationPreview.Text
-                $lblTranslationPreview.ForeColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(238, 183, 92) } else { [System.Drawing.Color]::FromArgb(145, 91, 16) }
-            }
-            $card.AccessibleName = "$statusText, $keyText"
-            $card.AccessibleDescription = "$($preview[0]). $($defContext.Explanation) 번역: $($lblTranslationPreview.Text)"
-
-            $card.Controls.AddRange(@($stripe, $lblSourcePreview, $lblStatus, $lblTranslationPreview, $lblKey))
-            foreach ($control in @($card, $stripe, $lblKey, $lblSourcePreview, $lblStatus, $lblTranslationPreview)) {
-                $control.Add_Click({
-                    $target = $this
-                    while ($target -and -not ($target.Tag -is [int])) { $target = $target.Parent }
-                    if ($target) { Select-RowIndex ([int]$target.Tag) }
-                })
-            }
-            $flowItems.Controls.Add($card)
-            $rendered++
+        $flowItems.Items.Clear()
+        $rowOrder = [System.Collections.Generic.List[int]]::new()
+        for ($rowIndex = 0; $rowIndex -lt $script:rows.Count; $rowIndex++) { [void]$rowOrder.Add($rowIndex) }
+        $orderedRowIndexes = $rowOrder.ToArray()
+        $sortMode = if ($cmbSort -and $cmbSort.SelectedItem) { [string]$cmbSort.SelectedItem } else { "기본 순서" }
+        if ($sortMode -eq "내 번역 최신순") {
+            $orderedRowIndexes = @($orderedRowIndexes | Sort-Object `
+                @{ Expression = { if ([string](Get-Decision $script:rows[[int]$_]).translationOrigin -eq "local") { 0 } else { 1 } }; Ascending = $true }, `
+                @{ Expression = { Get-TranslationSortTicks (Get-Decision $script:rows[[int]$_]) }; Descending = $true }, `
+                @{ Expression = { [int]$_ }; Ascending = $true })
+        } elseif ($sortMode -eq "내 번역 오래된순") {
+            $orderedRowIndexes = @($orderedRowIndexes | Sort-Object `
+                @{ Expression = { if ([string](Get-Decision $script:rows[[int]$_]).translationOrigin -eq "local") { 0 } else { 1 } }; Ascending = $true }, `
+                @{ Expression = { Get-TranslationSortTicks (Get-Decision $script:rows[[int]$_]) }; Ascending = $true }, `
+                @{ Expression = { [int]$_ }; Ascending = $true })
         }
-        if ($matched -gt $rendered) {
-            $more = New-Object System.Windows.Forms.Label
-            $more.Text = "총 $matched개 중 $rendered개 표시 · 검색어로 좁혀보세요"
-            $more.Width = [Math]::Max(240, $flowItems.ClientSize.Width - 18)
-            $more.Height = 38
-            $more.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 8)
-            $more.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-            $more.Font = New-Font 8.5
-            $more.ForeColor = $script:itemMuted
-            $more.BackColor = $flowItems.BackColor
-            $flowItems.Controls.Add($more)
+        $capacity = $orderedRowIndexes.Count
+        $visibleBuffer = [int[]]::new($capacity)
+        $itemBuffer = [object[]]::new($capacity)
+        $positionMap = [int[]]::new($script:rows.Count)
+        $matched = 0
+        $fastAllRows = $script:currentFile -eq "__ALL__" -and
+            [string]$cmbStatus.SelectedItem -eq "전체" -and
+            [string]::IsNullOrWhiteSpace($txtSearch.Text)
+        foreach ($rowIndex in @($orderedRowIndexes)) {
+            $i = [int]$rowIndex
+            $row = $script:rows[$i]
+            if (-not $fastAllRows -and -not (Get-RowPassesFilter $row)) { continue }
+            $visibleBuffer[$matched] = $i
+            $positionMap[$i] = $matched + 1
+            $itemBuffer[$matched] = [System.Collections.DictionaryEntry]::new($i, [string]$row.key)
+            $matched++
+        }
+        if ($matched -eq $capacity) {
+            $visibleIndexes = $visibleBuffer
+            $listItems = $itemBuffer
+        } else {
+            $visibleIndexes = [int[]]::new($matched)
+            $listItems = [object[]]::new($matched)
+            if ($matched -gt 0) {
+                [System.Array]::Copy($visibleBuffer, $visibleIndexes, $matched)
+                [System.Array]::Copy($itemBuffer, $listItems, $matched)
+            }
+        }
+        if ($listItems.Count -gt 0) {
+            $flowItems.Items.AddRange($listItems)
         }
     } finally {
-        $flowItems.ResumeLayout()
+        $flowItems.EndUpdate()
+        $script:syncingItemSelection = $false
     }
-    $script:visibleRowIndexes = $visibleIndexes.ToArray()
+    $script:visibleRowIndexes = $visibleIndexes
+    $script:visibleRowPositionMap = $positionMap
 
     if ($script:visibleRowIndexes.Count -eq 0) {
         Clear-CurrentView
@@ -3178,14 +3527,18 @@ function Refresh-ItemList([int]$SelectRowIndex = -1) {
 
 function Refresh-ResultSelection {
     if (-not $flowItems) { return }
-    foreach ($card in @($flowItems.Controls)) {
-        if (-not ($card.Tag -is [int])) { continue }
-        if ([int]$card.Tag -eq $script:currentRowIndex) {
-            $card.BackColor = $script:itemCardSelected
-        } else {
-            $card.BackColor = $script:itemCardBack
-        }
+    $positionValue = if ($script:currentRowIndex -ge 0 -and $script:currentRowIndex -lt $script:visibleRowPositionMap.Length) { [int]$script:visibleRowPositionMap[$script:currentRowIndex] } else { 0 }
+    if ($positionValue -le 0) {
+        $script:syncingItemSelection = $true
+        try { $flowItems.ClearSelected() } finally { $script:syncingItemSelection = $false }
+        return
     }
+    $position = $positionValue - 1
+    if ($flowItems.SelectedIndex -ne $position) {
+        $script:syncingItemSelection = $true
+        try { $flowItems.SelectedIndex = $position } finally { $script:syncingItemSelection = $false }
+    }
+    $flowItems.Invalidate()
 }
 
 function Clear-CurrentView {
@@ -3203,15 +3556,20 @@ function Clear-CurrentView {
     if ($lblUpdateBadge) { $lblUpdateBadge.Visible = $false }
 }
 
-function Set-HistoryView([string]$Source, [string]$Existing, [string]$Candidate, [string]$Translation, [string]$PreviousSource = "", [bool]$SourceChanged = $false) {
+function Set-HistoryView([string]$Source, [string]$Existing, [string]$Candidate, [string]$Translation, [string]$PreviousSource = "", [bool]$SourceChanged = $false, [string]$ReferenceCurrentSource = "") {
     $isDark = Get-IsWindowsDarkMode
     $titleColor = if ($isDark) { [System.Drawing.Color]::FromArgb(183, 174, 159) } else { [System.Drawing.Color]::FromArgb(112, 102, 86) }
     $bodyColor = if ($isDark) { [System.Drawing.Color]::FromArgb(239, 233, 221) } else { [System.Drawing.Color]::FromArgb(47, 44, 38) }
     $reviewColor = if ($isDark) { [System.Drawing.Color]::FromArgb(107, 188, 129) } else { [System.Drawing.Color]::FromArgb(47, 126, 75) }
     $sections = New-Object "System.Collections.Generic.List[object]"
     if ($SourceChanged) {
-        [void]$sections.Add([pscustomobject]@{ Title = "업데이트 전 원문"; Value = $(if ($PreviousSource) { $PreviousSource } else { "(기록 없음)" }); Color = Get-UpdateColor })
-        [void]$sections.Add([pscustomobject]@{ Title = "현재 원문"; Value = $Source; Color = $bodyColor })
+        $previousTitle = if ($ReferenceCurrentSource) { "RMK 번역 당시 원문" } else { "업데이트 전 원문" }
+        $currentTitle = if ($ReferenceCurrentSource) { "현재 RMK 비교 원문" } else { "현재 원문" }
+        [void]$sections.Add([pscustomobject]@{ Title = $previousTitle; Value = $(if ($PreviousSource) { $PreviousSource } else { "(기록 없음)" }); Color = Get-UpdateColor })
+        [void]$sections.Add([pscustomobject]@{ Title = $currentTitle; Value = $(if ($ReferenceCurrentSource) { $ReferenceCurrentSource } else { $Source }); Color = $bodyColor })
+        if ($ReferenceCurrentSource -and -not [string]::Equals($ReferenceCurrentSource, $Source, [System.StringComparison]::Ordinal)) {
+            [void]$sections.Add([pscustomobject]@{ Title = "현재 번역 기준 원문"; Value = $Source; Color = $bodyColor })
+        }
     } else {
         [void]$sections.Add([pscustomobject]@{ Title = "원문"; Value = $Source; Color = $bodyColor })
     }
@@ -3258,13 +3616,16 @@ function Select-RowIndex([int]$Index) {
         $candidate = ConvertTo-FlatString $row.candidate
         $existing = ConvertTo-FlatString $row.existing
         $translation = ConvertTo-FlatString $decision.text
+        $originText = Get-TranslationOriginText ([string]$decision.translationOrigin)
+        $translationTime = Format-TranslationTimestamp ([string]$decision.translationUpdatedAt)
         $sourceChanged = ConvertTo-BoolValue $decision.sourceChanged
         $previousSource = ConvertTo-FlatString $decision.previousSourceText
+        $referenceCurrentSource = Get-OptionalRowText -Row $row -Names @("rmkCurrentSource")
 
         $statusLabel = Get-StatusText $decision.status
         $updateLabel = if ($sourceChanged) { "  ·  업데이트로 변경됨" } else { "" }
         $warningLabel = if ($warnings.Count -gt 0) { "  ·  주의 $($warnings.Count)" } else { "" }
-        $lblCurrent.Text = "{0} / {1}   {2}{3}" -f ($Index + 1), $script:rows.Count, $statusLabel, $warningLabel
+        $lblCurrent.Text = "{0} / {1}   {2}  ·  {3}{4}" -f ($Index + 1), $script:rows.Count, $statusLabel, $originText, $warningLabel
         $lblCurrent.ForeColor = if ($sourceChanged) { Get-UpdateColor } else { Get-StatusColor $decision.status }
         $lblUpdateBadge.Visible = $sourceChanged
         $lblUpdateBadge.ForeColor = Get-UpdateColor
@@ -3274,6 +3635,10 @@ function Select-RowIndex([int]$Index) {
         $txtTranslation.Text = $translation
         $txtExisting.Text = $existing
         $txtCandidate.Text = $candidate
+        $existingOriginText = Get-TranslationOriginText (Get-OptionalRowText -Row $row -Names @("existingOrigin"))
+        $lblExisting.Text = if ($existing) { "기존 번역  ·  $existingOriginText" } else { "기존 번역" }
+        $lblCandidate.Text = "AI 번역 후보"
+        $lblTranslationTitle.Text = "번역문  ·  $originText"
         $txtMemo.Text = [string]$decision.note
         $wordCount = @($source -split '\s+' | Where-Object { $_ }).Count
         $safeText = if ($translationValidation.SafeToApply) { "예" } else { "아니요" }
@@ -3288,13 +3653,17 @@ function Select-RowIndex([int]$Index) {
         } else {
             "'$($defContext.Field)' 노드는 $($defContext.NodeDescription)."
         }
-        $txtMeta.Text = "Def Class :  $($defContext.DefClass) ($classNote)`r`nNode :  $($defContext.Node) ($nodeNote)`r`n파일  $relative`r`nID  $($row.id)   ·   단어 $wordCount   ·   안전 적용 $safeText"
+        $translationTimeText = if ($translationTime) { "   ·   내 번역 시각 $translationTime" } else { "" }
+        $txtMeta.Text = "Def Class :  $($defContext.DefClass) ($classNote)`r`nNode :  $($defContext.Node) ($nodeNote)`r`n파일  $relative`r`nID  $($row.id)   ·   출처 $originText$translationTimeText   ·   단어 $wordCount   ·   안전 적용 $safeText"
         $txtMeta.AccessibleDescription = "Def Class는 문자열이 속한 RimWorld 정의 유형이고, Node는 Def 이름과 번역 필드 경로입니다. $($txtMeta.Text)"
         $issueLines = New-Object "System.Collections.Generic.List[string]"
-        if ($sourceChanged) { [void]$issueLines.Add("업데이트로 원문이 변경되었습니다. 다시 번역하거나 검토해야 적용할 수 있습니다.") }
+        if ($sourceChanged) {
+            $changeMessage = if ($referenceCurrentSource) { "RMK 번역 당시 원문과 현재 같은 언어의 원문이 달라졌습니다." } else { "모드 업데이트로 원문이 변경되었습니다." }
+            [void]$issueLines.Add("$changeMessage 다시 번역하거나 검토해야 적용할 수 있습니다.")
+        }
         foreach ($warning in $warnings) { [void]$issueLines.Add([string]$warning) }
         $txtWarnings.Text = if ($issueLines.Count -gt 0) { [string]::Join("`r`n", $issueLines.ToArray()) } else { "문제 없음" }
-        Set-HistoryView -Source $source -Existing $existing -Candidate $candidate -Translation $translation -PreviousSource $previousSource -SourceChanged $sourceChanged
+        Set-HistoryView -Source $source -Existing $existing -Candidate $candidate -Translation $translation -PreviousSource $previousSource -SourceChanged $sourceChanged -ReferenceCurrentSource $referenceCurrentSource
         Update-TermsForRow $row
         Refresh-ResultSelection
     } finally {
@@ -3304,6 +3673,7 @@ function Select-RowIndex([int]$Index) {
         $script:translationEditedByUser = $false
         $script:translationEditBaseline = $translation
     }
+    $script:translationEditorOrigin = [string]$decision.translationOrigin
 }
 
 function Update-FileListGroupDisplay([string]$RelativeFile) {
@@ -3322,58 +3692,13 @@ function Update-FileListGroupDisplay([string]$RelativeFile) {
 
 function Update-RenderedItemCard([int]$RowIndex) {
     if ($RowIndex -lt 0 -or $RowIndex -ge $script:rows.Count -or -not $flowItems) { return $false }
-
-    $card = $null
-    foreach ($control in @($flowItems.Controls)) {
-        if (($control.Tag -is [int]) -and [int]$control.Tag -eq $RowIndex) {
-            $card = $control
-            break
-        }
+    if ($RowIndex -ge $script:visibleRowPositionMap.Length) { return $false }
+    $positionValue = [int]$script:visibleRowPositionMap[$RowIndex]
+    if ($positionValue -le 0) { return $false }
+    $position = $positionValue - 1
+    if ($position -ge 0 -and $position -lt $flowItems.Items.Count) {
+        $flowItems.Invalidate($flowItems.GetItemRectangle($position))
     }
-    if (-not $card) { return $false }
-
-    $row = $script:rows[$RowIndex]
-    $decision = Get-Decision $row
-    $warnings = @(Get-RowWarnings -Row $row -Translation (ConvertTo-FlatString $decision.text))
-    $preview = Get-ItemPreview $row
-    $isUpdated = ConvertTo-BoolValue $decision.sourceChanged
-    $statusText = if ($isUpdated) { "변경됨" } else { Get-StatusText $decision.status }
-    $statusColor = if ($isUpdated) { Get-UpdateColor } else { Get-StatusColor $decision.status }
-    $statusWidth = if ($isUpdated) { 70 } else { 60 }
-
-    $stripe = @($card.Controls.Find("StatusStripe", $true) | Select-Object -First 1)[0]
-    $statusLabel = @($card.Controls.Find("StatusLabel", $true) | Select-Object -First 1)[0]
-    $sourceLabel = @($card.Controls.Find("SourcePreviewLabel", $true) | Select-Object -First 1)[0]
-    $translationLabel = @($card.Controls.Find("TranslationPreviewLabel", $true) | Select-Object -First 1)[0]
-    $keyLabel = @($card.Controls.Find("KeyLabel", $true) | Select-Object -First 1)[0]
-
-    if ($stripe) { $stripe.BackColor = $statusColor }
-    if ($statusLabel) {
-        $statusLabel.Text = $statusText
-        $statusLabel.ForeColor = $statusColor
-        $statusLabel.SetBounds($card.Width - $statusWidth - 14, $statusLabel.Top, $statusWidth, $statusLabel.Height)
-    }
-    if ($sourceLabel) {
-        $sourceLabel.Text = $preview[0]
-        $sourceLabel.Width = $card.Width - $statusWidth - 42
-    }
-    if ($translationLabel) {
-        $translationLabel.Text = if ([string]::IsNullOrWhiteSpace($preview[1])) { "번역 대기" } else { $preview[1] }
-        $translationLabel.ForeColor = $script:itemMuted
-        if ($warnings.Count -gt 0) {
-            $translationLabel.Text = "주의 · " + $translationLabel.Text
-            $translationLabel.ForeColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(238, 183, 92) } else { [System.Drawing.Color]::FromArgb(145, 91, 16) }
-        }
-    }
-    if ($keyLabel) {
-        $keyText = [string]$row.key
-        if ($keyText.Length -gt 46) { $keyText = $keyText.Substring(0, 43) + "..." }
-        $keyLabel.Text = $keyText
-    }
-
-    $card.AccessibleName = "$statusText, $([string]$row.key)"
-    $translationDescription = if ($translationLabel) { $translationLabel.Text } else { $preview[1] }
-    $card.AccessibleDescription = "$($preview[0]). 번역: $translationDescription"
     Refresh-ResultSelection
     return $true
 }
@@ -3479,7 +3804,59 @@ function Mark-Current([string]$Status, [bool]$Advance) {
     }
 }
 
+function Approve-AllSafeTranslations {
+    if (-not $script:rows -or $script:rows.Count -eq 0) { return }
+    Save-CurrentEdit
+    [void](Confirm-DuplicateSourceTranslation)
+
+    $eligible = New-Object "System.Collections.Generic.List[int]"
+    $blank = 0
+    $changedSource = 0
+    $unsafe = 0
+    foreach ($index in 0..($script:rows.Count - 1)) {
+        $row = $script:rows[$index]
+        $decision = Get-Decision $row
+        if ([string]::IsNullOrWhiteSpace((ConvertTo-FlatString $decision.text))) { $blank++; continue }
+        if (ConvertTo-BoolValue $decision.sourceChanged) { $changedSource++; continue }
+        if (@(Get-RowWarnings -Row $row -Translation (ConvertTo-FlatString $decision.text)).Count -gt 0) { $unsafe++; continue }
+        if ([string]$decision.status -ne "approved") { [void]$eligible.Add($index) }
+    }
+
+    if ($eligible.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "새로 검토 완료로 바꿀 안전한 번역이 없습니다.`r`n`r`n빈 번역 $blank개 · 원문 변경 $changedSource개 · 주의 $unsafe개",
+            "전체 검토 완료",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "안전 검사를 통과한 번역 $($eligible.Count)개를 모두 검토 완료로 표시할까요?`r`n`r`n빈 번역 $blank개, 원문 변경 $changedSource개, 주의 $unsafe개는 건너뜁니다.",
+        "전체 검토 완료",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    $updatedAt = (Get-Date).ToString("o")
+    foreach ($index in $eligible) {
+        $decision = Get-Decision $script:rows[$index]
+        $decision.status = "approved"
+        $decision.updatedAt = $updatedAt
+    }
+    $script:dirty = $true
+    Save-Decisions
+    Refresh-FileList
+    Refresh-ItemList -SelectRowIndex $script:currentRowIndex
+    Add-Log "전체 검토 완료: $($eligible.Count)개 승인, 빈 번역 $blank개 · 원문 변경 $changedSource개 · 주의 $unsafe개 건너뜀"
+}
+
 function Load-ReviewRoot([string]$Root, [switch]$SkipPreviousDecisions) {
+    $loadStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $stageStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $loadStages = New-Object 'System.Collections.Generic.List[string]'
     if (-not $Root -or -not (Test-Path -LiteralPath $Root -PathType Container)) {
         throw "검토 폴더를 찾을 수 없습니다: $Root"
     }
@@ -3501,30 +3878,63 @@ function Load-ReviewRoot([string]$Root, [switch]$SkipPreviousDecisions) {
     }
     $script:comparisonFile = Find-ComparisonFile $script:reviewRoot
     $parsed = [System.IO.File]::ReadAllText($script:comparisonFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-    $script:rows = @($parsed)
+    $allRows = @($parsed)
+    [void]$loadStages.Add(("JSON {0:n0}ms" -f $stageStopwatch.Elapsed.TotalMilliseconds)); $stageStopwatch.Restart()
+    $excludedInternalCount = 0
+    $screeningAudit = $script:comparisonFile -replace '-comparison\.json$', '-skipped-internal-identifiers.json'
+    if (Test-Path -LiteralPath $screeningAudit -PathType Leaf) {
+        $script:rows = [object[]]$allRows
+        try {
+            $auditInfo = Get-Item -LiteralPath $screeningAudit -ErrorAction Stop
+            if ($auditInfo.Length -gt 2 -and $auditInfo.Length -le 1048576) {
+                [object[]]$screenedRows = [System.IO.File]::ReadAllText($screeningAudit, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                $excludedInternalCount = $screenedRows.Count
+            }
+        } catch {}
+    } else {
+        $includedRows = [System.Collections.Generic.List[object]]::new()
+        foreach ($row in $allRows) {
+            if (Get-InternalLocalizationIdentifierReason $row) { $excludedInternalCount++; continue }
+            [void]$includedRows.Add($row)
+        }
+        $script:rows = $includedRows.ToArray()
+    }
+    $script:sourceRowIndex = $null
+    if ($excludedInternalCount -gt 0) { Add-Log "내부 식별자 ${excludedInternalCount}개를 검수 목록에서 제외했습니다." }
+    [void]$loadStages.Add(("필터 {0:n0}ms" -f $stageStopwatch.Elapsed.TotalMilliseconds)); $stageStopwatch.Restart()
     if ($script:validationCache.Count -gt 20000) { $script:validationCache = @{} }
     $script:reviewStats = $null
+    $script:relativeTargetCache = @{}
     $script:currentRowIndex = -1
     Load-Decisions
+    [void]$loadStages.Add(("상태 {0:n0}ms" -f $stageStopwatch.Elapsed.TotalMilliseconds)); $stageStopwatch.Restart()
     if (-not $SkipPreviousDecisions) { Import-PreviousProjectDecisions }
-    foreach ($row in $script:rows) { [void](Get-Decision $row) }
-    if ($script:dirty) { Save-Decisions }
+    [void]$loadStages.Add(("이전 작업 {0:n0}ms" -f $stageStopwatch.Elapsed.TotalMilliseconds)); $stageStopwatch.Restart()
     $script:currentFile = "__ALL__"
     $lblProject.Text = Get-CurrentDisplayName
     $lblPath.Text = if ($script:selectedModRoot) { $script:selectedModRoot } else { $script:reviewRoot }
     Update-SearchCrumb
     Refresh-FileList
+    [void]$loadStages.Add(("파일 집계 {0:n0}ms" -f $stageStopwatch.Elapsed.TotalMilliseconds)); $stageStopwatch.Restart()
+    if ($script:dirty) {
+        Save-Decisions
+        [void]$loadStages.Add(("상태 저장 {0:n0}ms" -f $stageStopwatch.Elapsed.TotalMilliseconds)); $stageStopwatch.Restart()
+    }
     Refresh-ItemList
+    [void]$loadStages.Add(("목록 화면 {0:n0}ms" -f $stageStopwatch.Elapsed.TotalMilliseconds)); $stageStopwatch.Restart()
     $lblSave.Text = "불러옴 " + (Get-Date -Format "HH:mm:ss")
     $script:lastReviewOutputPath = $script:reviewRoot
     $hasProjectMod = [bool](Get-ActiveProjectModRoot)
     if ($btnApply) { $btnApply.Enabled = $hasProjectMod }
     if ($btnApplyTranslated) { $btnApplyTranslated.Enabled = $hasProjectMod }
     if ($tabs -and $tabRmk -and $tabs.SelectedTab -eq $tabRmk) { Refresh-RmkPanel }
+    $loadStopwatch.Stop()
+    Add-Log ("검수 화면 로드: {0:n2}초 · {1}개 문자열" -f $loadStopwatch.Elapsed.TotalSeconds, $script:rows.Count)
+    Add-Log ("로드 세부: " + [string]::Join(" · ", $loadStages))
 }
 
 function Choose-ReviewRoot {
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg = [System.Windows.Forms.FolderBrowserDialog]::new()
     $dlg.Description = "검수할 리뷰 결과 폴더를 선택하세요."
     if ($script:reviewRoot -and (Test-Path -LiteralPath $script:reviewRoot)) {
         $dlg.SelectedPath = $script:reviewRoot
@@ -3630,6 +4040,7 @@ function Set-SelectedMod([object]$ModInfo) {
         }
     }
     $project = Get-OrCreateProject -ModInfo $ModInfo -SourceLanguageFolder $sourceLanguage
+    if (-not (Ensure-ProjectSourceLanguage $project)) { return $null }
     Save-ProjectStore
     Set-ActiveProject $project
     $selectedLanguage = if ($project.PSObject.Properties["sourceLanguageFolder"]) { [string]$project.sourceLanguageFolder } else { "Auto" }
@@ -3637,8 +4048,29 @@ function Set-SelectedMod([object]$ModInfo) {
     return $project
 }
 
+function Ensure-ProjectSourceLanguage([object]$Project) {
+    if (-not $Project -or -not $Project.modRoot) { return $false }
+    $current = if ($Project.PSObject.Properties["sourceLanguageFolder"]) { ([string]$Project.sourceLanguageFolder).Trim() } else { "Auto" }
+    if ($current -and $current -ne "Auto") { return $true }
+    if ($Project.latestReviewRoot -and (Test-Path -LiteralPath ([string]$Project.latestReviewRoot) -PathType Container)) { return $true }
+
+    $options = @(Get-ModSourceLanguageOptions ([string]$Project.modRoot))
+    if ($options.Count -eq 0) { return $true }
+    $selected = if ($options.Count -eq 1) {
+        [string]$options[0].Folder
+    } else {
+        Select-ProjectSourceLanguage ([pscustomobject]@{ Path = [string]$Project.modRoot; Name = [string]$Project.name })
+    }
+    if (-not $selected) { return $false }
+    $Project.sourceLanguageFolder = $selected
+    $Project.updatedAt = (Get-Date).ToString("o")
+    Save-ProjectStore
+    Invalidate-DashboardProjectData ([string]$Project.id)
+    return $true
+}
+
 function Choose-ModFolder {
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg = [System.Windows.Forms.FolderBrowserDialog]::new()
     $dlg.Description = "프로젝트로 만들 RimWorld 모드 폴더를 선택하세요."
     if ($script:selectedModRoot -and (Test-Path -LiteralPath $script:selectedModRoot)) {
         $dlg.SelectedPath = $script:selectedModRoot
@@ -3677,6 +4109,7 @@ function Set-TranslationRunning([bool]$Running) {
     $cmbModCatalog.Enabled = -not $Running
     $cmbProject.Enabled = -not $Running
     $txtApiKeys.Enabled = -not $Running
+    if ($pnlApiSettings) { $pnlApiSettings.Enabled = -not $Running }
     $chkIncludePatches.Enabled = -not $Running
     $chkDryRun.Enabled = -not $Running
     $chkApplyToRmk.Enabled = -not $Running
@@ -3724,11 +4157,11 @@ function Get-ExistingProjectTranslationInfo([string]$ModRoot, [string]$RmkRefere
 function Select-AiTranslationMode([object]$ExistingInfo) {
     if (-not $ExistingInfo -or -not $ExistingInfo.HasExistingTranslation) { return "Overwrite" }
 
-    $dialog = New-Object System.Windows.Forms.Form
+    $dialog = [System.Windows.Forms.Form]::new()
     $dialog.Text = "AI 번역 방식 선택"
     $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
     $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $dialog.ClientSize = New-Object System.Drawing.Size(680, 278)
+    $dialog.ClientSize = [System.Drawing.Size]::new(680, 278)
     $dialog.MinimizeBox = $false
     $dialog.MaximizeBox = $false
     $dialog.ShowInTaskbar = $false
@@ -3737,7 +4170,7 @@ function Select-AiTranslationMode([object]$ExistingInfo) {
     $dialog.Font = New-Font 9
     $dialog.Tag = "Cancel"
 
-    $accent = New-Object System.Windows.Forms.Panel
+    $accent = [System.Windows.Forms.Panel]::new()
     $accent.SetBounds(0, 0, 680, 4)
     $accent.BackColor = $script:accentColor
 
@@ -3746,7 +4179,7 @@ function Select-AiTranslationMode([object]$ExistingInfo) {
     $body = New-Label $bodyText 28 66 624 86 $script:mutedColor 9.5
     $body.AutoEllipsis = $false
 
-    $divider = New-Object System.Windows.Forms.Panel
+    $divider = [System.Windows.Forms.Panel]::new()
     $divider.SetBounds(28, 164, 624, 1)
     $divider.BackColor = [System.Drawing.Color]::FromArgb(120, $script:mutedColor)
 
@@ -3794,7 +4227,12 @@ function New-PreserveTranslationFile {
         $key = ([string]$row.key).Trim()
         $text = ConvertTo-FlatString $decision.text
         if (-not $key -or -not $seen.Add($key) -or [string]::IsNullOrWhiteSpace($text) -or (ConvertTo-BoolValue $decision.sourceChanged)) { continue }
-        [void]$items.Add([pscustomobject]@{ key = $key; text = $text })
+        [void]$items.Add([pscustomobject]@{
+            key = $key
+            text = $text
+            origin = [string]$decision.translationOrigin
+            translationUpdatedAt = [string]$decision.translationUpdatedAt
+        })
     }
     if ($items.Count -eq 0) { return $null }
     $path = New-TempFilePath "preserve-translations" ".json"
@@ -3809,6 +4247,8 @@ function Start-Translation {
         [System.Windows.Forms.MessageBox]::Show("이미 번역이 실행 중입니다.", "RimWorld AI Translator") | Out-Null
         return
     }
+    $selectedProject = Get-SelectedProject
+    if ($selectedProject -and -not (Ensure-ProjectSourceLanguage $selectedProject)) { return }
     try {
         $modRoot = Get-ActiveProjectModRoot -Require
     } catch {
@@ -3820,7 +4260,10 @@ function Start-Translation {
         return
     }
     Save-ReviewWithDuplicatePrompt
-    $rmkReference = Get-RmkReferenceLanguageRoot (Get-SelectedProject)
+    Save-CurrentApiProviderControls -Persist
+    $rmkTarget = Get-RmkReferenceTarget (Get-SelectedProject)
+    $rmkReference = if ($rmkTarget) { [string]$rmkTarget.LanguageRoot } else { "" }
+    $rmkWorkbook = if ($rmkTarget -and $rmkTarget.PSObject.Properties["WorkbookPath"]) { [string]$rmkTarget.WorkbookPath } else { "" }
     $existingInfo = Get-ExistingProjectTranslationInfo -ModRoot $modRoot -RmkReferenceRoot $rmkReference
     $translationMode = Select-AiTranslationMode $existingInfo
     if ($translationMode -eq "Cancel") { return }
@@ -3835,7 +4278,31 @@ function Start-Translation {
     $script:translationLogOffset = 0L
     $script:translationLogPartial = ""
 
-    $keys = @(Get-ApiKeyLines $txtApiKeys.Text)
+    $selectedProvider = Get-ApiProviderProfile
+    $selectedProviderConfig = Get-SelectedApiProviderConfig
+    if (-not $selectedProvider -or -not $selectedProviderConfig) {
+        [System.Windows.Forms.MessageBox]::Show("번역 API 설정을 읽을 수 없습니다.", "RimWorld AI Translator") | Out-Null
+        return
+    }
+    $keys = @(Get-ApiKeyLines ([string]$script:apiProviderKeys[$script:selectedApiProviderId]))
+    $effectiveProvider = $selectedProvider
+    $effectiveProviderConfig = $selectedProviderConfig
+    if ([string]$selectedProvider.Provider -ne "Google" -and $keys.Count -eq 0) {
+        $effectiveProvider = Get-ApiProviderProfile "Google"
+        $effectiveProviderConfig = $script:apiProviderConfigs["Google"]
+    }
+    if ([string]$effectiveProvider.Provider -ne "Google") {
+        $providerUri = $null
+        if (-not [System.Uri]::TryCreate(([string]$effectiveProviderConfig.url).Trim(), [System.UriKind]::Absolute, [ref]$providerUri) -or $providerUri.Scheme -ne [System.Uri]::UriSchemeHttps) {
+            [System.Windows.Forms.MessageBox]::Show("선택한 번역 API의 HTTPS URL을 확인하세요.", "RimWorld AI Translator") | Out-Null
+            return
+        }
+        $providerModel = ([string]$effectiveProviderConfig.model).Trim()
+        if (-not $providerModel -or $providerModel.Length -gt 200 -or $providerModel -match "[\x00-\x1F\x7F]") {
+            [System.Windows.Forms.MessageBox]::Show("선택한 번역 API의 모델 ID를 확인하세요.", "RimWorld AI Translator") | Out-Null
+            return
+        }
+    }
     $sourceLanguage = Get-SelectedProjectSourceLanguage
     $translationParameters = [ordered]@{
         ModRoot = $modRoot
@@ -3845,9 +4312,26 @@ function Start-Translation {
         ReviewRoot = $script:appReviewRoot
         BatchSize = 40
         MaxGeneratedGlossaryTermsPerBatch = 40
+        TranslationProvider = [string]$effectiveProvider.Provider
+        ProviderName = [string]$effectiveProviderConfig.name
+        BaseUrl = [string]$effectiveProviderConfig.url
+        Model = [string]$effectiveProviderConfig.model
+        Temperature = [double]$effectiveProviderConfig.temperature
+        ResponseFormatMode = [string]$effectiveProvider.ResponseFormat
+        CompletionTokenParameter = [string]$effectiveProvider.TokenParameter
+        RequestsPerMinutePerKey = [int]$effectiveProvider.Rpm
+        InputTokensPerMinutePerKey = [int]$effectiveProvider.InputTpm
+        DailyTokenBudgetPerKey = [int]$effectiveProvider.DailyTokens
+        MaxCompletionTokens = [int]$effectiveProvider.MaxOutput
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$effectiveProvider.ReasoningEffort)) {
+        $translationParameters.ReasoningEffort = [string]$effectiveProvider.ReasoningEffort
     }
     if ($rmkReference) {
         $translationParameters.ReferenceLanguageRoot = @($rmkReference)
+    }
+    if ($rmkWorkbook -and (Test-Path -LiteralPath $rmkWorkbook -PathType Leaf)) {
+        $translationParameters.ReferenceSourceWorkbook = $rmkWorkbook
     }
     $preservedReview = $null
     if ($translationMode -eq "MissingOnly") {
@@ -3863,10 +4347,14 @@ function Start-Translation {
     $txtLog.Clear()
     Add-Log "번역 시작: $modRoot"
     Add-Log "원문 기준 언어: $sourceLanguage"
-    if ($keys.Count -gt 0) {
-        Add-Log "Cerebras API 키 $($keys.Count)개 사용"
+    if ([string]$effectiveProvider.Provider -eq "Google") {
+        if ([string]$selectedProvider.Provider -eq "Google") {
+            Add-Log "번역 API: Google 번역"
+        } else {
+            Add-Log "$($selectedProvider.Name) API 키 없음: Google 번역으로 자동 전환"
+        }
     } else {
-        Add-Log "API 키 없음: Google 번역 후보를 생성합니다."
+        Add-Log "번역 API: $($effectiveProviderConfig.name) · 모델 $($effectiveProviderConfig.model) · API 키 $($keys.Count)개"
     }
     if ($translationMode -eq "MissingOnly") {
         $preservedCount = if ($preservedReview) { $preservedReview.Count } else { 0 }
@@ -3875,6 +4363,7 @@ function Start-Translation {
         Add-Log "번역 방식: 전체 항목의 번역 후보를 새로 생성"
     }
     if ($rmkReference) { Add-Log "RMK 기존 번역 참조: $rmkReference" }
+    if ($rmkWorkbook) { Add-Log "RMK 번역 당시 원문 비교: $rmkWorkbook" }
 
     $argumentFile = New-TempFilePath "translation-arguments" ".json"
     $argumentPayload = [ordered]@{ version = 1; parameters = $translationParameters }
@@ -3890,8 +4379,9 @@ function Start-Translation {
     $psi.RedirectStandardOutput = $false
     $psi.RedirectStandardError = $false
     $psi.CreateNoWindow = $true
-    if ($keys.Count -gt 0) {
+    if ([string]$effectiveProvider.Provider -ne "Google" -and $keys.Count -gt 0) {
         $psi.EnvironmentVariables["RIMWORLD_TRANSLATOR_API_KEYS"] = [string]::Join("`n", $keys)
+        $psi.EnvironmentVariables["CEREBRAS_API_KEY"] = ""
     } else {
         $psi.EnvironmentVariables["RIMWORLD_TRANSLATOR_API_KEYS"] = ""
         $psi.EnvironmentVariables["CEREBRAS_API_KEY"] = ""
@@ -3930,14 +4420,20 @@ function Stop-Translation {
 }
 
 function Load-SourceOnlyForSelectedMod {
+    if ($script:process -and -not $script:process.HasExited) {
+        [System.Windows.Forms.MessageBox]::Show("이미 작업이 실행 중입니다.", "RimWorld AI Translator") | Out-Null
+        return
+    }
+    $selectedProject = Get-SelectedProject
+    if ($selectedProject -and -not (Ensure-ProjectSourceLanguage $selectedProject)) { return }
     try {
         $modRoot = Get-ActiveProjectModRoot -Require
     } catch {
         [System.Windows.Forms.MessageBox]::Show("먼저 프로젝트를 만들거나 여세요.", "RimWorld AI Translator") | Out-Null
         return
     }
-    if (-not (Test-Path -LiteralPath $script:translatorScript)) {
-        [System.Windows.Forms.MessageBox]::Show("번역 스크립트를 찾을 수 없습니다.`r`n$script:translatorScript", "RimWorld AI Translator") | Out-Null
+    if (-not (Test-Path -LiteralPath $script:translatorScript -PathType Leaf) -or -not (Test-Path -LiteralPath $script:translationRunnerScript -PathType Leaf)) {
+        [System.Windows.Forms.MessageBox]::Show("원문 로드 실행 파일을 찾을 수 없습니다. 프로그램 패키지를 다시 확인하세요.", "RimWorld AI Translator") | Out-Null
         return
     }
 
@@ -3946,48 +4442,69 @@ function Load-SourceOnlyForSelectedMod {
     Remove-TempFiles
     $script:lastReviewOutputPath = ""
     $script:lastProvider = "sourceonly"
+    $script:translationLogFile = New-TempFilePath "source-refresh-output" ".log"
+    [System.IO.File]::WriteAllText($script:translationLogFile, "", [System.Text.UTF8Encoding]::new($false))
+    [void]$script:tempFiles.Add($script:translationLogFile)
+    $script:translationLogOffset = 0L
+    $script:translationLogPartial = ""
     $sourceLanguage = Get-SelectedProjectSourceLanguage
-    $args = @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", $script:translatorScript,
-        "-ModRoot", $modRoot,
-        "-LanguageFolderName", "Korean",
-        "-SourceLanguageFolder", $sourceLanguage,
-        "-ReviewOnly",
-        "-ReviewRoot", $script:appReviewRoot,
-        "-SourceOnly"
-    )
-    if ($chkIncludePatches.Checked) { $args += "-IncludePatches" }
-    $rmkReference = Get-RmkReferenceLanguageRoot (Get-SelectedProject)
-    if ($rmkReference) { $args += @("-ReferenceLanguageRoot", $rmkReference) }
+    $rmkTarget = Get-RmkReferenceTarget (Get-SelectedProject)
+    $rmkReference = if ($rmkTarget) { [string]$rmkTarget.LanguageRoot } else { "" }
+    $rmkWorkbook = if ($rmkTarget -and $rmkTarget.PSObject.Properties["WorkbookPath"]) { [string]$rmkTarget.WorkbookPath } else { "" }
+    $translationParameters = [ordered]@{
+        ModRoot = $modRoot
+        LanguageFolderName = "Korean"
+        SourceLanguageFolder = $sourceLanguage
+        ReviewOnly = $true
+        ReviewRoot = $script:appReviewRoot
+        SourceOnly = $true
+    }
+    if ($chkIncludePatches.Checked) { $translationParameters.IncludePatches = $true }
+    if ($rmkReference) { $translationParameters.ReferenceLanguageRoot = @($rmkReference) }
+    if ($rmkWorkbook -and (Test-Path -LiteralPath $rmkWorkbook -PathType Leaf)) { $translationParameters.ReferenceSourceWorkbook = $rmkWorkbook }
 
     $txtLog.Clear()
     Add-Log "원문 로드 시작: $modRoot"
     Add-Log "원문 기준 언어: $sourceLanguage"
     if ($rmkReference) { Add-Log "RMK 기존 번역을 기본 번역으로 불러옵니다: $rmkReference" }
+    if ($rmkWorkbook) { Add-Log "RMK 번역 당시 원문과 현재 원문을 비교합니다: $rmkWorkbook" }
+
+    $argumentFile = New-TempFilePath "source-refresh-arguments" ".json"
+    $argumentPayload = [ordered]@{ version = 1; parameters = $translationParameters }
+    [System.IO.File]::WriteAllText($argumentFile, ($argumentPayload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    [void]$script:tempFiles.Add($argumentFile)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $runnerArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script:translationRunnerScript, "-TranslatorScript", $script:translatorScript, "-ArgumentFile", $argumentFile, "-LogFile", $script:translationLogFile)
+    $psi.FileName = $script:powershellExe
+    $psi.Arguments = [string]::Join(" ", @($runnerArgs | ForEach-Object { Quote-WindowsProcessArgument $_ }))
+    $psi.WorkingDirectory = $scriptRoot
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $false
+    $psi.RedirectStandardError = $false
+    $psi.CreateNoWindow = $true
+    $psi.EnvironmentVariables["RIMWORLD_TRANSLATOR_API_KEYS"] = ""
+    $psi.EnvironmentVariables["CEREBRAS_API_KEY"] = ""
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $proc.EnableRaisingEvents = $true
+    $script:process = $proc
+    $script:activeAiTranslationMode = "SourceOnly"
+    $script:startedAt = Get-Date
+    $script:processExitHandled = $false
+    $script:stopRequested = $false
+    $progressRun.Value = 0
+    $progressRun.Maximum = 100
     $lblRunStatus.Text = "원문 로드 중"
     Set-TranslationRunning $true
     try {
-        $output = & $script:powershellExe @args 2>&1
-        $exitCode = $LASTEXITCODE
-        foreach ($line in @($output)) {
-            Add-Log ([string]$line)
-            Update-ProgressFromLine ([string]$line)
-        }
-        if ($exitCode -eq 0 -and $script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath -PathType Container)) {
-            Load-ReviewRoot $script:lastReviewOutputPath
-            Register-ProjectRun -ReviewRoot $script:lastReviewOutputPath -Provider "sourceonly"
-            $lblRunStatus.Text = "원문 로드 완료"
-            Add-Log "원문 목록을 불러왔습니다. 기존 한국어 번역이 있으면 번역칸의 기본값으로 사용합니다."
-        } elseif ($exitCode -eq 0) {
-            $lblRunStatus.Text = "원문 로드 완료"
-        } else {
-            $lblRunStatus.Text = "원문 로드 실패"
-        }
+        [void]$proc.Start()
+        Add-Log "원문 로드 프로세스 PID=$($proc.Id)"
     } catch {
-        Add-Log "원문 로드 실패: $($_.Exception.Message)"
+        Add-Log "원문 로드 실행 실패: $($_.Exception.Message)"
+        $script:activeAiTranslationMode = ""
         $lblRunStatus.Text = "원문 로드 실패"
-    } finally {
         Set-TranslationRunning $false
     }
 }
@@ -4097,7 +4614,7 @@ function Get-ProjectReviewStats([object]$Project) {
         }
 
         $parsedRows = [System.IO.File]::ReadAllText($comparison, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-        $rows = @($parsedRows)
+        $rows = @($parsedRows | Where-Object { -not (Get-InternalLocalizationIdentifierReason $_) })
         $decisions = @{}
         if (Test-Path -LiteralPath $decisionPath -PathType Leaf) {
             $json = [System.IO.File]::ReadAllText($decisionPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -4113,12 +4630,10 @@ function Get-ProjectReviewStats([object]$Project) {
             $stats.Total++
 
             $decision = $null
-            foreach ($identity in @("id:$($row.id)", "key:$($row.key)")) {
-                if ($identity -and $decisions.ContainsKey($identity)) {
-                    $decision = $decisions[$identity]
-                    break
-                }
-            }
+            $idIdentity = if ($row.id) { "id:$($row.id)" } else { "" }
+            $keyIdentity = if ($row.key) { "key:$($row.key)" } else { "" }
+            if ($idIdentity -and $decisions.ContainsKey($idIdentity)) { $decision = $decisions[$idIdentity] }
+            elseif ($keyIdentity -and $decisions.ContainsKey($keyIdentity)) { $decision = $decisions[$keyIdentity] }
             $status = if ($decision -and $decision.status) { [string]$decision.status } else {
                 if ([string]::IsNullOrWhiteSpace((Get-DefaultTranslationForRow $row))) { "pending" } else { "translated" }
             }
@@ -4201,6 +4716,7 @@ function Get-ProjectActivityRows {
 
 function Open-ProjectWorkspace([object]$Project) {
     if (-not $Project) { return }
+    if (-not (Ensure-ProjectSourceLanguage $Project)) { return }
     Set-ActiveProject $Project
     if ($Project.modRoot -and (Test-Path -LiteralPath $Project.modRoot -PathType Container)) {
         Show-Workspace
@@ -4250,64 +4766,70 @@ function Refresh-DashboardProjects {
     $flowDashboardProjects.SuspendLayout()
     try {
         $flowDashboardProjects.Controls.Clear()
-        $matches = @($script:projects | Sort-Object @{ Expression = "updatedAt"; Descending = $true } | Where-Object {
+        $matchingProjects = @($script:projects | Sort-Object @{ Expression = "updatedAt"; Descending = $true } | Where-Object {
             if (-not $filter) { return $true }
             $blob = @([string]$_.name, [string]$_.modRoot, [string]$_.packageId, [string]$_.workshopId, [string]$_.sourceLanguageFolder) -join "`n"
             return $blob.ToLowerInvariant().Contains($filter)
         })
 
-        if ($matches.Count -eq 0) {
+        if ($matchingProjects.Count -eq 0) {
             $empty = New-Label "아직 프로젝트가 없습니다. 감지된 모드를 선택해 프로젝트를 만들거나 폴더를 직접 추가하세요." 12 12 820 34 $script:itemMuted 10
             $flowDashboardProjects.Controls.Add($empty)
             $renderSucceeded = $true
             return
         }
 
-        foreach ($project in $matches) {
+        foreach ($project in $matchingProjects) {
             $stats = Get-ProjectReviewStats $project
-            $card = New-Object System.Windows.Forms.Panel
-            $card.Size = New-Object System.Drawing.Size(410, 204)
-            $card.Margin = New-Object System.Windows.Forms.Padding(10)
+            $hasReview = $project.latestReviewRoot -and (Test-Path -LiteralPath ([string]$project.latestReviewRoot) -PathType Container)
+            $card = [System.Windows.Forms.Panel]::new()
+            $card.Size = [System.Drawing.Size]::new(410, 204)
+            $card.Margin = [System.Windows.Forms.Padding]::new(10)
             $card.BackColor = $script:itemCardBack
             $card.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
             $card.Tag = $project
             $card.Cursor = [System.Windows.Forms.Cursors]::Hand
 
             $name = [string]$project.name
-            if ($name.Length -gt 42) { $name = $name.Substring(0, 39) + "..." }
-            $accentLine = New-Object System.Windows.Forms.Panel
+            $accentLine = [System.Windows.Forms.Panel]::new()
             $accentLine.SetBounds(0, 0, 4, 204)
             $accentLine.BackColor = $projectAccent
             $lblName = New-Label $name 22 18 366 26 $script:itemText 11.5 ([System.Drawing.FontStyle]::Bold)
+            $lblName.AutoEllipsis = $true
+            if ($toolTip) { $toolTip.SetToolTip($lblName, $name) }
             $idText = if ($project.workshopId) { "Workshop $($project.workshopId)" } elseif ($project.packageId) { [string]$project.packageId } else { Split-Path -Leaf ([string]$project.modRoot) }
             $sourceFolder = if ($project.PSObject.Properties["sourceLanguageFolder"]) { [string]$project.sourceLanguageFolder } else { "Auto" }
             $sourceText = if ($sourceFolder -eq "Auto") { "자동" } else { Get-ProjectSourceLanguageName $sourceFolder }
             $lblId = New-Label "$idText  ·  원문 $sourceText" 22 48 366 20 $script:itemMuted 8.3
-            $lblTotal = New-Label ("전체 " + $stats.Total) 22 78 104 30 $script:itemText 13 ([System.Drawing.FontStyle]::Bold)
-            $lblCoverage = New-Label ("번역 $($stats.Translated)  ·  검토 $($stats.Approved)") 128 83 250 24 $script:itemMuted 8.8
-            $lblPending = New-Label ("미번역 " + $stats.Pending) 22 116 96 22 (Get-StatusColor "pending") 8.7 ([System.Drawing.FontStyle]::Bold)
-            $lblUpdated = New-Label ("업데이트 변경 " + $stats.Updated) 128 116 180 22 $(if ($stats.Updated -gt 0) { Get-UpdateColor } else { $script:itemSubtle }) 8.7 ([System.Drawing.FontStyle]::Bold)
+            $totalText = if ($hasReview) { "전체 $($stats.Total)" } else { "원문 미로드" }
+            $coverageText = if ($hasReview) { "번역 $($stats.Translated)  ·  검토 $($stats.Approved)" } else { "열어서 원문을 불러오세요" }
+            $lblTotal = New-Label $totalText 22 78 132 30 $script:itemText $(if ($hasReview) { 13 } else { 11 }) ([System.Drawing.FontStyle]::Bold)
+            $lblCoverage = New-Label $coverageText 160 83 228 24 $script:itemMuted 8.8
+            $lblPending = New-Label ("미번역 " + $stats.Pending) 22 116 110 22 (Get-StatusColor "pending") 8.7 ([System.Drawing.FontStyle]::Bold)
+            $lblUpdated = New-Label ("업데이트 변경 " + $stats.Updated) 160 116 200 22 $(if ($stats.Updated -gt 0) { Get-UpdateColor } else { $script:itemSubtle }) 8.7 ([System.Drawing.FontStyle]::Bold)
+            $lblPending.Visible = [bool]$hasReview
+            $lblUpdated.Visible = [bool]$hasReview
 
-            $progressTrack = New-Object System.Windows.Forms.Panel
-            $progressTrack.SetBounds(22, 150, 252, 5)
+            $progressTrack = [System.Windows.Forms.Panel]::new()
+            $progressTrack.SetBounds(22, 146, 366, 5)
             $progressTrack.BackColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(69, 70, 66) } else { [System.Drawing.Color]::FromArgb(220, 222, 216) }
-            $progressFill = New-Object System.Windows.Forms.Panel
+            $progressFill = [System.Windows.Forms.Panel]::new()
             $completed = $stats.Translated + $stats.Approved
-            $fillWidth = if ($stats.Total -gt 0) { [int][Math]::Round(252 * ($completed / [double]$stats.Total)) } else { 0 }
-            $progressFill.SetBounds(0, 0, [Math]::Max(0, [Math]::Min(252, $fillWidth)), 5)
+            $fillWidth = if ($stats.Total -gt 0) { [int][Math]::Round(366 * ($completed / [double]$stats.Total)) } else { 0 }
+            $progressFill.SetBounds(0, 0, [Math]::Max(0, [Math]::Min(366, $fillWidth)), 5)
             $progressFill.BackColor = $projectAccent
             $progressTrack.Controls.Add($progressFill)
 
             $lblTime = New-Label ("최근 작업 " + (Format-LocalTimeText ([string]$project.latestReviewAt))) 22 170 196 20 $script:itemSubtle 8.1
             $btnOpen = New-Button "열기" $projectAccent
             $btnOpen.ForeColor = [System.Drawing.Color]::White
-            $btnOpen.SetBounds(304, 154, 86, 34)
+            $btnOpen.SetBounds(304, 158, 86, 36)
             $btnOpen.Tag = $project
             Set-AccessibleControl $btnOpen "$name 프로젝트 열기" "$name 모드의 번역 및 검수 작업 화면을 엽니다." 0
             $btnOpen.Add_Click({ Open-ProjectWorkspace $this.Tag })
             $btnDelete = New-Button "삭제" $deleteColor
             $btnDelete.ForeColor = [System.Drawing.Color]::White
-            $btnDelete.SetBounds(226, 154, 70, 34)
+            $btnDelete.SetBounds(226, 158, 70, 36)
             $btnDelete.Tag = $project
             Set-AccessibleControl $btnDelete "$name 프로젝트 삭제" "$name 프로젝트의 로컬 검수 기록을 삭제합니다. 원본 모드와 Korean 폴더는 보존합니다." 0
             $btnDelete.Add_Click({ Remove-TranslationProject $this.Tag })
@@ -4339,7 +4861,7 @@ function Refresh-DashboardActivity {
     try {
         $lvDashboardActivity.Items.Clear()
         foreach ($row in Get-ProjectActivityRows) {
-            $item = New-Object System.Windows.Forms.ListViewItem((Format-LocalTimeText ([string]$row.Time)))
+            $item = [System.Windows.Forms.ListViewItem]::new((Format-LocalTimeText ([string]$row.Time)))
             [void]$item.SubItems.Add([string]$row.Project)
             [void]$item.SubItems.Add([string]$row.Kind)
             [void]$item.SubItems.Add([string]$row.Text)
@@ -4350,11 +4872,165 @@ function Refresh-DashboardActivity {
     }
 }
 
+function Save-CurrentApiProviderControls([switch]$Persist) {
+    if ($script:syncingApiProvider -or -not $txtDashboardApiKeys) { return }
+    $providerProfile = Get-ApiProviderProfile
+    $config = Get-SelectedApiProviderConfig
+    if (-not $providerProfile -or -not $config) { return }
+
+    $script:apiProviderKeys[$script:selectedApiProviderId] = [string]$txtDashboardApiKeys.Text
+    if ($script:selectedApiProviderId -eq "Custom" -and -not [string]::IsNullOrWhiteSpace($txtApiProviderCustomName.Text)) {
+        $config.name = $txtApiProviderCustomName.Text.Trim()
+    }
+    $config.url = $txtApiProviderUrl.Text.Trim()
+    $config.model = $cmbApiProviderModel.Text.Trim()
+    $temperatureText = $cmbApiProviderTemperature.Text.Trim()
+    if (-not $temperatureText -or $temperatureText -eq "모델 기본값") {
+        $config.temperature = -1
+    } else {
+        $parsedTemperature = 0.0
+        if ([double]::TryParse($temperatureText.Replace(",", "."), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsedTemperature)) {
+            $config.temperature = [Math]::Max(-1, [Math]::Min(2, $parsedTemperature))
+        }
+    }
+    if ($txtApiKeys) { $txtApiKeys.Text = [string]$script:apiProviderKeys[$script:selectedApiProviderId] }
+    if ($Persist) { Save-AppSettings }
+}
+
+function Refresh-ApiProviderButtons {
+    if (-not $script:apiProviderButtons) { return }
+    foreach ($providerProfile in $script:apiProviders) {
+        $button = $script:apiProviderButtons[[string]$providerProfile.Id]
+        if (-not $button) { continue }
+        $selected = [string]$providerProfile.Id -eq $script:selectedApiProviderId
+        $button.Text = if ($selected) { "●  $($providerProfile.Name)" } else { "    $($providerProfile.Name)" }
+        $button.BackColor = if ($selected) { $script:accentColor } else { $script:surfaceColor }
+        $button.ForeColor = if ($selected) { [System.Drawing.Color]::White } else { $script:textColor }
+        $button.FlatAppearance.BorderColor = if ($selected) { $script:accentColor } else { [System.Drawing.Color]::FromArgb(96, $script:mutedColor) }
+        $button.FlatAppearance.BorderSize = 1
+    }
+}
+
+function Show-ApiProviderControls([string]$ProviderId = "", [switch]$SkipCurrentSave) {
+    if (-not $txtDashboardApiKeys) { return }
+    if (-not $SkipCurrentSave) { Save-CurrentApiProviderControls }
+    if (-not $ProviderId) { $ProviderId = $script:selectedApiProviderId }
+    $providerProfile = Get-ApiProviderProfile $ProviderId
+    if (-not $providerProfile) { return }
+    $script:selectedApiProviderId = [string]$providerProfile.Id
+    $config = $script:apiProviderConfigs[$script:selectedApiProviderId]
+
+    $script:syncingApiProvider = $true
+    try {
+        $lblApiProviderTitle.Text = [string]$config.name
+        $lblApiProviderDescription.Text = [string]$providerProfile.Description
+        $txtApiProviderCustomName.Text = [string]$config.name
+        $txtDashboardApiKeys.Text = [string]$script:apiProviderKeys[$script:selectedApiProviderId]
+        $txtApiProviderUrl.Text = [string]$config.url
+        $cmbApiProviderModel.Items.Clear()
+        foreach ($model in @($providerProfile.Models)) { [void]$cmbApiProviderModel.Items.Add([string]$model) }
+        $cmbApiProviderModel.Text = [string]$config.model
+        $cmbApiProviderTemperature.Text = if ([double]$config.temperature -lt 0) { "모델 기본값" } else { ([double]$config.temperature).ToString("0.##", [System.Globalization.CultureInfo]::InvariantCulture) }
+
+        $isGoogle = [string]$providerProfile.Provider -eq "Google"
+        $lblApiProviderCustomName.Visible = $false
+        $txtApiProviderCustomName.Visible = $false
+        foreach ($control in @($lblApiProviderKeys, $txtDashboardApiKeys, $lblApiProviderUrl, $txtApiProviderUrl, $lblApiProviderModel, $cmbApiProviderModel, $lblApiProviderTemperature, $cmbApiProviderTemperature)) {
+            $control.Visible = -not $isGoogle
+        }
+        $lblApiProviderNotice.Text = if ($isGoogle) {
+            "API 키 없이 Google 기계 번역으로 초벌 후보를 만듭니다. 용어집과 추가 프롬프트는 적용되지 않습니다."
+        } else {
+            "API 키가 비어 있으면 Google 번역으로 자동 전환합니다. 키는 메모리에만 유지됩니다."
+        }
+        if ($txtApiKeys) { $txtApiKeys.Text = [string]$script:apiProviderKeys[$script:selectedApiProviderId] }
+    } finally {
+        $script:syncingApiProvider = $false
+    }
+    Refresh-ApiProviderButtons
+}
+
+function Select-ApiProvider([string]$ProviderId) {
+    if (-not (Get-ApiProviderProfile $ProviderId)) { return }
+    Show-ApiProviderControls -ProviderId $ProviderId
+    Save-AppSettings
+}
+
+function Resize-ApiProviderSettingsLayout {
+    if (-not $pnlApiSettings -or $pnlApiSettings.ClientSize.Width -le 0) { return }
+    $panelWidth = $pnlApiSettings.ClientSize.Width
+    $listWidth = if ($panelWidth -lt 700) { 164 } else { 190 }
+    $detailX = $listWidth + 28
+    $detailWidth = [Math]::Max(360, $panelWidth - $detailX)
+    $fieldWidth = [Math]::Max(300, $detailWidth - 10)
+
+    $flowApiProviders.SetBounds(0, 58, $listWidth, 370)
+    foreach ($button in $script:apiProviderButtons.Values) { $button.Width = [Math]::Max(146, $listWidth - 18) }
+    $apiProviderDivider.SetBounds(($listWidth + 12), 58, 1, 370)
+    $pnlApiDetail.SetBounds($detailX, 58, $detailWidth, 370)
+    $lblApiProviderTitle.Width = $fieldWidth
+    $lblApiProviderDescription.Width = $fieldWidth
+    $txtApiProviderCustomName.Width = $fieldWidth
+    $txtDashboardApiKeys.Width = $fieldWidth
+    $txtApiProviderUrl.Width = $fieldWidth
+    $lblApiProviderNotice.Width = $fieldWidth
+    $modelWidth = [Math]::Max(190, [int]($fieldWidth * 0.65))
+    $tempX = $modelWidth + 14
+    $tempWidth = [Math]::Max(94, $fieldWidth - $tempX)
+    $cmbApiProviderModel.Width = $modelWidth
+    $lblApiProviderTemperature.SetBounds($tempX, 234, $tempWidth, 20)
+    $cmbApiProviderTemperature.SetBounds($tempX, 256, $tempWidth, 30)
+    $lblDashSettingsNote.SetBounds(286, 332, [Math]::Max(100, $fieldWidth - 286), 24)
+}
+
+function Resize-RmkSettingsLayout {
+    if (-not $pnlRmkSettings -or $pnlRmkSettings.ClientSize.Width -le 0) { return }
+    $width = $pnlRmkSettings.ClientSize.Width
+    $settingsRmkDivider.Width = $width
+    $buttonsWidth = (94 * 3) + (8 * 2)
+    $pathWidth = [Math]::Max(260, $width - $buttonsWidth - 14)
+    $txtDashboardRmkWorkspace.Width = $pathWidth
+    $buttonX = $pathWidth + 14
+    $btnDashboardRmkAuto.Left = $buttonX
+    $btnDashboardRmkChoose.Left = $buttonX + 102
+    $btnDashboardRmkOpen.Left = $buttonX + 204
+    $lblDashboardRmkReference.Width = $width
+    $noteX = if ($width -gt 760) { 438 } else { 0 }
+    $noteY = if ($width -gt 760) { 144 } else { 174 }
+    $lblDashboardRmkNote.SetBounds($noteX, $noteY, [Math]::Max(280, $width - $noteX), 34)
+}
+
+function Resize-DashboardSettingsLayout {
+    if (-not $dashSettingsPage -or $dashSettingsPage.ClientSize.Width -le 0) { return }
+    $width = $dashSettingsPage.ClientSize.Width
+    $inner = [Math]::Max(620, $width - 56)
+    $wide = $width -ge 1080
+    if ($wide) {
+        $apiWidth = [Math]::Min(760, [Math]::Max(660, [int]($inner * 0.68)))
+        $appearanceX = 28 + $apiWidth + 28
+        $appearanceWidth = [Math]::Max(260, $inner - $apiWidth - 28)
+        $pnlApiSettings.SetBounds(28, 66, $apiWidth, 440)
+        $pnlAppearanceSettings.SetBounds($appearanceX, 66, $appearanceWidth, 300)
+        $pnlRmkSettings.SetBounds(28, 536, $inner, 190)
+        $dashSettingsPage.AutoScrollMinSize = [System.Drawing.Size]::new(0, 750)
+    } else {
+        $pnlApiSettings.SetBounds(28, 66, $inner, 440)
+        $pnlAppearanceSettings.SetBounds(28, 532, $inner, 270)
+        $pnlRmkSettings.SetBounds(28, 830, $inner, 220)
+        $dashSettingsPage.AutoScrollMinSize = [System.Drawing.Size]::new(0, 1080)
+    }
+    Resize-ApiProviderSettingsLayout
+    Resize-RmkSettingsLayout
+}
+
 function Sync-DashboardSettingsFromMain {
     if (-not $txtDashboardApiKeys) { return }
     $script:syncingSettings = $true
     try {
-        $txtDashboardApiKeys.Text = $txtApiKeys.Text
+        if ($txtApiKeys -and $txtApiKeys.Text -and -not $script:apiProviderKeys[$script:selectedApiProviderId]) {
+            $script:apiProviderKeys[$script:selectedApiProviderId] = $txtApiKeys.Text
+        }
+        Show-ApiProviderControls -ProviderId $script:selectedApiProviderId -SkipCurrentSave
         $chkDashboardIncludePatches.Checked = $chkIncludePatches.Checked
         $chkDashboardDryRun.Checked = $chkDryRun.Checked
         $cmbDashboardTheme.SelectedIndex = switch ($script:themeMode) { "Light" { 1 } "Dark" { 2 } default { 0 } }
@@ -4373,7 +5049,8 @@ function Sync-MainSettingsFromDashboard {
     if (-not $txtApiKeys -or $script:syncingSettings) { return }
     $script:syncingSettings = $true
     try {
-        $txtApiKeys.Text = $txtDashboardApiKeys.Text
+        Save-CurrentApiProviderControls
+        $txtApiKeys.Text = [string]$script:apiProviderKeys[$script:selectedApiProviderId]
         $chkIncludePatches.Checked = $chkDashboardIncludePatches.Checked
         $chkDryRun.Checked = $chkDashboardDryRun.Checked
     } finally {
@@ -4443,6 +5120,22 @@ function Focus-NextWorkRegion([int]$Direction = 1) {
     [void]$targets[$next].Focus()
 }
 
+function Refresh-DashboardTabButtons {
+    if (-not $btnDashProjects) { return }
+    $inactiveBack = [System.Drawing.Color]::FromArgb(48, 53, 49)
+    $inactiveFore = [System.Drawing.Color]::FromArgb(224, 229, 222)
+    foreach ($button in @($btnDashProjects, $btnDashActivity, $btnDashSettings)) {
+        $button.BackColor = $inactiveBack
+        $button.ForeColor = $inactiveFore
+        $button.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(77, 83, 77)
+        $button.FlatAppearance.BorderSize = 1
+    }
+    $active = if ($dashSettingsPage.Visible) { $btnDashSettings } elseif ($dashActivityPage.Visible) { $btnDashActivity } else { $btnDashProjects }
+    $active.BackColor = $script:accentColor
+    $active.ForeColor = [System.Drawing.Color]::White
+    $active.FlatAppearance.BorderColor = $script:accentColor
+}
+
 function Show-Dashboard([string]$Tab = "projects") {
     if (-not $dashboardPanel) { return }
     Save-ReviewWithDuplicatePrompt
@@ -4491,6 +5184,7 @@ function Show-Dashboard([string]$Tab = "projects") {
             Refresh-DashboardProjects
         }
     }
+    Refresh-DashboardTabButtons
 }
 
 function Show-Workspace {
@@ -4509,29 +5203,29 @@ if ($PreviewTheme -in @("System", "Light", "Dark")) { $script:themeMode = $Previ
 if ($PreviewTextSize -ge 9 -and $PreviewTextSize -le 12) { $script:textSize = $PreviewTextSize }
 if ($PreviewHighContrast) { $script:highContrast = $true }
 
-$form = New-Object System.Windows.Forms.Form
+$form = [System.Windows.Forms.Form]::new()
 $form.Text = "RimWorld AI Translator"
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
-$form.ClientSize = New-Object System.Drawing.Size(1180, 780)
-$form.MinimumSize = New-Object System.Drawing.Size(900, 600)
+$form.ClientSize = [System.Drawing.Size]::new(1180, 780)
+$form.MinimumSize = [System.Drawing.Size]::new(900, 600)
 $form.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
 $form.Font = New-Font 9
 $form.KeyPreview = $true
 $form.WindowState = [System.Windows.Forms.FormWindowState]::Maximized
 
-$toolTip = New-Object System.Windows.Forms.ToolTip
+$toolTip = [System.Windows.Forms.ToolTip]::new()
 $toolTip.AutoPopDelay = 6000
 $toolTip.InitialDelay = 450
 $toolTip.ReshowDelay = 100
 
-$top = New-Object System.Windows.Forms.Panel
+$top = [System.Windows.Forms.Panel]::new()
 $top.Dock = [System.Windows.Forms.DockStyle]::Top
 $top.Height = 78
 $top.BackColor = [System.Drawing.Color]::FromArgb(34, 42, 50)
 $form.Controls.Add($top)
 
-$topAccent = New-Object System.Windows.Forms.Panel
+$topAccent = [System.Windows.Forms.Panel]::new()
 $topAccent.SetBounds(0, 75, 1180, 3)
 $topAccent.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
 
@@ -4541,7 +5235,7 @@ $lblSave = New-Label "" 940 134 96 20 ([System.Drawing.Color]::FromArgb(160, 174
 
 $lblProjectPick = New-Label "" 18 60 90 18 ([System.Drawing.Color]::FromArgb(188, 199, 210)) 8.5 ([System.Drawing.FontStyle]::Bold)
 $lblProjectPick.Visible = $false
-$cmbProject = New-Object System.Windows.Forms.ComboBox
+$cmbProject = [System.Windows.Forms.ComboBox]::new()
 $cmbProject.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $cmbProject.DisplayMember = "Display"
 $cmbProject.Font = New-Font 9
@@ -4549,7 +5243,7 @@ $cmbProject.SetBounds(18, 80, 250, 28)
 $cmbProject.Visible = $false
 
 $lblModPick = New-Label "모드" 18 60 80 18 ([System.Drawing.Color]::FromArgb(188, 199, 210)) 8.5 ([System.Drawing.FontStyle]::Bold)
-$cmbModCatalog = New-Object System.Windows.Forms.ComboBox
+$cmbModCatalog = [System.Windows.Forms.ComboBox]::new()
 $cmbModCatalog.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $cmbModCatalog.DisplayMember = "Display"
 $cmbModCatalog.Font = New-Font 9
@@ -4568,12 +5262,12 @@ $txtApiKeys.SetBounds(820, 32, 260, 76)
 $txtApiKeys.BackColor = [System.Drawing.Color]::FromArgb(26, 34, 42)
 $txtApiKeys.ForeColor = [System.Drawing.Color]::FromArgb(230, 238, 246)
 
-$chkIncludePatches = New-Object System.Windows.Forms.CheckBox
+$chkIncludePatches = [System.Windows.Forms.CheckBox]::new()
 $chkIncludePatches.Text = "Patches 포함"
 $chkIncludePatches.SetBounds(1096, 52, 120, 24)
 $chkIncludePatches.ForeColor = [System.Drawing.Color]::FromArgb(218, 226, 234)
 $chkIncludePatches.BackColor = [System.Drawing.Color]::Transparent
-$chkDryRun = New-Object System.Windows.Forms.CheckBox
+$chkDryRun = [System.Windows.Forms.CheckBox]::new()
 $chkDryRun.Text = "Dry run"
 $chkDryRun.SetBounds(1096, 78, 90, 24)
 $chkDryRun.ForeColor = [System.Drawing.Color]::FromArgb(218, 226, 234)
@@ -4596,7 +5290,7 @@ $btnApplyTranslated.ForeColor = [System.Drawing.Color]::White
 $btnApplyTranslated.SetBounds(1346, 108, 126, 34)
 $btnApplyTranslated.Enabled = $false
 
-$chkApplyToRmk = New-Object System.Windows.Forms.CheckBox
+$chkApplyToRmk = [System.Windows.Forms.CheckBox]::new()
 $chkApplyToRmk.Text = "RMK에 적용"
 $chkApplyToRmk.Checked = $false
 $chkApplyToRmk.SetBounds(1096, 108, 104, 26)
@@ -4616,7 +5310,7 @@ $btnSave = New-Button "저장" ([System.Drawing.Color]::FromArgb(72, 86, 100))
 $btnSave.ForeColor = [System.Drawing.Color]::White
 $btnSave.SetBounds(1364, 14, 70, 30)
 
-$progressRun = New-Object System.Windows.Forms.ProgressBar
+$progressRun = [System.Windows.Forms.ProgressBar]::new()
 $progressRun.SetBounds(18, 140, 520, 10)
 $progressRun.Minimum = 0
 $progressRun.Maximum = 100
@@ -4627,7 +5321,7 @@ $lblRunStatus = New-Label "대기 중" 552 134 380 20 ([System.Drawing.Color]::F
 
 $top.Controls.AddRange(@($lblProject, $lblPath, $lblSave, $lblProjectPick, $cmbProject, $lblModPick, $cmbModCatalog, $btnRefreshMods, $btnChooseMod, $lblApi, $txtApiKeys, $chkIncludePatches, $chkDryRun, $btnTranslate, $btnStop, $chkApplyToRmk, $btnApply, $btnApplyTranslated, $btnHome, $btnLoad, $btnOpenFolder, $btnSave, $progressRun, $lblRunStatus, $topAccent))
 
-$main = New-Object System.Windows.Forms.SplitContainer
+$main = [System.Windows.Forms.SplitContainer]::new()
 $main.Dock = [System.Windows.Forms.DockStyle]::Fill
 $main.SplitterWidth = 2
 $main.SplitterDistance = 390
@@ -4635,7 +5329,7 @@ $main.BackColor = [System.Drawing.Color]::FromArgb(232, 236, 240)
 $main.TabStop = $false
 $form.Controls.Add($main)
 
-$rightSplit = New-Object System.Windows.Forms.SplitContainer
+$rightSplit = [System.Windows.Forms.SplitContainer]::new()
 $rightSplit.Dock = [System.Windows.Forms.DockStyle]::Fill
 $rightSplit.SplitterWidth = 2
 $rightSplit.SplitterDistance = 690
@@ -4648,7 +5342,7 @@ $left.BackColor = [System.Drawing.Color]::FromArgb(248, 249, 250)
 
 $lblSearchCrumb = New-Label "모드`r`n전체 문자열  ·  모든 상태" 16 12 352 62 ([System.Drawing.Color]::FromArgb(36, 45, 54)) 10.5 ([System.Drawing.FontStyle]::Bold)
 
-$cmbSearchField = New-Object System.Windows.Forms.ComboBox
+$cmbSearchField = [System.Windows.Forms.ComboBox]::new()
 $cmbSearchField.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $cmbSearchField.Font = New-Font 9
 $cmbSearchField.SetBounds(16, 66, 92, 30)
@@ -4659,19 +5353,27 @@ $cmbSearchField.SelectedIndex = 0
 $txtSearch = New-TextBox
 $txtSearch.SetBounds(108, 66, 178, 30)
 $txtSearch.Text = ""
-$cmbStatus = New-Object System.Windows.Forms.ComboBox
+$cmbStatus = [System.Windows.Forms.ComboBox]::new()
 $cmbStatus.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $cmbStatus.Font = New-Font 9
 $cmbStatus.SetBounds(292, 66, 76, 30)
 $cmbStatus.DropDownWidth = 168
-[void]$cmbStatus.Items.AddRange(@("전체", "미번역", "번역됨", "검토됨", "업데이트로 변경됨", "주의", "후보 있음", "기존 있음"))
+[void]$cmbStatus.Items.AddRange(@("전체", "미번역", "번역됨", "검토됨", "업데이트로 변경됨", "RMK 가져옴", "내 번역", "주의", "후보 있음", "기존 있음"))
 $cmbStatus.SelectedIndex = 0
 
-$statusFilterBar = New-Object System.Windows.Forms.FlowLayoutPanel
+$cmbSort = [System.Windows.Forms.ComboBox]::new()
+$cmbSort.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$cmbSort.Font = New-Font 8.5
+$cmbSort.SetBounds(16, 174, 352, 30)
+$cmbSort.DropDownWidth = 190
+[void]$cmbSort.Items.AddRange(@("기본 순서", "내 번역 최신순", "내 번역 오래된순"))
+$cmbSort.SelectedIndex = 0
+
+$statusFilterBar = [System.Windows.Forms.FlowLayoutPanel]::new()
 $statusFilterBar.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 $statusFilterBar.WrapContents = $false
 $statusFilterBar.AutoScroll = $false
-$statusFilterBar.Margin = New-Object System.Windows.Forms.Padding(0)
+$statusFilterBar.Margin = [System.Windows.Forms.Padding]::new(0)
 $statusFilterButtons = New-Object "System.Collections.Generic.List[System.Windows.Forms.Button]"
 foreach ($spec in @(
     [pscustomobject]@{ Text = "전체"; Status = "전체"; Width = 48 },
@@ -4684,14 +5386,14 @@ foreach ($spec in @(
     $filterButton.Tag = $spec.Status
     $filterButton.Width = $spec.Width
     $filterButton.Height = 30
-    $filterButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 4, 0)
+    $filterButton.Margin = [System.Windows.Forms.Padding]::new(0, 0, 4, 0)
     $filterButton.Font = New-Font 8 ([System.Drawing.FontStyle]::Bold)
     [void]$statusFilterButtons.Add($filterButton)
     [void]$statusFilterBar.Controls.Add($filterButton)
 }
 
 $lblProjectStats = New-Label "전체 0" 16 102 350 42 ([System.Drawing.Color]::FromArgb(53, 63, 72)) 8.5 ([System.Drawing.FontStyle]::Bold)
-$progressReview = New-Object System.Windows.Forms.ProgressBar
+$progressReview = [System.Windows.Forms.ProgressBar]::new()
 $progressReview.SetBounds(16, 128, 260, 14)
 $progressReview.Minimum = 0
 $progressReview.Maximum = 1
@@ -4700,7 +5402,7 @@ $progressReview.TabStop = $false
 $progressReview.AccessibleName = "검토 진행률"
 $lblProgress = New-Label "검토 진행률 0%" 282 124 100 20 ([System.Drawing.Color]::FromArgb(80, 88, 96)) 8
 
-$lvFiles = New-Object System.Windows.Forms.ListView
+$lvFiles = [System.Windows.Forms.ListView]::new()
 $lvFiles.SetBounds(16, 152, 352, 120)
 $lvFiles.View = [System.Windows.Forms.View]::Details
 $lvFiles.FullRowSelect = $true
@@ -4711,7 +5413,7 @@ $lvFiles.Font = New-Font 8.5
 [void]$lvFiles.Columns.Add("검토됨", 70)
 [void]$lvFiles.Columns.Add("주의", 46)
 
-$lvItems = New-Object System.Windows.Forms.ListView
+$lvItems = [System.Windows.Forms.ListView]::new()
 $lvItems.SetBounds(16, 284, 352, 436)
 $lvItems.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $lvItems.View = [System.Windows.Forms.View]::Details
@@ -4725,14 +5427,81 @@ $lvItems.Font = New-Font 8.5
 [void]$lvItems.Columns.Add("번역", 126)
 $lvItems.Visible = $false
 
-$flowItems = New-Object System.Windows.Forms.FlowLayoutPanel
+$flowItems = [System.Windows.Forms.ListBox]::new()
 $flowItems.SetBounds(16, 284, 352, 436)
 $flowItems.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-$flowItems.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
-$flowItems.WrapContents = $false
-$flowItems.AutoScroll = $true
+$flowItems.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
+$flowItems.ItemHeight = 94
+$flowItems.IntegralHeight = $false
+$flowItems.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$flowItems.SelectionMode = [System.Windows.Forms.SelectionMode]::One
+$flowItems.DisplayMember = "Value"
+$flowItems.HorizontalScrollbar = $false
+$flowItems.Font = New-Font 9
+$flowItems.AccessibleName = "검색된 문자열 목록"
+$flowItems.AccessibleDescription = "필터와 검색 조건에 맞는 번역 문자열 전체 목록입니다. 위아래 화살표로 이동할 수 있습니다."
+$flowItems.Add_DrawItem({
+    param($listControl, $e)
+    if ($e.Index -lt 0 -or $e.Index -ge $listControl.Items.Count) { return }
+    $item = $listControl.Items[$e.Index]
+    $rowIndex = [int]$item.Key
+    if ($rowIndex -lt 0 -or $rowIndex -ge $script:rows.Count) { return }
 
-$left.Controls.AddRange(@($lblSearchCrumb, $cmbSearchField, $txtSearch, $cmbStatus, $statusFilterBar, $lblProjectStats, $progressReview, $lblProgress, $lvFiles, $lvItems, $flowItems))
+    $row = $script:rows[$rowIndex]
+    $decision = Get-Decision $row
+    $preview = Get-ItemPreview $row
+    $originText = Get-TranslationOriginShortText ([string]$decision.translationOrigin)
+    $isUpdated = ConvertTo-BoolValue $decision.sourceChanged
+    $statusText = if ($isUpdated) { "변경됨" } else { Get-StatusText $decision.status }
+    $statusColor = if ($isUpdated) { Get-UpdateColor } else { Get-StatusColor $decision.status }
+    $warnings = @(Get-RowWarnings -Row $row -Translation (ConvertTo-FlatString $decision.text))
+    $translationText = if ([string]::IsNullOrWhiteSpace($preview[1])) { "번역 대기" } else { $preview[1] }
+    if (-not [string]::IsNullOrWhiteSpace($preview[1]) -and $originText) { $translationText = "$originText  ·  $translationText" }
+    $translationColor = $script:itemMuted
+    if ($warnings.Count -gt 0) {
+        $translationText = "주의 · $translationText"
+        $translationColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(238, 183, 92) } else { [System.Drawing.Color]::FromArgb(145, 91, 16) }
+    }
+    $defContext = Get-RowDefContext $row
+    $keyText = "$($defContext.DefClass)  ·  $($defContext.Node)"
+    $selected = $e.Index -eq $listControl.SelectedIndex
+    $cardBack = if ($selected) { $script:itemCardSelected } else { $script:itemCardBack }
+    $bounds = $e.Bounds
+    $cardHeight = [Math]::Max(1, $bounds.Height - 6)
+    $cardRect = [System.Drawing.Rectangle]::new($bounds.X, $bounds.Y, [Math]::Max(1, $bounds.Width - 1), $cardHeight)
+    $backgroundBrush = [System.Drawing.SolidBrush]::new($listControl.BackColor)
+    $cardBrush = [System.Drawing.SolidBrush]::new($cardBack)
+    $stripeBrush = [System.Drawing.SolidBrush]::new($statusColor)
+    try {
+        $e.Graphics.FillRectangle($backgroundBrush, $bounds)
+        $e.Graphics.FillRectangle($cardBrush, $cardRect)
+        $e.Graphics.FillRectangle($stripeBrush, [System.Drawing.Rectangle]::new($cardRect.X, $cardRect.Y, 3, $cardRect.Height))
+    } finally {
+        $stripeBrush.Dispose()
+        $cardBrush.Dispose()
+        $backgroundBrush.Dispose()
+    }
+
+    $textDelta = [Math]::Max(-1, [Math]::Min(2, $script:textSize - 10))
+    $statusWidth = if ($isUpdated) { 70 } else { 60 }
+    $sourceRect = [System.Drawing.Rectangle]::new($cardRect.X + 18, $cardRect.Y + 6, [Math]::Max(30, $cardRect.Width - $statusWidth - 42), 24 + $textDelta)
+    $statusRect = [System.Drawing.Rectangle]::new($cardRect.Right - $statusWidth - 12, $cardRect.Y + 6, $statusWidth, 24)
+    $translationRect = [System.Drawing.Rectangle]::new($cardRect.X + 18, $cardRect.Y + 31 + $textDelta, [Math]::Max(30, $cardRect.Width - 34), 24 + $textDelta)
+    $keyRect = [System.Drawing.Rectangle]::new($cardRect.X + 18, $cardRect.Y + 58 + ($textDelta * 2), [Math]::Max(30, $cardRect.Width - 34), 20)
+    $singleLine = [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis -bor [System.Windows.Forms.TextFormatFlags]::SingleLine -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter
+    $rightAligned = $singleLine -bor [System.Windows.Forms.TextFormatFlags]::Right
+    [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $preview[0], (New-Font ([Math]::Max(8.5, $script:textSize - 0.5))), $sourceRect, $script:itemText, $singleLine)
+    [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $statusText, (New-Font 8 ([System.Drawing.FontStyle]::Bold)), $statusRect, $statusColor, $rightAligned)
+    [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $translationText, (New-Font ([Math]::Max(8, $script:textSize - 1.5))), $translationRect, $translationColor, $singleLine)
+    [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $keyText, (New-Font 7.8), $keyRect, $script:itemSubtle, $singleLine)
+})
+$flowItems.Add_SelectedIndexChanged({
+    if ($script:syncingItemSelection -or $script:loading -or $flowItems.SelectedIndex -lt 0) { return }
+    $selectedItem = $flowItems.SelectedItem
+    if ($selectedItem) { Select-RowIndex ([int]$selectedItem.Key) }
+})
+
+$left.Controls.AddRange(@($lblSearchCrumb, $cmbSearchField, $txtSearch, $cmbStatus, $statusFilterBar, $cmbSort, $lblProjectStats, $progressReview, $lblProgress, $lvFiles, $lvItems, $flowItems))
 
 $center = $rightSplit.Panel1
 $center.BackColor = [System.Drawing.Color]::White
@@ -4743,7 +5512,7 @@ $lblUpdateBadge = New-Label "업데이트로 변경됨" 520 14 150 24 ([System.D
 $lblUpdateBadge.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
 $lblUpdateBadge.Visible = $false
 $lblSourceTitle = New-Label "원문" 18 42 120 20 ([System.Drawing.Color]::FromArgb(52, 61, 70)) 9 ([System.Drawing.FontStyle]::Bold)
-$pnlSourceFrame = New-Object System.Windows.Forms.Panel
+$pnlSourceFrame = [System.Windows.Forms.Panel]::new()
 $pnlSourceFrame.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $txtSource = New-TextBox -Multiline
 $txtSource.ReadOnly = $true
@@ -4753,12 +5522,12 @@ $txtSource.BorderStyle = [System.Windows.Forms.BorderStyle]::None
 $pnlSourceFrame.Controls.Add($txtSource)
 
 $lblTranslationTitle = New-Label "번역" 18 150 120 20 ([System.Drawing.Color]::FromArgb(52, 61, 70)) 9 ([System.Drawing.FontStyle]::Bold)
-$pnlTranslationFrame = New-Object System.Windows.Forms.Panel
+$pnlTranslationFrame = [System.Windows.Forms.Panel]::new()
 $pnlTranslationFrame.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $txtTranslation = New-TextBox -Multiline
 $txtTranslation.Font = New-Font 10.5
 $txtTranslation.BorderStyle = [System.Windows.Forms.BorderStyle]::None
-$translationAccent = New-Object System.Windows.Forms.Panel
+$translationAccent = [System.Windows.Forms.Panel]::new()
 $translationAccent.Height = 3
 $pnlTranslationFrame.Controls.AddRange(@($txtTranslation, $translationAccent))
 
@@ -4778,11 +5547,12 @@ $btnTranslated = New-Button "번역됨" ([System.Drawing.Color]::FromArgb(220, 2
 $btnApprove = New-Button "검토 완료" ([System.Drawing.Color]::FromArgb(218, 242, 226))
 $btnApproveNext = New-Button "완료 후 다음" ([System.Drawing.Color]::FromArgb(51, 174, 111))
 $btnApproveNext.ForeColor = [System.Drawing.Color]::White
+$btnApproveAll = New-Button "전체 검토" ([System.Drawing.Color]::FromArgb(236, 229, 216))
 
-$editorDivider = New-Object System.Windows.Forms.Panel
+$editorDivider = [System.Windows.Forms.Panel]::new()
 $lblReferenceTitle = New-Label "참고 번역" 18 430 120 20 ([System.Drawing.Color]::FromArgb(52, 61, 70)) 8.5 ([System.Drawing.FontStyle]::Bold)
 
-$buttons = @($btnPrev, $btnNext, $btnUseCandidate, $btnUseExisting, $btnUseSource, $btnResetEdit, $btnPending, $btnTranslated, $btnApprove, $btnApproveNext)
+$buttons = @($btnPrev, $btnNext, $btnUseCandidate, $btnUseExisting, $btnUseSource, $btnResetEdit, $btnPending, $btnTranslated, $btnApprove, $btnApproveNext, $btnApproveAll)
 $x = 18
 foreach ($button in $buttons) {
     $w = switch ($button.Text) {
@@ -4812,18 +5582,19 @@ $txtCandidate.ReadOnly = $true
 $txtCandidate.Font = New-Font 9.5
 $txtCandidate.BackColor = [System.Drawing.Color]::FromArgb(248, 249, 250)
 
-$center.Controls.AddRange(@($lblCurrent, $lblUpdateBadge, $lblSourceTitle, $pnlSourceFrame, $lblTranslationTitle, $pnlTranslationFrame, $txtMeta, $editorDivider, $btnPrev, $btnNext, $btnUseCandidate, $btnUseExisting, $btnUseSource, $btnResetEdit, $btnPending, $btnTranslated, $btnApprove, $btnApproveNext, $lblReferenceTitle, $lblExisting, $txtExisting, $lblCandidate, $txtCandidate))
+$center.Controls.AddRange(@($lblCurrent, $lblUpdateBadge, $lblSourceTitle, $pnlSourceFrame, $lblTranslationTitle, $pnlTranslationFrame, $txtMeta, $editorDivider, $btnPrev, $btnNext, $btnUseCandidate, $btnUseExisting, $btnUseSource, $btnResetEdit, $btnPending, $btnTranslated, $btnApprove, $btnApproveNext, $btnApproveAll, $lblReferenceTitle, $lblExisting, $txtExisting, $lblCandidate, $txtCandidate))
 
 function Resize-ReviewEditorLayout {
     if (-not $center -or $center.ClientSize.Width -le 0) { return }
     $pad = if ($center.ClientSize.Width -lt 520) { 18 } else { 24 }
     $contentWidth = [Math]::Max(300, $center.ClientSize.Width - ($pad * 2))
     $contentHeight = [Math]::Max(420, $center.ClientSize.Height)
+    $ultraCompact = $center.ClientSize.Height -lt 500
     $veryCompact = $contentHeight -lt 660
     $compact = $contentHeight -lt 760
-    $sourceHeight = if ($veryCompact) { 72 } elseif ($compact) { 92 } else { 118 }
-    $translationHeight = if ($veryCompact) { 112 } elseif ($compact) { 148 } else { 190 }
-    $metaHeight = if ($veryCompact) { 82 } else { 92 }
+    $sourceHeight = if ($ultraCompact) { 52 } elseif ($veryCompact) { 72 } elseif ($compact) { 92 } else { 118 }
+    $translationHeight = if ($ultraCompact) { 72 } elseif ($veryCompact) { 112 } elseif ($compact) { 148 } else { 190 }
+    $metaHeight = if ($ultraCompact) { 46 } elseif ($veryCompact) { 82 } else { 92 }
 
     $lblCurrent.SetBounds($pad, 18, [Math]::Max(180, $contentWidth - 178), 28)
     $lblUpdateBadge.SetBounds(($pad + $contentWidth - 168), 18, 168, 26)
@@ -4831,23 +5602,23 @@ function Resize-ReviewEditorLayout {
     $pnlSourceFrame.SetBounds($pad, 80, $contentWidth, $sourceHeight)
     $txtSource.SetBounds(11, 9, [Math]::Max(120, $contentWidth - 24), [Math]::Max(38, $sourceHeight - 18))
 
-    $translationLabelY = 80 + $sourceHeight + 18
-    $translationBoxY = $translationLabelY + 24
+    $translationLabelY = 80 + $sourceHeight + $(if ($ultraCompact) { 8 } else { 18 })
+    $translationBoxY = $translationLabelY + $(if ($ultraCompact) { 20 } else { 24 })
     $lblTranslationTitle.SetBounds($pad, $translationLabelY, $contentWidth, 20)
     $pnlTranslationFrame.SetBounds($pad, $translationBoxY, $contentWidth, $translationHeight)
     $txtTranslation.SetBounds(11, 9, [Math]::Max(120, $contentWidth - 24), [Math]::Max(42, $translationHeight - 20))
     $translationAccent.SetBounds(0, [Math]::Max(0, $translationHeight - 3), $contentWidth, 3)
 
-    $metaY = $translationBoxY + $translationHeight + 14
+    $metaY = $translationBoxY + $translationHeight + $(if ($ultraCompact) { 8 } else { 14 })
     $txtMeta.SetBounds($pad, $metaY, $contentWidth, $metaHeight)
-    $dividerY = $metaY + $metaHeight + 8
+    $dividerY = $metaY + $metaHeight + $(if ($ultraCompact) { 4 } else { 8 })
     $editorDivider.SetBounds($pad, $dividerY, $contentWidth, 1)
-    $toolbarY = $dividerY + 12
+    $toolbarY = $dividerY + $(if ($ultraCompact) { 8 } else { 12 })
 
     $utilityButtons = @($btnPrev, $btnNext, $btnUseCandidate, $btnUseExisting, $btnUseSource, $btnResetEdit)
     $utilityWidths = @(38, 38, 72, 62, 58, 72)
-    $statusButtons = @($btnPending, $btnTranslated, $btnApprove, $btnApproveNext)
-    $statusWidths = @(72, 76, 88, 108)
+    $statusButtons = @($btnPending, $btnTranslated, $btnApprove, $btnApproveNext, $btnApproveAll)
+    $statusWidths = @(72, 76, 88, 108, 88)
     $gap = 7
     $utilityTotal = ($utilityWidths | Measure-Object -Sum).Sum + ($gap * ($utilityWidths.Count - 1))
     $statusTotal = ($statusWidths | Measure-Object -Sum).Sum + ($gap * ($statusWidths.Count - 1))
@@ -4865,7 +5636,7 @@ function Resize-ReviewEditorLayout {
         $toolbarBottom = $toolbarY + 36
     } else {
         $x = $pad
-        $statusY = $toolbarY + 44
+        $statusY = $toolbarY + $(if ($ultraCompact) { 40 } else { 44 })
         $toolbarBottom = $statusY + 36
     }
     for ($i = 0; $i -lt $statusButtons.Count; $i++) {
@@ -4885,7 +5656,7 @@ function Resize-ReviewEditorLayout {
     $lblCandidate.SetBounds($candidateX, $suggestionLabelY, $halfWidth, 18)
     $txtCandidate.SetBounds($candidateX, $bottomBoxY, $halfWidth, $bottomHeight)
     $requiredHeight = $bottomBoxY + [Math]::Max(76, $bottomHeight) + 18
-    $center.AutoScrollMinSize = New-Object System.Drawing.Size(0, $requiredHeight)
+    $center.AutoScrollMinSize = [System.Drawing.Size]::new(0, $requiredHeight)
 }
 
 $center.Add_Resize({ Resize-ReviewEditorLayout })
@@ -4894,27 +5665,27 @@ Resize-ReviewEditorLayout
 $side = $rightSplit.Panel2
 $side.BackColor = [System.Drawing.Color]::White
 
-$tabs = New-Object System.Windows.Forms.TabControl
+$tabs = [System.Windows.Forms.TabControl]::new()
 $tabs.Dock = [System.Windows.Forms.DockStyle]::Fill
 $tabs.Font = New-Font 8.5 ([System.Drawing.FontStyle]::Bold)
 $tabs.DrawMode = [System.Windows.Forms.TabDrawMode]::OwnerDrawFixed
 $tabs.SizeMode = [System.Windows.Forms.TabSizeMode]::Fixed
-$tabs.ItemSize = New-Object System.Drawing.Size(44, 38)
-$tabs.Padding = New-Object System.Drawing.Point(2, 3)
+$tabs.ItemSize = [System.Drawing.Size]::new(44, 38)
+$tabs.Padding = [System.Drawing.Point]::new(2, 3)
 $tabs.Multiline = $false
 $side.Controls.Add($tabs)
 
-$tabHistory = New-Object System.Windows.Forms.TabPage
+$tabHistory = [System.Windows.Forms.TabPage]::new()
 $tabHistory.Text = "역사"
-$tabTerms = New-Object System.Windows.Forms.TabPage
+$tabTerms = [System.Windows.Forms.TabPage]::new()
 $tabTerms.Text = "용어"
-$tabMemo = New-Object System.Windows.Forms.TabPage
+$tabMemo = [System.Windows.Forms.TabPage]::new()
 $tabMemo.Text = "메모"
-$tabRmk = New-Object System.Windows.Forms.TabPage
+$tabRmk = [System.Windows.Forms.TabPage]::new()
 $tabRmk.Text = "RMK"
-$tabIssues = New-Object System.Windows.Forms.TabPage
+$tabIssues = [System.Windows.Forms.TabPage]::new()
 $tabIssues.Text = "문제"
-$tabLog = New-Object System.Windows.Forms.TabPage
+$tabLog = [System.Windows.Forms.TabPage]::new()
 $tabLog.Text = "로그"
 [void]$tabs.TabPages.AddRange(@($tabHistory, $tabTerms, $tabMemo, $tabRmk, $tabIssues, $tabLog))
 
@@ -4922,7 +5693,7 @@ function Resize-SideTabs {
     if (-not $tabs -or $tabs.TabPages.Count -le 0 -or $tabs.ClientSize.Width -le 0) { return }
     $availableWidth = [Math]::Max(220, $tabs.ClientSize.Width - 100)
     $itemWidth = [Math]::Max(44, [int][Math]::Floor($availableWidth / $tabs.TabPages.Count))
-    $tabs.ItemSize = New-Object System.Drawing.Size($itemWidth, 38)
+    $tabs.ItemSize = [System.Drawing.Size]::new($itemWidth, 38)
 }
 
 $script:sideTabResizePending = $false
@@ -4949,11 +5720,11 @@ $tabs.Add_DrawItem({
     $bounds = $_.Bounds
     $selected = $_.Index -eq $this.SelectedIndex
     $fore = if ($selected) { $script:tabActive } else { $script:tabText }
-    $brush = New-Object System.Drawing.SolidBrush($script:tabBack)
+    $brush = [System.Drawing.SolidBrush]::new($script:tabBack)
     try {
         $_.Graphics.FillRectangle($brush, $bounds)
         if ($selected) {
-            $accentBrush = New-Object System.Drawing.SolidBrush($script:tabActive)
+            $accentBrush = [System.Drawing.SolidBrush]::new($script:tabActive)
             try {
                 $_.Graphics.FillRectangle($accentBrush, $bounds.X + 8, $bounds.Bottom - 3, [Math]::Max(8, $bounds.Width - 16), 3)
             } finally {
@@ -4973,7 +5744,7 @@ $tabs.Add_DrawItem({
     }
 })
 
-$txtHistory = New-Object System.Windows.Forms.RichTextBox
+$txtHistory = [System.Windows.Forms.RichTextBox]::new()
 $txtHistory.Dock = [System.Windows.Forms.DockStyle]::Fill
 $txtHistory.ReadOnly = $true
 $txtHistory.DetectUrls = $false
@@ -5031,7 +5802,7 @@ $tabIssues.Controls.Add($txtWarnings)
 $txtLog = New-TextBox -Multiline
 $txtLog.Dock = [System.Windows.Forms.DockStyle]::Fill
 $txtLog.ReadOnly = $true
-$txtLog.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+$txtLog.Font = [System.Drawing.Font]::new("Consolas", 8.5)
 $txtLog.BackColor = [System.Drawing.Color]::FromArgb(17, 23, 29)
 $txtLog.ForeColor = [System.Drawing.Color]::FromArgb(214, 224, 234)
 $tabLog.Controls.Add($txtLog)
@@ -5064,20 +5835,20 @@ foreach ($page in @($tabHistory, $tabTerms, $tabMemo, $tabRmk, $tabIssues, $tabL
     $page.BackColor = [System.Drawing.Color]::FromArgb(24, 31, 38)
 }
 
-$dashboardPanel = New-Object System.Windows.Forms.Panel
+$dashboardPanel = [System.Windows.Forms.Panel]::new()
 $dashboardPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $dashboardPanel.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
 $dashboardPanel.Visible = $false
 $dashboardPanel.AutoScroll = $false
 $form.Controls.Add($dashboardPanel)
 
-$dashHeader = New-Object System.Windows.Forms.Panel
+$dashHeader = [System.Windows.Forms.Panel]::new()
 $dashHeader.SetBounds(0, 0, $form.ClientSize.Width, 76)
 $dashHeader.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $dashHeader.BackColor = [System.Drawing.Color]::FromArgb(31, 39, 48)
 $dashboardPanel.Controls.Add($dashHeader)
 
-$dashAccent = New-Object System.Windows.Forms.Panel
+$dashAccent = [System.Windows.Forms.Panel]::new()
 $dashAccent.SetBounds(0, 67, $form.ClientSize.Width, 3)
 $dashAccent.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
 
@@ -5094,14 +5865,14 @@ $btnDashSettings.ForeColor = [System.Drawing.Color]::FromArgb(215, 226, 237)
 $btnDashSettings.SetBounds(806, 22, 74, 34)
 $dashHeader.Controls.AddRange(@($lblDashTitle, $lblDashSub, $btnDashProjects, $btnDashActivity, $btnDashSettings, $dashAccent))
 
-$dashContent = New-Object System.Windows.Forms.Panel
+$dashContent = [System.Windows.Forms.Panel]::new()
 $dashContent.SetBounds(0, 76, $form.ClientSize.Width, [Math]::Max(1, $form.ClientSize.Height - 76))
 $dashContent.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $dashContent.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
 $dashboardPanel.Controls.Add($dashContent)
 $dashHeader.BringToFront()
 
-$dashProjectsPage = New-Object System.Windows.Forms.Panel
+$dashProjectsPage = [System.Windows.Forms.Panel]::new()
 $dashProjectsPage.Dock = [System.Windows.Forms.DockStyle]::Fill
 $dashProjectsPage.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
 $dashContent.Controls.Add($dashProjectsPage)
@@ -5113,7 +5884,7 @@ $txtDashboardSearch.SetBounds(24, 60, 330, 30)
 $txtDashboardSearch.BackColor = [System.Drawing.Color]::FromArgb(30, 38, 46)
 $txtDashboardSearch.ForeColor = [System.Drawing.Color]::FromArgb(226, 235, 244)
 $lblDashboardMod = New-Label "프로젝트 대상 모드" 378 36 170 20 ([System.Drawing.Color]::FromArgb(160, 174, 188)) 8.5 ([System.Drawing.FontStyle]::Bold)
-$cmbDashboardMods = New-Object System.Windows.Forms.ComboBox
+$cmbDashboardMods = [System.Windows.Forms.ComboBox]::new()
 $cmbDashboardMods.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $cmbDashboardMods.DisplayMember = "Display"
 $cmbDashboardMods.Font = New-Font 9
@@ -5128,21 +5899,21 @@ $btnDashboardRefreshMods = New-Button "새로고침" ([System.Drawing.Color]::Fr
 $btnDashboardRefreshMods.ForeColor = [System.Drawing.Color]::White
 $btnDashboardRefreshMods.SetBounds(1050, 58, 92, 32)
 
-$flowDashboardProjects = New-Object System.Windows.Forms.FlowLayoutPanel
+$flowDashboardProjects = [System.Windows.Forms.FlowLayoutPanel]::new()
 $flowDashboardProjects.SetBounds(16, 112, 1418, 560)
 $flowDashboardProjects.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $flowDashboardProjects.AutoScroll = $true
 $flowDashboardProjects.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
 $dashProjectsPage.Controls.AddRange(@($lblDashProjects, $lblDashboardSearch, $txtDashboardSearch, $lblDashboardMod, $cmbDashboardMods, $btnDashboardAddMod, $btnDashboardChooseMod, $btnDashboardRefreshMods, $flowDashboardProjects))
 
-$dashActivityPage = New-Object System.Windows.Forms.Panel
+$dashActivityPage = [System.Windows.Forms.Panel]::new()
 $dashActivityPage.Dock = [System.Windows.Forms.DockStyle]::Fill
 $dashActivityPage.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
 $dashActivityPage.Visible = $false
 $dashContent.Controls.Add($dashActivityPage)
 
 $lblDashActivity = New-Label "활동" 24 20 180 30 ([System.Drawing.Color]::White) 14 ([System.Drawing.FontStyle]::Bold)
-$lvDashboardActivity = New-Object System.Windows.Forms.ListView
+$lvDashboardActivity = [System.Windows.Forms.ListView]::new()
 $lvDashboardActivity.SetBounds(24, 66, 1378, 606)
 $lvDashboardActivity.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $lvDashboardActivity.View = [System.Windows.Forms.View]::Details
@@ -5157,82 +5928,137 @@ $lvDashboardActivity.ForeColor = [System.Drawing.Color]::FromArgb(226, 235, 244)
 [void]$lvDashboardActivity.Columns.Add("내용", 720)
 $dashActivityPage.Controls.AddRange(@($lblDashActivity, $lvDashboardActivity))
 
-$dashSettingsPage = New-Object System.Windows.Forms.Panel
+$dashSettingsPage = [System.Windows.Forms.Panel]::new()
 $dashSettingsPage.Dock = [System.Windows.Forms.DockStyle]::Fill
 $dashSettingsPage.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
 $dashSettingsPage.AutoScroll = $true
-$dashSettingsPage.AutoScrollMinSize = New-Object System.Drawing.Size(0, 640)
+$dashSettingsPage.AutoScrollMinSize = [System.Drawing.Size]::new(0, 760)
 $dashSettingsPage.Visible = $false
 $dashContent.Controls.Add($dashSettingsPage)
 
 $lblDashSettings = New-Label "설정" 24 20 180 30 ([System.Drawing.Color]::White) 14 ([System.Drawing.FontStyle]::Bold)
-$lblDashApi = New-Label "API 키 (Enter로 여러 개, 비우면 Google)" 28 70 340 22 ([System.Drawing.Color]::FromArgb(218, 228, 238)) 9 ([System.Drawing.FontStyle]::Bold)
+$pnlApiSettings = [System.Windows.Forms.Panel]::new()
+$pnlApiSettings.SetBounds(28, 66, 720, 440)
+$lblDashApi = New-Label "번역 API" 0 0 220 28 ([System.Drawing.Color]::FromArgb(218, 228, 238)) 11 ([System.Drawing.FontStyle]::Bold)
+$lblDashApiHint = New-Label "사용할 서비스를 선택하세요. 키는 저장되지 않습니다." 0 28 360 20 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.3
+$flowApiProviders = [System.Windows.Forms.FlowLayoutPanel]::new()
+$flowApiProviders.SetBounds(0, 58, 190, 370)
+$flowApiProviders.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+$flowApiProviders.WrapContents = $false
+$flowApiProviders.AutoScroll = $true
+$flowApiProviders.Padding = [System.Windows.Forms.Padding]::new(0)
+$flowApiProviders.Margin = [System.Windows.Forms.Padding]::new(0)
+foreach ($providerProfile in $script:apiProviders) {
+    $providerButton = New-Button ([string]$providerProfile.Name) ([System.Drawing.Color]::FromArgb(72, 86, 100))
+    $providerButton.Tag = [string]$providerProfile.Id
+    $providerButton.Size = [System.Drawing.Size]::new(172, 34)
+    $providerButton.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, 5)
+    $providerButton.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $providerButton.Padding = [System.Windows.Forms.Padding]::new(10, 0, 4, 0)
+    $providerButton.Font = New-Font 8.7 ([System.Drawing.FontStyle]::Bold)
+    $script:apiProviderButtons[[string]$providerProfile.Id] = $providerButton
+    [void]$flowApiProviders.Controls.Add($providerButton)
+}
+$apiProviderDivider = [System.Windows.Forms.Panel]::new()
+$apiProviderDivider.SetBounds(202, 58, 1, 370)
+
+$pnlApiDetail = [System.Windows.Forms.Panel]::new()
+$pnlApiDetail.SetBounds(220, 58, 500, 370)
+$lblApiProviderTitle = New-Label "Cerebras" 0 0 300 28 ([System.Drawing.Color]::FromArgb(218, 228, 238)) 11 ([System.Drawing.FontStyle]::Bold)
+$lblApiProviderDescription = New-Label "Gemma 4와 초고속 추론 모델" 0 30 430 20 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.3
+$lblApiProviderCustomName = New-Label "서비스 명칭" 0 58 150 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.3 ([System.Drawing.FontStyle]::Bold)
+$txtApiProviderCustomName = New-TextBox
+$txtApiProviderCustomName.SetBounds(0, 80, 460, 30)
+$lblApiProviderKeys = New-Label "API 키 · 한 줄에 하나씩" 0 58 220 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.3 ([System.Drawing.FontStyle]::Bold)
 $txtDashboardApiKeys = New-TextBox -Multiline
-$txtDashboardApiKeys.SetBounds(28, 100, 560, 170)
+$txtDashboardApiKeys.SetBounds(0, 80, 460, 82)
 $txtDashboardApiKeys.BackColor = [System.Drawing.Color]::FromArgb(30, 38, 46)
 $txtDashboardApiKeys.ForeColor = [System.Drawing.Color]::FromArgb(226, 235, 244)
-$chkDashboardIncludePatches = New-Object System.Windows.Forms.CheckBox
+$lblApiProviderUrl = New-Label "API URL" 0 172 120 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.3 ([System.Drawing.FontStyle]::Bold)
+$txtApiProviderUrl = New-TextBox
+$txtApiProviderUrl.SetBounds(0, 194, 460, 30)
+$lblApiProviderModel = New-Label "모델" 0 234 100 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.3 ([System.Drawing.FontStyle]::Bold)
+$cmbApiProviderModel = [System.Windows.Forms.ComboBox]::new()
+$cmbApiProviderModel.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+$cmbApiProviderModel.Font = New-Font 9.5
+$cmbApiProviderModel.SetBounds(0, 256, 300, 30)
+$lblApiProviderTemperature = New-Label "Temperature" 316 234 140 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.3 ([System.Drawing.FontStyle]::Bold)
+$cmbApiProviderTemperature = [System.Windows.Forms.ComboBox]::new()
+$cmbApiProviderTemperature.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+$cmbApiProviderTemperature.Font = New-Font 9.5
+$cmbApiProviderTemperature.SetBounds(316, 256, 144, 30)
+[void]$cmbApiProviderTemperature.Items.AddRange(@("모델 기본값", "0", "0.1", "0.2"))
+$lblApiProviderNotice = New-Label "키가 비어 있으면 Google 번역을 사용합니다." 0 298 460 22 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.3
+$chkDashboardIncludePatches = [System.Windows.Forms.CheckBox]::new()
 $chkDashboardIncludePatches.Text = "Patches 포함"
-$chkDashboardIncludePatches.SetBounds(28, 288, 150, 26)
+$chkDashboardIncludePatches.SetBounds(0, 332, 150, 26)
 $chkDashboardIncludePatches.ForeColor = [System.Drawing.Color]::FromArgb(218, 226, 234)
 $chkDashboardIncludePatches.BackColor = [System.Drawing.Color]::Transparent
-$chkDashboardDryRun = New-Object System.Windows.Forms.CheckBox
+$chkDashboardDryRun = [System.Windows.Forms.CheckBox]::new()
 $chkDashboardDryRun.Text = "Dry run"
-$chkDashboardDryRun.SetBounds(188, 288, 120, 26)
+$chkDashboardDryRun.SetBounds(158, 332, 120, 26)
 $chkDashboardDryRun.ForeColor = [System.Drawing.Color]::FromArgb(218, 226, 234)
 $chkDashboardDryRun.BackColor = [System.Drawing.Color]::Transparent
-$lblDashSettingsNote = New-Label "배치 크기는 무료 API 안정성을 우선해서 40으로 고정되어 있습니다." 28 330 680 24 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.5
+$lblDashSettingsNote = New-Label "배치 크기 40 · 여러 키는 입력 순서대로 순환" 286 332 300 24 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.3
+$pnlApiDetail.Controls.AddRange(@($lblApiProviderTitle, $lblApiProviderDescription, $lblApiProviderCustomName, $txtApiProviderCustomName, $lblApiProviderKeys, $txtDashboardApiKeys, $lblApiProviderUrl, $txtApiProviderUrl, $lblApiProviderModel, $cmbApiProviderModel, $lblApiProviderTemperature, $cmbApiProviderTemperature, $lblApiProviderNotice, $chkDashboardIncludePatches, $chkDashboardDryRun, $lblDashSettingsNote))
+$pnlApiSettings.Controls.AddRange(@($lblDashApi, $lblDashApiHint, $flowApiProviders, $apiProviderDivider, $pnlApiDetail))
 
-$settingsDivider = New-Object System.Windows.Forms.Panel
-$settingsDivider.SetBounds(616, 70, 1, 284)
-$lblDashAppearance = New-Label "화면 및 편집" 646 70 240 24 ([System.Drawing.Color]::FromArgb(218, 228, 238)) 10 ([System.Drawing.FontStyle]::Bold)
-$lblDashTheme = New-Label "테마" 646 108 120 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.5 ([System.Drawing.FontStyle]::Bold)
-$cmbDashboardTheme = New-Object System.Windows.Forms.ComboBox
+$pnlAppearanceSettings = [System.Windows.Forms.Panel]::new()
+$pnlAppearanceSettings.SetBounds(776, 66, 350, 300)
+$settingsDivider = [System.Windows.Forms.Panel]::new()
+$settingsDivider.SetBounds(0, 0, 350, 1)
+$lblDashAppearance = New-Label "화면 및 편집" 0 0 240 28 ([System.Drawing.Color]::FromArgb(218, 228, 238)) 11 ([System.Drawing.FontStyle]::Bold)
+$lblDashTheme = New-Label "테마" 0 46 120 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.5 ([System.Drawing.FontStyle]::Bold)
+$cmbDashboardTheme = [System.Windows.Forms.ComboBox]::new()
 $cmbDashboardTheme.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $cmbDashboardTheme.Font = New-Font 9.5
-$cmbDashboardTheme.SetBounds(646, 132, 220, 30)
+$cmbDashboardTheme.SetBounds(0, 70, 220, 30)
 [void]$cmbDashboardTheme.Items.AddRange(@("시스템 설정 따름", "밝게", "어둡게"))
 
-$lblDashTextSize = New-Label "본문 글자 크기" 646 180 160 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.5 ([System.Drawing.FontStyle]::Bold)
-$cmbDashboardTextSize = New-Object System.Windows.Forms.ComboBox
+$lblDashTextSize = New-Label "본문 글자 크기" 0 118 160 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.5 ([System.Drawing.FontStyle]::Bold)
+$cmbDashboardTextSize = [System.Windows.Forms.ComboBox]::new()
 $cmbDashboardTextSize.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $cmbDashboardTextSize.Font = New-Font 9.5
-$cmbDashboardTextSize.SetBounds(646, 204, 220, 30)
+$cmbDashboardTextSize.SetBounds(0, 142, 220, 30)
 [void]$cmbDashboardTextSize.Items.AddRange(@("9", "10", "11", "12"))
 
-$chkDashboardHighContrast = New-Object System.Windows.Forms.CheckBox
+$chkDashboardHighContrast = [System.Windows.Forms.CheckBox]::new()
 $chkDashboardHighContrast.Text = "고대비"
-$chkDashboardHighContrast.SetBounds(646, 252, 150, 26)
+$chkDashboardHighContrast.SetBounds(0, 190, 150, 26)
 $chkDashboardHighContrast.BackColor = [System.Drawing.Color]::Transparent
-$chkDashboardAutoSave = New-Object System.Windows.Forms.CheckBox
+$chkDashboardAutoSave = [System.Windows.Forms.CheckBox]::new()
 $chkDashboardAutoSave.Text = "편집 내용 자동 저장"
-$chkDashboardAutoSave.SetBounds(646, 286, 210, 26)
+$chkDashboardAutoSave.SetBounds(0, 224, 210, 26)
 $chkDashboardAutoSave.BackColor = [System.Drawing.Color]::Transparent
+$pnlAppearanceSettings.Controls.AddRange(@($lblDashAppearance, $lblDashTheme, $cmbDashboardTheme, $lblDashTextSize, $cmbDashboardTextSize, $chkDashboardHighContrast, $chkDashboardAutoSave))
 
-$settingsRmkDivider = New-Object System.Windows.Forms.Panel
-$settingsRmkDivider.SetBounds(28, 374, 1040, 1)
-$lblDashRmk = New-Label "RMK 로컬 연동" 28 394 240 26 ([System.Drawing.Color]::FromArgb(218, 228, 238)) 10 ([System.Drawing.FontStyle]::Bold)
-$lblDashboardRmkWorkspace = New-Label "작업 클론 (bus 브랜치)" 28 432 220 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.5 ([System.Drawing.FontStyle]::Bold)
+$pnlRmkSettings = [System.Windows.Forms.Panel]::new()
+$pnlRmkSettings.SetBounds(28, 536, 1098, 190)
+$settingsRmkDivider = [System.Windows.Forms.Panel]::new()
+$settingsRmkDivider.SetBounds(0, 0, 1098, 1)
+$lblDashRmk = New-Label "RMK 로컬 연동" 0 18 240 26 ([System.Drawing.Color]::FromArgb(218, 228, 238)) 10 ([System.Drawing.FontStyle]::Bold)
+$lblDashboardRmkWorkspace = New-Label "작업 클론 (bus 브랜치)" 0 54 220 20 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.5 ([System.Drawing.FontStyle]::Bold)
 $txtDashboardRmkWorkspace = New-TextBox
-$txtDashboardRmkWorkspace.SetBounds(28, 456, 650, 32)
+$txtDashboardRmkWorkspace.SetBounds(0, 78, 650, 32)
 $txtDashboardRmkWorkspace.ReadOnly = $true
 $btnDashboardRmkAuto = New-Button "자동 찾기" ([System.Drawing.Color]::FromArgb(72, 86, 100))
 $btnDashboardRmkAuto.ForeColor = [System.Drawing.Color]::White
-$btnDashboardRmkAuto.SetBounds(690, 454, 94, 34)
+$btnDashboardRmkAuto.SetBounds(662, 76, 94, 34)
 $btnDashboardRmkChoose = New-Button "폴더 선택" ([System.Drawing.Color]::FromArgb(72, 86, 100))
 $btnDashboardRmkChoose.ForeColor = [System.Drawing.Color]::White
-$btnDashboardRmkChoose.SetBounds(792, 454, 94, 34)
+$btnDashboardRmkChoose.SetBounds(764, 76, 94, 34)
 $btnDashboardRmkOpen = New-Button "폴더 열기" ([System.Drawing.Color]::FromArgb(72, 86, 100))
 $btnDashboardRmkOpen.ForeColor = [System.Drawing.Color]::White
-$btnDashboardRmkOpen.SetBounds(894, 454, 94, 34)
-$lblDashboardRmkReference = New-Label "RMK 구독본을 찾는 중입니다." 28 500 1040 24 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.5
-$chkDashboardRmkUseExisting = New-Object System.Windows.Forms.CheckBox
+$btnDashboardRmkOpen.SetBounds(866, 76, 94, 34)
+$lblDashboardRmkReference = New-Label "RMK 구독본을 찾는 중입니다." 0 118 1040 24 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.5
+$chkDashboardRmkUseExisting = [System.Windows.Forms.CheckBox]::new()
 $chkDashboardRmkUseExisting.Text = "원문 갱신과 AI 번역에서 RMK 기존 번역 자동 사용"
-$chkDashboardRmkUseExisting.SetBounds(28, 530, 420, 26)
+$chkDashboardRmkUseExisting.SetBounds(0, 144, 420, 26)
 $chkDashboardRmkUseExisting.BackColor = [System.Drawing.Color]::Transparent
-$lblDashboardRmkNote = New-Label "Steam 구독본은 읽기 전용 참조로만 사용합니다. 내보내기는 bus 브랜치의 Git 클론에만 기록하며 커밋·푸시는 하지 않습니다." 28 562 1040 42 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.5
+$lblDashboardRmkNote = New-Label "Steam 구독본은 읽기 전용 참조입니다. 내보내기는 bus 브랜치 작업 클론에만 기록하며 커밋·푸시는 하지 않습니다." 438 144 650 30 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.3
+$pnlRmkSettings.Controls.AddRange(@($settingsRmkDivider, $lblDashRmk, $lblDashboardRmkWorkspace, $txtDashboardRmkWorkspace, $btnDashboardRmkAuto, $btnDashboardRmkChoose, $btnDashboardRmkOpen, $lblDashboardRmkReference, $chkDashboardRmkUseExisting, $lblDashboardRmkNote))
 
-$dashSettingsPage.Controls.AddRange(@($lblDashSettings, $lblDashApi, $txtDashboardApiKeys, $chkDashboardIncludePatches, $chkDashboardDryRun, $lblDashSettingsNote, $settingsDivider, $lblDashAppearance, $lblDashTheme, $cmbDashboardTheme, $lblDashTextSize, $cmbDashboardTextSize, $chkDashboardHighContrast, $chkDashboardAutoSave, $settingsRmkDivider, $lblDashRmk, $lblDashboardRmkWorkspace, $txtDashboardRmkWorkspace, $btnDashboardRmkAuto, $btnDashboardRmkChoose, $btnDashboardRmkOpen, $lblDashboardRmkReference, $chkDashboardRmkUseExisting, $lblDashboardRmkNote))
+$dashSettingsPage.Controls.AddRange(@($lblDashSettings, $pnlApiSettings, $pnlAppearanceSettings, $pnlRmkSettings))
 
 $dashboardPanel.Add_Resize({
     $dashHeader.SetBounds(0, 0, $dashboardPanel.ClientSize.Width, 70)
@@ -5258,13 +6084,22 @@ function Update-SplitMinimumSizes {
     try {
         $rightSplit.Panel1MinSize = 0
         $rightSplit.Panel2MinSize = 0
-        $rightWidth = $rightSplit.ClientSize.Width
-        $rightRequired = 420 + 320 + $rightSplit.SplitterWidth
-        if ($rightWidth -ge $rightRequired) {
-            $maxRightDistance = $rightWidth - 320 - $rightSplit.SplitterWidth
-            $rightSplit.SplitterDistance = [Math]::Max(420, [Math]::Min($rightSplit.SplitterDistance, $maxRightDistance))
-            $rightSplit.Panel1MinSize = 420
-            $rightSplit.Panel2MinSize = 320
+        if ($rightSplit.Orientation -eq [System.Windows.Forms.Orientation]::Horizontal) {
+            $rightHeight = $rightSplit.ClientSize.Height
+            if ($rightHeight -ge 470) {
+                $rightSplit.Panel1MinSize = 340
+                $rightSplit.Panel2MinSize = 100
+                $rightSplit.SplitterDistance = [Math]::Max(340, [Math]::Min($rightSplit.SplitterDistance, $rightHeight - 100 - $rightSplit.SplitterWidth))
+            }
+        } else {
+            $rightWidth = $rightSplit.ClientSize.Width
+            $rightRequired = 420 + 320 + $rightSplit.SplitterWidth
+            if ($rightWidth -ge $rightRequired) {
+                $maxRightDistance = $rightWidth - 320 - $rightSplit.SplitterWidth
+                $rightSplit.SplitterDistance = [Math]::Max(420, [Math]::Min($rightSplit.SplitterDistance, $maxRightDistance))
+                $rightSplit.Panel1MinSize = 420
+                $rightSplit.Panel2MinSize = 320
+            }
         }
     } catch {}
 }
@@ -5325,13 +6160,11 @@ function Apply-AppTheme {
     $primarySoft = if ($isDark) { [System.Drawing.Color]::FromArgb(68, 59, 44) } else { [System.Drawing.Color]::FromArgb(240, 229, 210) }
     $steel = if ($isDark) { [System.Drawing.Color]::FromArgb(82, 124, 139) } else { [System.Drawing.Color]::FromArgb(74, 111, 124) }
     $green = if ($isDark) { [System.Drawing.Color]::FromArgb(71, 139, 92) } else { [System.Drawing.Color]::FromArgb(62, 124, 82) }
-    $danger = if ($isDark) { [System.Drawing.Color]::FromArgb(174, 76, 73) } else { [System.Drawing.Color]::FromArgb(153, 67, 64) }
     if ($script:highContrast) {
         $primary = if ($isDark) { [System.Drawing.Color]::FromArgb(224, 177, 92) } else { [System.Drawing.Color]::FromArgb(119, 77, 22) }
         $primarySoft = if ($isDark) { [System.Drawing.Color]::FromArgb(75, 61, 38) } else { [System.Drawing.Color]::FromArgb(244, 232, 210) }
         $steel = if ($isDark) { [System.Drawing.Color]::FromArgb(94, 163, 190) } else { [System.Drawing.Color]::FromArgb(38, 88, 108) }
         $green = if ($isDark) { [System.Drawing.Color]::FromArgb(68, 158, 94) } else { [System.Drawing.Color]::FromArgb(31, 103, 56) }
-        $danger = if ($isDark) { [System.Drawing.Color]::FromArgb(193, 74, 70) } else { [System.Drawing.Color]::FromArgb(137, 43, 40) }
     }
 
     $script:itemCardBack = $surface
@@ -5371,10 +6204,10 @@ function Apply-AppTheme {
     $dashAccent.SetBounds(0, 67, $formWidth, 3)
     $dashAccent.BackColor = $primary
     $dashContent.Top = 70
-    foreach ($control in @($main, $main.Panel1, $main.Panel2, $left, $center, $side, $rightSplit, $rightSplit.Panel1, $rightSplit.Panel2, $dashboardPanel, $dashContent, $dashProjectsPage, $dashActivityPage, $dashSettingsPage, $flowDashboardProjects, $flowItems, $statusFilterBar)) {
+    foreach ($control in @($main, $main.Panel1, $main.Panel2, $left, $center, $side, $rightSplit, $rightSplit.Panel1, $rightSplit.Panel2, $dashboardPanel, $dashContent, $dashProjectsPage, $dashActivityPage, $dashSettingsPage, $flowDashboardProjects, $flowItems, $statusFilterBar, $pnlApiSettings, $pnlAppearanceSettings, $pnlRmkSettings)) {
         if ($control) { $control.BackColor = $bg }
     }
-    foreach ($panel in @($center, $side)) {
+    foreach ($panel in @($center, $side, $pnlApiDetail, $flowApiProviders)) {
         if ($panel) { $panel.BackColor = $surface }
     }
 
@@ -5399,7 +6232,7 @@ function Apply-AppTheme {
     $chkIncludePatches.Visible = $false
     $chkDryRun.Visible = $false
     $progressRun.Visible = $false
-    $actionWidths = @(96, 88, 54, 92, 92)
+    $actionWidths = @(96, 88, 54, 92, 100)
     $actionGap = 8
     $actionTotal = ($actionWidths | Measure-Object -Sum).Sum + ($actionGap * ($actionWidths.Count - 1))
     $actionX = [Math]::Max(434, $topWidth - 24 - $actionTotal)
@@ -5479,15 +6312,28 @@ function Apply-AppTheme {
     try { $main.SplitterDistance = $leftWidth } catch {}
 
     $rightWidth = [Math]::Max(1, $rightSplit.ClientSize.Width)
-    $sideWidth = [Math]::Min(370, [Math]::Max(330, [int]($rightWidth * 0.25)))
-    $centerWidth = [Math]::Max(420, $rightWidth - $sideWidth - $rightSplit.SplitterWidth)
-    $centerWidth = [Math]::Min($centerWidth, [Math]::Max(420, $rightWidth - 330 - $rightSplit.SplitterWidth))
-    try { $rightSplit.SplitterDistance = $centerWidth } catch {}
+    $compactWorkspace = $mainWidth -lt 1100
+    try {
+        $rightSplit.Panel1MinSize = 0
+        $rightSplit.Panel2MinSize = 0
+        if ($compactWorkspace) {
+            $rightSplit.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+            $rightHeight = [Math]::Max(1, $rightSplit.ClientSize.Height)
+            $centerHeight = [Math]::Max(340, [Math]::Min([int]($rightHeight * 0.8), $rightHeight - 104 - $rightSplit.SplitterWidth))
+            $rightSplit.SplitterDistance = $centerHeight
+        } else {
+            $rightSplit.Orientation = [System.Windows.Forms.Orientation]::Vertical
+            $sideWidth = [Math]::Min(370, [Math]::Max(330, [int]($rightWidth * 0.25)))
+            $centerWidth = [Math]::Max(420, $rightWidth - $sideWidth - $rightSplit.SplitterWidth)
+            $centerWidth = [Math]::Min($centerWidth, [Math]::Max(420, $rightWidth - 330 - $rightSplit.SplitterWidth))
+            $rightSplit.SplitterDistance = $centerWidth
+        }
+    } catch {}
     Queue-SideTabResize
 
     $leftInner = [Math]::Max(268, $leftWidth - 32)
     $lblSearchCrumb.SetBounds(16, 16, $leftInner, 64)
-    $lblSearchCrumb.Padding = New-Object System.Windows.Forms.Padding(14, 9, 12, 7)
+    $lblSearchCrumb.Padding = [System.Windows.Forms.Padding]::new(14, 9, 12, 7)
     $lblSearchCrumb.BackColor = $searchCard
     $lblSearchCrumb.ForeColor = $primary
     $lblSearchCrumb.BorderStyle = [System.Windows.Forms.BorderStyle]::None
@@ -5497,15 +6343,16 @@ function Apply-AppTheme {
     $txtSearch.SetBounds(104, 92, [Math]::Max(72, $statusX - 112), 32)
     $cmbStatus.SetBounds($statusX, 92, $statusWidth, 32)
     $statusFilterBar.SetBounds(16, 136, $leftInner, 30)
-    $lblProjectStats.SetBounds(16, 176, $leftInner, 42)
+    $cmbSort.SetBounds(16, 174, $leftInner, 32)
+    $lblProjectStats.SetBounds(16, 214, $leftInner, 42)
     $progressReview.Visible = $false
     $lblProgress.Visible = $false
     $lvFiles.Visible = $false
-    $flowItems.SetBounds(16, 228, $leftInner, [Math]::Max(260, $main.ClientSize.Height - 244))
-    $flowItems.Padding = New-Object System.Windows.Forms.Padding(0)
+    $flowItems.SetBounds(16, 266, $leftInner, [Math]::Max(240, $main.ClientSize.Height - 282))
+    $flowItems.ItemHeight = 94 + ([Math]::Max(-1, [Math]::Min(2, $script:textSize - 10)) * 4)
     $flowItems.BorderStyle = [System.Windows.Forms.BorderStyle]::None
 
-    foreach ($box in @($txtSearch, $txtSource, $txtTranslation, $txtMeta, $txtExisting, $txtCandidate, $txtHistory, $txtTerms, $txtMemo, $txtRmkDetails, $txtWarnings, $txtDashboardSearch, $txtDashboardApiKeys, $txtDashboardRmkWorkspace, $txtApiKeys)) {
+    foreach ($box in @($txtSearch, $txtSource, $txtTranslation, $txtMeta, $txtExisting, $txtCandidate, $txtHistory, $txtTerms, $txtMemo, $txtRmkDetails, $txtWarnings, $txtDashboardSearch, $txtDashboardApiKeys, $txtDashboardRmkWorkspace, $txtApiKeys, $txtApiProviderUrl, $txtApiProviderCustomName)) {
         if ($box) {
             $box.BackColor = $surface
             $box.ForeColor = $text
@@ -5531,7 +6378,7 @@ function Apply-AppTheme {
     $txtLog.BackColor = if ($isDark) { [System.Drawing.Color]::FromArgb(16, 22, 28) } else { [System.Drawing.Color]::FromArgb(248, 247, 242) }
     $txtLog.ForeColor = $text
 
-    foreach ($combo in @($cmbSearchField, $cmbStatus, $cmbModCatalog, $cmbProject, $cmbDashboardMods, $cmbDashboardTheme, $cmbDashboardTextSize)) {
+    foreach ($combo in @($cmbSearchField, $cmbStatus, $cmbSort, $cmbModCatalog, $cmbProject, $cmbDashboardMods, $cmbDashboardTheme, $cmbDashboardTextSize, $cmbApiProviderModel, $cmbApiProviderTemperature)) {
         if ($combo) {
             $combo.BackColor = $surface
             $combo.ForeColor = $text
@@ -5548,7 +6395,7 @@ function Apply-AppTheme {
     foreach ($page in @($tabHistory, $tabTerms, $tabMemo, $tabRmk, $tabIssues, $tabLog)) {
         if ($page) {
             $page.BackColor = $surface
-            $page.Padding = New-Object System.Windows.Forms.Padding(12)
+            $page.Padding = [System.Windows.Forms.Padding]::new(12)
         }
     }
     foreach ($sideBox in @($txtHistory, $txtTerms, $txtMemo, $txtRmkDetails, $txtWarnings)) {
@@ -5557,7 +6404,7 @@ function Apply-AppTheme {
             $sideBox.BackColor = $surface
         }
     }
-    foreach ($label in @($lblSearchCrumb, $lblProjectStats, $lblProgress, $lblExisting, $lblCandidate, $lblReferenceTitle, $lblRmkStatus, $lblDashProjects, $lblDashActivity, $lblDashSettings, $lblDashApi, $lblDashboardSearch, $lblDashboardMod, $lblDashSettingsNote, $lblDashAppearance, $lblDashTheme, $lblDashTextSize, $lblDashRmk, $lblDashboardRmkWorkspace, $lblDashboardRmkReference, $lblDashboardRmkNote)) {
+    foreach ($label in @($lblSearchCrumb, $lblProjectStats, $lblProgress, $lblExisting, $lblCandidate, $lblReferenceTitle, $lblRmkStatus, $lblDashProjects, $lblDashActivity, $lblDashSettings, $lblDashApi, $lblDashApiHint, $lblApiProviderTitle, $lblApiProviderDescription, $lblApiProviderCustomName, $lblApiProviderKeys, $lblApiProviderUrl, $lblApiProviderModel, $lblApiProviderTemperature, $lblApiProviderNotice, $lblDashboardSearch, $lblDashboardMod, $lblDashSettingsNote, $lblDashAppearance, $lblDashTheme, $lblDashTextSize, $lblDashRmk, $lblDashboardRmkWorkspace, $lblDashboardRmkReference, $lblDashboardRmkNote)) {
         if ($label -and $label -ne $lblSearchCrumb) { $label.ForeColor = $text }
     }
     $lblSourceTitle.ForeColor = $muted
@@ -5581,6 +6428,7 @@ function Apply-AppTheme {
     }
     $settingsDivider.BackColor = $line
     $settingsRmkDivider.BackColor = $line
+    $apiProviderDivider.BackColor = $line
 
     $lblSourceTitle.Text = "원문"
     $lblTranslationTitle.Text = "번역문"
@@ -5608,6 +6456,10 @@ function Apply-AppTheme {
     $btnApproveNext.ForeColor = [System.Drawing.Color]::White
     $btnApproveNext.FlatAppearance.BorderColor = $green
     $btnApproveNext.FlatAppearance.BorderSize = 0
+    $btnApproveAll.BackColor = $surface
+    $btnApproveAll.ForeColor = $primary
+    $btnApproveAll.FlatAppearance.BorderColor = $primary
+    $btnApproveAll.FlatAppearance.BorderSize = 1
     $btnRmkBuild.BackColor = $primary
     $btnRmkBuild.ForeColor = [System.Drawing.Color]::White
     $btnRmkBuild.FlatAppearance.BorderColor = $primary
@@ -5617,7 +6469,7 @@ function Apply-AppTheme {
     $tabs.Appearance = [System.Windows.Forms.TabAppearance]::Normal
     $tabs.SizeMode = [System.Windows.Forms.TabSizeMode]::Fixed
     $tabWidth = [Math]::Max(48, [Math]::Min(68, [int](($side.ClientSize.Width - 8) / [Math]::Max(1, $tabs.TabPages.Count))))
-    $tabs.ItemSize = New-Object System.Drawing.Size($tabWidth, 38)
+    $tabs.ItemSize = [System.Drawing.Size]::new($tabWidth, 38)
     $tabs.BackColor = $surface
     $tabs.Invalidate()
 
@@ -5651,20 +6503,9 @@ function Apply-AppTheme {
     }
     $flowDashboardProjects.SetBounds(22, 152, [Math]::Max(320, $dashWidth - 44), [Math]::Max(260, $dashHeight - 176))
     $lvDashboardActivity.SetBounds(24, 66, [Math]::Max(320, $dashWidth - 48), [Math]::Max(260, $dashHeight - 154))
-    $settingsWidth = [Math]::Max(760, $dashSettingsPage.ClientSize.Width)
-    $settingsInner = [Math]::Max(704, $settingsWidth - 56)
-    $settingsRmkDivider.SetBounds(28, 374, $settingsInner, 1)
-    $lblDashboardRmkReference.SetBounds(28, 500, $settingsInner, 24)
-    $lblDashboardRmkNote.SetBounds(28, 562, $settingsInner, 42)
-    $rmkButtonWidth = 94
-    $rmkButtonGap = 8
-    $rmkButtonTotal = ($rmkButtonWidth * 3) + ($rmkButtonGap * 2)
-    $rmkPathWidth = [Math]::Max(300, $settingsInner - $rmkButtonTotal - 12)
-    $txtDashboardRmkWorkspace.SetBounds(28, 456, $rmkPathWidth, 32)
-    $rmkButtonX = 28 + $rmkPathWidth + 12
-    $btnDashboardRmkAuto.SetBounds($rmkButtonX, 454, $rmkButtonWidth, 34)
-    $btnDashboardRmkChoose.SetBounds(($rmkButtonX + $rmkButtonWidth + $rmkButtonGap), 454, $rmkButtonWidth, 34)
-    $btnDashboardRmkOpen.SetBounds(($rmkButtonX + (($rmkButtonWidth + $rmkButtonGap) * 2)), 454, $rmkButtonWidth, 34)
+    Resize-DashboardSettingsLayout
+    Refresh-ApiProviderButtons
+    if ($dashboardPanel.Visible) { Refresh-DashboardTabButtons }
     Update-SplitMinimumSizes
     $script:appliedThemeSignature = $themeSignature
 }
@@ -5692,6 +6533,7 @@ Set-AccessibleControl $btnApplyTranslated "번역된 항목 모두 적용" "번�
 Set-AccessibleControl $cmbSearchField "검색 범위" "텍스트, 키, Def Class 또는 Node 중 검색할 범위를 선택합니다." 0
 Set-AccessibleControl $txtSearch "문자열 검색" "원문, 번역문 또는 키를 검색합니다. 단축키 Ctrl+F." 1
 Set-AccessibleControl $cmbStatus "번역 상태 필터" "미번역, 번역됨, 검토됨, 업데이트로 변경됨 또는 주의 항목을 고릅니다." 2
+Set-AccessibleControl $cmbSort "번역 정렬" "기본 순서 또는 내가 편집한 번역의 최신순과 오래된순을 선택합니다." 3
 for ($i = 0; $i -lt $statusFilterButtons.Count; $i++) {
     $filterButton = $statusFilterButtons[$i]
     Set-AccessibleControl $filterButton "$($filterButton.Text) 상태 필터" "$($filterButton.Text) 상태의 문자열만 목록에 표시합니다." $i
@@ -5709,8 +6551,9 @@ Set-AccessibleControl $btnPending "미번역으로 표시" "현재 항목을 미
 Set-AccessibleControl $btnTranslated "번역됨으로 표시" "현재 항목을 번역됨 상태로 바꿉니다. 단축키 Ctrl+2." 10
 Set-AccessibleControl $btnApprove "검토 완료로 표시" "현재 항목을 검토 완료 상태로 바꿉니다. 단축키 Ctrl+3 또는 Ctrl+Shift+Enter." 11
 Set-AccessibleControl $btnApproveNext "검토 완료 후 다음" "현재 항목을 검토 완료로 저장하고 다음 항목으로 이동합니다. 단축키 Ctrl+Enter." 12
-Set-AccessibleControl $txtExisting "기존 번역" "모드에 이미 있던 Korean 번역입니다." 13
-Set-AccessibleControl $txtCandidate "AI 번역 후보" "AI 또는 Google이 만든 초벌 번역입니다." 14
+Set-AccessibleControl $btnApproveAll "전체 검토 완료" "빈 번역, 원문 변경과 주의 항목을 제외한 모든 안전한 번역을 검토 완료로 표시합니다. 단축키 Ctrl+Shift+3." 13
+Set-AccessibleControl $txtExisting "기존 번역" "모드 또는 RMK에서 가져온 기존 Korean 번역입니다." 14
+Set-AccessibleControl $txtCandidate "AI 번역 후보" "AI 또는 Google이 만든 초벌 번역입니다." 15
 Set-AccessibleControl $tabs "참고 정보 탭" "역사, 용어, 메모, RMK, 문제와 로그를 전환합니다." 0
 Set-AccessibleControl $txtHistory "번역 역사" "원문, 기존 번역, AI 후보와 현재 검수 번역을 보여줍니다." 0
 Set-AccessibleControl $txtTerms "관련 용어" "현재 문자열과 관련된 RimWorld 용어를 보여줍니다." 0
@@ -5719,7 +6562,7 @@ Set-AccessibleControl $txtRmkDetails "RMK 연결 정보" "현재 프로젝트의
 Set-AccessibleControl $btnRmkRefresh "RMK 상태 갱신" "RMK 구독본과 작업 클론에서 현재 프로젝트를 다시 찾습니다." 1
 Set-AccessibleControl $btnRmkOpen "RMK 폴더 열기" "현재 RMK 번역 항목 또는 작업 클론 폴더를 엽니다." 2
 Set-AccessibleControl $btnRmkBuild "RMK LoadFolders 빌드" "RMK 작업 클론의 LoadFoldersBuilder를 실행합니다." 3
-Set-AccessibleControl $txtWarnings "주의 사항" "토큰 누락과 안전 적용 여부 등 현재 문자열의 문제를 보여줍니다." 0
+Set-AccessibleControl $txtWarnings "주의 사항" "토큰 누락, 림월드 조사 표기 오류와 안전 적용 여부 등 현재 문자열의 문제를 보여줍니다." 0
 Set-AccessibleControl $txtLog "작업 로그" "원문 로드, 번역과 적용 과정의 로그입니다." 0
 
 Set-AccessibleControl $btnDashProjects "프로젝트 탭" "로컬 번역 프로젝트를 표시합니다." 0
@@ -5731,7 +6574,14 @@ Set-AccessibleControl $btnDashboardAddMod "프로젝트 만들기" "선택한 �
 Set-AccessibleControl $btnDashboardChooseMod "모드 폴더 선택" "자동 검색되지 않은 모드 폴더를 직접 선택합니다." 3
 Set-AccessibleControl $btnDashboardRefreshMods "모드 목록 새로고침" "Steam과 RimWorld 모드 폴더를 다시 검색합니다." 4
 Set-AccessibleControl $lvDashboardActivity "최근 활동 목록" "번역, 검토와 적용 내역입니다." 0
-Set-AccessibleControl $txtDashboardApiKeys "Cerebras API 키" "한 줄에 하나씩 여러 API 키를 입력합니다. 이 값은 설정 파일에 저장되지 않습니다." 0
+foreach ($providerProfile in $script:apiProviders) {
+    $providerButton = $script:apiProviderButtons[[string]$providerProfile.Id]
+    Set-AccessibleControl $providerButton "$($providerProfile.Name) 번역 API 선택" "$($providerProfile.Description) 설정을 표시하고 번역 제공자로 선택합니다." 0
+}
+Set-AccessibleControl $txtDashboardApiKeys "선택한 제공자의 API 키" "한 줄에 하나씩 여러 API 키를 입력합니다. 이 값은 설정 파일에 저장되지 않습니다." 0
+Set-AccessibleControl $txtApiProviderUrl "Chat Completions API URL" "선택한 제공자의 HTTPS Chat Completions 주소입니다." 1
+Set-AccessibleControl $cmbApiProviderModel "번역 모델" "기본 모델을 선택하거나 모델 ID를 직접 입력합니다." 2
+Set-AccessibleControl $cmbApiProviderTemperature "번역 Temperature" "모델 기본값 또는 0에서 2 사이의 값을 입력합니다." 3
 Set-AccessibleControl $chkDashboardIncludePatches "Patches 폴더 포함" "모드의 Patches 폴더도 번역 대상으로 포함합니다." 1
 Set-AccessibleControl $chkDashboardDryRun "시험 실행" "파일을 쓰지 않고 번역 대상을 점검합니다." 2
 Set-AccessibleControl $cmbDashboardTheme "테마" "시스템 설정, 밝은 테마 또는 어두운 테마를 선택합니다." 3
@@ -5771,6 +6621,8 @@ $toolTip.SetToolTip($btnPending, "미번역으로 표시 (Ctrl+1)")
 $toolTip.SetToolTip($btnTranslated, "번역됨으로 표시 (Ctrl+2)")
 $toolTip.SetToolTip($btnApprove, "검토 완료로 표시 (Ctrl+3 또는 Ctrl+Shift+Enter)")
 $toolTip.SetToolTip($btnApproveNext, "검토 완료 후 다음 (Ctrl+Enter)")
+$toolTip.SetToolTip($btnApproveAll, "안전한 번역 전체를 검토 완료로 표시 (Ctrl+Shift+3)")
+$toolTip.SetToolTip($cmbSort, "내가 직접 편집한 번역을 번역 시각순으로 정렬")
 $toolTip.SetToolTip($chkApplyToRmk, "해제: 원본 모드 Languages\Korean · 선택: RMK 작업 클론")
 $toolTip.SetToolTip($btnApply, "검토 완료 상태만 선택한 대상에 반영합니다.")
 $toolTip.SetToolTip($btnApplyTranslated, "번역됨과 검토 완료 상태를 선택한 대상에 반영합니다.")
@@ -5780,6 +6632,7 @@ $toolTip.SetToolTip($cmbDashboardTextSize, "번역문, 기존 번역, AI 후보�
 
 Sync-DashboardSettingsFromMain
 Apply-TextSize
+Resize-DashboardSettingsLayout
 
 $form.Add_Resize({
     if ($script:layouting -or $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { return }
@@ -5791,7 +6644,7 @@ $form.Add_Resize({
     }
 })
 
-$autoSaveTimer = New-Object System.Windows.Forms.Timer
+$autoSaveTimer = [System.Windows.Forms.Timer]::new()
 $autoSaveTimer.Interval = 1200
 $autoSaveTimer.Add_Tick({
     $autoSaveTimer.Stop()
@@ -5805,14 +6658,14 @@ $autoSaveTimer.Add_Tick({
     }
 })
 
-$dashboardSearchTimer = New-Object System.Windows.Forms.Timer
+$dashboardSearchTimer = [System.Windows.Forms.Timer]::new()
 $dashboardSearchTimer.Interval = 180
 $dashboardSearchTimer.Add_Tick({
     $dashboardSearchTimer.Stop()
     Refresh-DashboardProjects
 })
 
-$searchTimer = New-Object System.Windows.Forms.Timer
+$searchTimer = [System.Windows.Forms.Timer]::new()
 $searchTimer.Interval = 160
 $searchTimer.Add_Tick({
     $searchTimer.Stop()
@@ -5864,7 +6717,23 @@ $btnDashboardAddMod.Add_Click({
     Show-Workspace
     Load-SourceOnlyForSelectedMod
 })
-$txtDashboardApiKeys.Add_TextChanged({ Sync-MainSettingsFromDashboard })
+$dashSettingsPage.Add_Resize({ Resize-DashboardSettingsLayout })
+$pnlApiSettings.Add_Resize({ Resize-ApiProviderSettingsLayout })
+$pnlRmkSettings.Add_Resize({ Resize-RmkSettingsLayout })
+foreach ($providerButton in $script:apiProviderButtons.Values) {
+    $providerButton.Add_Click({ Select-ApiProvider ([string]$this.Tag) })
+}
+$txtDashboardApiKeys.Add_TextChanged({
+    if ($script:syncingApiProvider) { return }
+    $script:apiProviderKeys[$script:selectedApiProviderId] = [string]$txtDashboardApiKeys.Text
+    Sync-MainSettingsFromDashboard
+})
+$txtApiProviderUrl.Add_Leave({ Save-CurrentApiProviderControls -Persist })
+$txtApiProviderCustomName.Add_Leave({ Save-CurrentApiProviderControls -Persist; Show-ApiProviderControls -ProviderId $script:selectedApiProviderId -SkipCurrentSave })
+$cmbApiProviderModel.Add_Leave({ Save-CurrentApiProviderControls -Persist })
+$cmbApiProviderModel.Add_SelectedIndexChanged({ if (-not $script:syncingApiProvider) { Save-CurrentApiProviderControls -Persist } })
+$cmbApiProviderTemperature.Add_Leave({ Save-CurrentApiProviderControls -Persist })
+$cmbApiProviderTemperature.Add_SelectedIndexChanged({ if (-not $script:syncingApiProvider) { Save-CurrentApiProviderControls -Persist } })
 $chkDashboardIncludePatches.Add_CheckedChanged({ Sync-MainSettingsFromDashboard })
 $chkDashboardDryRun.Add_CheckedChanged({ Sync-MainSettingsFromDashboard })
 $cmbDashboardTheme.Add_SelectedIndexChanged({ Apply-DashboardPreferences })
@@ -5932,11 +6801,20 @@ $txtTranslation.Add_Enter({
     $lblTranslationTitle.ForeColor = $script:accentColor
 })
 $txtTranslation.Add_Leave({
-    $lblTranslationTitle.Text = "번역문"
+    if ($script:currentRowIndex -ge 0 -and $script:currentRowIndex -lt $script:rows.Count) {
+        $originText = Get-TranslationOriginText ([string](Get-Decision $script:rows[$script:currentRowIndex]).translationOrigin)
+        $lblTranslationTitle.Text = "번역문  ·  $originText"
+    } else {
+        $lblTranslationTitle.Text = "번역문"
+    }
     $lblTranslationTitle.ForeColor = $script:mutedColor
+})
+$cmbSort.Add_SelectedIndexChanged({
+    if (-not $script:loading) { Refresh-ItemList -SelectRowIndex $script:currentRowIndex }
 })
 $txtTranslation.Add_TextChanged({
     if (-not $script:loading) {
+        if (-not $script:settingTranslationOrigin) { $script:translationEditorOrigin = "local" }
         $script:translationEditedByUser = -not [string]::Equals(
             (ConvertTo-FlatString $txtTranslation.Text),
             (ConvertTo-FlatString $script:translationEditBaseline),
@@ -5967,14 +6845,27 @@ $lvItems.Add_SelectedIndexChanged({
 
 $btnPrev.Add_Click({ Move-Selection -1 })
 $btnNext.Add_Click({ Move-Selection 1 })
-$btnUseCandidate.Add_Click({ if ($script:currentRowIndex -ge 0) { $txtTranslation.Text = ConvertTo-FlatString $script:rows[$script:currentRowIndex].candidate } })
-$btnUseExisting.Add_Click({ if ($script:currentRowIndex -ge 0) { $txtTranslation.Text = ConvertTo-FlatString $script:rows[$script:currentRowIndex].existing } })
+$btnUseCandidate.Add_Click({
+    if ($script:currentRowIndex -ge 0) {
+        Set-TranslationEditorValue -Text (ConvertTo-FlatString $script:rows[$script:currentRowIndex].candidate) -Origin "ai"
+    }
+})
+$btnUseExisting.Add_Click({
+    if ($script:currentRowIndex -ge 0) {
+        $row = $script:rows[$script:currentRowIndex]
+        $origin = Get-OptionalRowText -Row $row -Names @("existingOrigin")
+        Set-TranslationEditorValue -Text (ConvertTo-FlatString $row.existing) -Origin $(if ($origin) { $origin } else { "existing" })
+    }
+})
 $btnUseSource.Add_Click({ Copy-ToClipboard $txtTranslation.Text })
 $btnResetEdit.Add_Click({
     if ($script:currentRowIndex -ge 0) {
         $decision = Get-Decision $script:rows[$script:currentRowIndex]
         $script:loading = $true
-        try { $txtTranslation.Text = ConvertTo-FlatString $decision.text } finally { $script:loading = $false }
+        try {
+            $txtTranslation.Text = ConvertTo-FlatString $decision.text
+            $script:translationEditorOrigin = [string]$decision.translationOrigin
+        } finally { $script:loading = $false }
         $script:translationEditedByUser = $false
         $script:translationEditBaseline = ConvertTo-FlatString $decision.text
         $lblSave.Text = ""
@@ -5984,6 +6875,7 @@ $btnPending.Add_Click({ Mark-Current "pending" $false })
 $btnTranslated.Add_Click({ Mark-Current "translated" $false })
 $btnApprove.Add_Click({ Mark-Current "approved" $false })
 $btnApproveNext.Add_Click({ Mark-Current "approved" $true })
+$btnApproveAll.Add_Click({ Approve-AllSafeTranslations })
 
 $txtSource.Add_DoubleClick({ Copy-ToClipboard $txtSource.Text })
 $txtCandidate.Add_DoubleClick({ Copy-ToClipboard $txtCandidate.Text })
@@ -6016,7 +6908,9 @@ $form.Add_KeyDown({
         if (-not $dashboardPanel.Visible) { Mark-Current "translated" $false }
         $_.SuppressKeyPress = $true
     } elseif ($_.Control -and -not $_.Alt -and $_.KeyCode -in @([System.Windows.Forms.Keys]::D3, [System.Windows.Forms.Keys]::NumPad3)) {
-        if (-not $dashboardPanel.Visible) { Mark-Current "approved" $false }
+        if (-not $dashboardPanel.Visible) {
+            if ($_.Shift) { Approve-AllSafeTranslations } else { Mark-Current "approved" $false }
+        }
         $_.SuppressKeyPress = $true
     } elseif ($_.Alt -and -not $_.Control -and $_.KeyCode -in @([System.Windows.Forms.Keys]::D1, [System.Windows.Forms.Keys]::NumPad1)) {
         if (-not $dashboardPanel.Visible -and $script:currentRowIndex -ge 0 -and -not [string]::IsNullOrWhiteSpace([string]$script:rows[$script:currentRowIndex].candidate)) { $btnUseCandidate.PerformClick() }
@@ -6075,7 +6969,7 @@ $form.Add_KeyDown({
     }
 })
 
-$timer = New-Object System.Windows.Forms.Timer
+$timer = [System.Windows.Forms.Timer]::new()
 $timer.Interval = 250
 $timer.Add_Tick({
     foreach ($line in (Read-NewProcessLogLines)) {
@@ -6096,6 +6990,7 @@ $timer.Add_Tick({
 
         $script:processExitHandled = $true
         $exitCode = $script:process.ExitCode
+        $isSourceRefresh = $script:activeAiTranslationMode -eq "SourceOnly"
         $elapsed = if ($script:startedAt) { [Math]::Round(((Get-Date) - $script:startedAt).TotalSeconds, 1) } else { 0 }
         Add-Log "프로세스 종료. ExitCode=$exitCode, 경과 ${elapsed}s"
 
@@ -6106,13 +7001,21 @@ $timer.Add_Tick({
             if ($progressRun.Maximum -gt 0) { $progressRun.Value = $progressRun.Maximum }
             if ($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath -PathType Container)) {
                 try {
+                    if ($isSourceRefresh) {
+                        $lblRunStatus.Text = "원문 목록 구성 중"
+                        [System.Windows.Forms.Application]::DoEvents()
+                    }
                     $replaceExisting = $script:activeAiTranslationMode -eq "Overwrite"
                     Load-ReviewRoot $script:lastReviewOutputPath -SkipPreviousDecisions:$replaceExisting
                     Register-ProjectRun -ReviewRoot $script:lastReviewOutputPath -Provider $script:lastProvider
-                    $lblRunStatus.Text = "검수 결과 불러옴"
-                    if ($replaceExisting) {
+                    if ($isSourceRefresh) {
+                        $lblRunStatus.Text = "원문 로드 완료"
+                        Add-Log "원문 목록을 불러왔습니다. 기존 한국어 번역이 있으면 번역칸의 기본값으로 사용합니다."
+                    } elseif ($replaceExisting) {
+                        $lblRunStatus.Text = "검수 결과 불러옴"
                         Add-Log "새 번역 후보로 기존 검수 번역을 교체해 불러왔습니다. 이전 작업 기록은 보존됩니다."
                     } else {
+                        $lblRunStatus.Text = "검수 결과 불러옴"
                         Add-Log "기존 번역을 보존하고 새 번역 후보를 현재 화면에 불러왔습니다."
                     }
                 } catch {
@@ -6120,10 +7023,10 @@ $timer.Add_Tick({
                     Add-Log "검수 결과를 열지 못했습니다: $($_.Exception.Message)"
                 }
             } else {
-                $lblRunStatus.Text = "완료"
+                $lblRunStatus.Text = if ($isSourceRefresh) { "원문 로드 완료" } else { "완료" }
             }
         } else {
-            $lblRunStatus.Text = "종료 코드 $exitCode"
+            $lblRunStatus.Text = if ($isSourceRefresh) { "원문 로드 실패" } else { "종료 코드 $exitCode" }
         }
 
         try { $script:process.Dispose() } catch {}
@@ -6140,6 +7043,11 @@ $form.Add_FormClosing({
     if ($autoSaveTimer) { $autoSaveTimer.Stop() }
     if ($dashboardSearchTimer) { $dashboardSearchTimer.Stop() }
     if ($searchTimer) { $searchTimer.Stop() }
+    if ($script:startupCatalogTimer) {
+        $script:startupCatalogTimer.Stop()
+        $script:startupCatalogTimer.Dispose()
+        $script:startupCatalogTimer = $null
+    }
     Save-ProjectStatsCache
     if ($script:process -and -not $script:process.HasExited) {
         try { Stop-ProcessTree $script:process.Id } catch {}
@@ -6154,6 +7062,17 @@ $form.Add_FormClosing({
         }
         if ($result -eq [System.Windows.Forms.DialogResult]::Yes) { Save-Decisions }
     }
+    if ($script:textFingerprintSha256) {
+        try { $script:textFingerprintSha256.Dispose() } catch {}
+        $script:textFingerprintSha256 = $null
+    }
+})
+
+$form.Add_FormClosed({
+    foreach ($font in @($script:fontCache.Values)) {
+        try { $font.Dispose() } catch {}
+    }
+    $script:fontCache.Clear()
 })
 
 Ensure-AppDataStore
@@ -6171,7 +7090,7 @@ $form.Add_Shown({
     try {
         if ($LayoutSnapshotWidth -gt 0 -and $LayoutSnapshotHeight -gt 0) {
             $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
-            $form.ClientSize = New-Object System.Drawing.Size($LayoutSnapshotWidth, $LayoutSnapshotHeight)
+            $form.ClientSize = [System.Drawing.Size]::new($LayoutSnapshotWidth, $LayoutSnapshotHeight)
         }
         Apply-AppTheme
         if ($script:initialReviewRoot) {
@@ -6185,16 +7104,27 @@ $form.Add_Shown({
         [System.Windows.Forms.MessageBox]::Show("검토 결과를 열지 못했습니다.`r`n$($_.Exception.Message)", "RimWorld AI Translator") | Out-Null
     }
 
-    try {
-        Refresh-ModCatalog -PreferCache
-    } catch {
-        Add-Log "모드 자동 검색 실패: $($_.Exception.Message)"
-    }
     # RMK 폴더 탐색은 설정 탭, 번역 시작, 내보내기처럼 실제로 필요할 때 수행한다.
     Update-RmkControls
 
+    # 첫 화면을 먼저 그린 다음 모드 캐시를 검증한다. 느린 Steam 드라이브가 초기 창 표시를 막지 않는다.
+    $script:startupCatalogTimer = [System.Windows.Forms.Timer]::new()
+    $script:startupCatalogTimer.Interval = 50
+    $script:startupCatalogTimer.Add_Tick({
+        $script:startupCatalogTimer.Stop()
+        try {
+            Refresh-ModCatalog -PreferCache
+        } catch {
+            Add-Log "모드 자동 검색 실패: $($_.Exception.Message)"
+        } finally {
+            $script:startupCatalogTimer.Dispose()
+            $script:startupCatalogTimer = $null
+        }
+    })
+    $script:startupCatalogTimer.Start()
+
     if (-not [string]::IsNullOrWhiteSpace($script:layoutSnapshotPath)) {
-        $script:layoutSnapshotTimer = New-Object System.Windows.Forms.Timer
+        $script:layoutSnapshotTimer = [System.Windows.Forms.Timer]::new()
         $script:layoutSnapshotTimer.Interval = 1200
         $script:layoutSnapshotTimer.Add_Tick({
             $script:layoutSnapshotTimer.Stop()
@@ -6205,9 +7135,9 @@ $form.Add_Shown({
                 }
                 $form.Refresh()
                 [System.Windows.Forms.Application]::DoEvents()
-                $bitmap = New-Object System.Drawing.Bitmap($form.ClientSize.Width, $form.ClientSize.Height)
+                $bitmap = [System.Drawing.Bitmap]::new($form.ClientSize.Width, $form.ClientSize.Height)
                 try {
-                    $rect = New-Object System.Drawing.Rectangle(0, 0, $form.ClientSize.Width, $form.ClientSize.Height)
+                    $rect = [System.Drawing.Rectangle]::new(0, 0, $form.ClientSize.Width, $form.ClientSize.Height)
                     $form.DrawToBitmap($bitmap, $rect)
                     $bitmap.Save($script:layoutSnapshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
                 } finally {
@@ -6220,6 +7150,8 @@ $form.Add_Shown({
                     ($auditRows | ConvertTo-Json -Depth 5),
                     (New-Object System.Text.UTF8Encoding($false))
                 )
+                $runtimeLogPath = [System.IO.Path]::ChangeExtension($script:layoutSnapshotPath, ".runtime.log")
+                [System.IO.File]::WriteAllText($runtimeLogPath, [string]$txtLog.Text, [System.Text.UTF8Encoding]::new($false))
             } finally {
                 $form.Close()
             }

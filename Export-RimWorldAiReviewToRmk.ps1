@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$RmkEntryRoot,
 
@@ -19,6 +19,9 @@ try {
     $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 } catch {
 }
+
+$script:DisplayLocalizationFieldPattern = '^(label|labelshort|description|jobstring|reportstring|deathmessage|deathmessagefemale|deathmessagemale|letterlabel|lettertext|header|headertip|summary|formatstring|formatstringunfinalized|fixedname|reason|text|slateref)$'
+$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
 
 function Resolve-FullPath([string]$Path) {
     return [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path)
@@ -77,11 +80,29 @@ function Get-TextFingerprint([string]$Text) {
 
 function Get-ProtectedTokens([string]$Text) {
     $tokens = New-Object "System.Collections.Generic.HashSet[string]"
-    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b)'
+    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
     foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
         [void]$tokens.Add($match.Value)
     }
     return @($tokens)
+}
+
+function Test-InternalLocalizationIdentifierRow([object]$Row) {
+    if (-not $Row -or [string]::IsNullOrWhiteSpace([string]$Row.key) -or [string]$Row.kind -ne "DefInjected") { return $false }
+    $keyLower = ([string]$Row.key).Trim().ToLowerInvariant()
+    $typeLower = if ($Row.PSObject.Properties["defClass"] -and $Row.defClass) { ([string]$Row.defClass).Trim().ToLowerInvariant() } else { "" }
+    $fieldLower = if ($Row.PSObject.Properties["field"] -and $Row.field) { ([string]$Row.field).Trim().ToLowerInvariant() } else { ($keyLower -replace "^.*\.", "") }
+    $isDisplayField = $fieldLower -match $script:DisplayLocalizationFieldPattern
+    if ($fieldLower -match $script:TechnicalLocalizationFieldPattern) { return $true }
+    if ($keyLower -match "\.alienrace\.generalsettings\.alienpartgenerator\.colorchannels\.") { return $true }
+    if ($fieldLower -eq "name" -and $keyLower -match "\.alienrace\.") { return $true }
+    if ($keyLower -match "\.(graphicpaths?|rendernodes?|rendertree)\." -and -not $isDisplayField) { return $true }
+    return $typeLower -match "pawnrendertreedef" -and -not $isDisplayField
+}
+
+function Test-InvalidKoreanParticleNotation([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return $Text -match '(은\(는\)|는\(은\)|이\(가\)|가\(이\)|을\(를\)|를\(을\)|과\(와\)|와\(과\)|으로\(로\)|로\(으로\)|(?:\[[^\]\r\n]+\]|\{[^}\r\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:으로|은|는|이|가|을|를|과|와|로)(?=$|[\s.,!?…:;，。！？、]))'
 }
 
 function Test-ValidXmlElementName([string]$Name) {
@@ -94,19 +115,29 @@ function Test-ValidXmlElementName([string]$Name) {
     }
 }
 
-function Test-TranslationSafe([object]$Row, [string]$Translation) {
+function Test-TranslationStructureSafe([object]$Row, [string]$Translation) {
     $source = ConvertTo-FlatString $Row.source
     $translationText = ConvertTo-FlatString $Translation
+    if (Test-InternalLocalizationIdentifierRow $Row) { return $false }
     if ([string]::IsNullOrWhiteSpace($translationText)) { return $false }
-    if ([string]::Equals($source, $translationText, [System.StringComparison]::Ordinal)) { return $false }
-    if ($translationText -notmatch "[\uAC00-\uD7AF]") { return $false }
+    if (Test-InvalidKoreanParticleNotation $translationText) { return $false }
     if ($translationText -match "(\r?\n\s*){8,}" -or $translationText -match "(\\u000a\s*){8,}") { return $false }
     $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($translationText, "\r?\n").Count
     if ($newlineCount -ge 20 -and $translationText.Length -lt 4000) { return $false }
     foreach ($token in (Get-ProtectedTokens $source)) {
         if (-not $translationText.Contains($token)) { return $false }
     }
+    $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
+    if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($translationText, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) { return $false }
     return $true
+}
+
+function Test-TranslationSafe([object]$Row, [string]$Translation) {
+    $source = ConvertTo-FlatString $Row.source
+    $translationText = ConvertTo-FlatString $Translation
+    if (-not (Test-TranslationStructureSafe -Row $Row -Translation $translationText)) { return $false }
+    if ([string]::Equals($source, $translationText, [System.StringComparison]::Ordinal)) { return $false }
+    return $translationText -match "[\uAC00-\uD7AF]"
 }
 
 function Test-StatusIncluded([string]$Status, [string]$Mode) {

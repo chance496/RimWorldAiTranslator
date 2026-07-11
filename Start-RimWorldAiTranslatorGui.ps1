@@ -22,10 +22,10 @@ if (-not (Test-Path -LiteralPath $powershellExe -PathType Leaf)) {
     throw "Windows PowerShell was not found at the expected system path: $powershellExe"
 }
 
-$args = @("-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", $reviewGuiScript)
+$launchArguments = @("-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", $reviewGuiScript)
 if (-not [string]::IsNullOrWhiteSpace($ReviewRoot)) {
-    $args += @("-ReviewRoot", $ReviewRoot)
+    $launchArguments += @("-ReviewRoot", $ReviewRoot)
 }
 
-& $powershellExe @args
+& $powershellExe @launchArguments
 exit $LASTEXITCODE

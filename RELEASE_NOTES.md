@@ -1,7 +1,35 @@
+# RimWorld AI Translator v0.2.0
+
+## Changes
+
+- Added persistent translation provenance for RMK imports, existing mod translations, AI drafts, and manual local edits.
+- Added RMK XLSX source-history comparison by `Def Class + Node`; stale RMK translations become updated and untranslated on first import.
+- Compare RMK language-folder history only against a matching current language folder; direct Def values are compared as the mod's actual source so a Def source-language change is still flagged for review.
+- Added RMK/local-origin filters and newest/oldest sorting based only on the time a user actually edited a translation.
+- Added a bulk review-complete action that skips blank translations, changed sources, and safety warnings.
+- Fixed Windows PowerShell failing with `Argument types do not match` when an RMK workbook contains tens of thousands of rows.
+- Replaced cell-by-cell XLSX and recursive Def parsing with bounded, DTD-disabled .NET readers; Medieval 2 source refresh dropped from a 17.6-second failure to a successful roughly 3.0-second runner pass.
+- Precompiled the native XML/XLSX reader into the release package and retained source compilation only as a development fallback, removing repeated runtime C# compilation.
+- Streamed large RMK shared-string and worksheet XML instead of materializing the whole sheet, while preserving file-size, DTD, entity, and path-traversal limits.
+- Added `LoadFolders.xml` content-root support so shared languages, versioned Defs, and optional integration folders are scanned as one project.
+- Moved source refresh to the cancellable background runner so the main window remains responsive.
+- Reduced a measured 1,797-row review load from 8.19 seconds to about 1.0-1.2 seconds by avoiding repeat decision normalization, indexing repeated paths, caching row state, and replacing hundreds of nested card controls with a full owner-drawn virtual list.
+- Added sparse, compact review-state persistence so auto-save stores AI/local edits and changed statuses without rebuilding every default RMK or mod translation.
+- Deferred Steam mod-cache validation until after first paint and added an immediate native startup window; the packaged EXE showed visible feedback in roughly 0.1-0.22 seconds in local tests.
+- Reused fonts and direct .NET constructors across static and review controls, reducing startup allocations and GDI object churn.
+- Hardened launcher argument quoting and fixed its Korean startup error messages.
+
 # RimWorld AI Translator v0.1.18
 
 ## Changes
 
+- Added provider-based translation settings for Cerebras, OpenAI, Gemini, DeepSeek, Qwen, Groq, Mistral, OpenRouter, BigModel / Z.AI, custom OpenAI-compatible endpoints, and keyless Google Translate.
+- Added editable per-provider API URLs, model presets, temperature settings, and in-memory multi-key rotation without persisting API keys.
+- Fixed versioned `LoadFolders.xml` mods such as Kiiro Race resolving to the Workshop root instead of the active `1.6` content folder.
+- Reworked project cards and compact review layouts to prevent progress bars, buttons, and reference tabs from overlapping at smaller resolutions.
+- Excluded definite internal `DefInjected` identifiers such as AlienRace color-channel names and non-display `PawnRenderTreeDef` fields from AI translation and review lists, with an audit record of every exclusion.
+- Protected RimWorld grammar-rule prefixes such as `r_logentry->` and require them to remain unchanged at the start of translated values before apply or RMK export.
+- Added RimWorld Korean automatic-particle guidance to AI prompts and block reversed forms such as `이(가)` or `은(는)` during review, direct apply, and RMK export; valid forms include `(이)가` and `(은)는`.
 - Added local RMK integration that discovers the Steam subscription and a `bus` branch working clone by Workshop or Package ID.
 - Reuses RMK translations as editable defaults and sends only missing strings to AI translation.
 - Added an `RMK에 적용` destination checkbox: unchecked writes to the original mod, while checked merges the same reviewed statuses into the RMK working clone.

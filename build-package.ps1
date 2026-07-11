@@ -4,13 +4,19 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Write-Verbose "Build configuration: $Configuration"
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $distRoot = Join-Path $projectRoot "dist"
 $packageRoot = Join-Path $distRoot "RimWorldAiTranslator"
 $zipPath = Join-Path $distRoot "RimWorldAiTranslator.zip"
+$launcherBuildRoot = Join-Path $distRoot "_launcher-build"
 $launcherSource = Join-Path $projectRoot "launcher\RimWorldAiTranslatorLauncher.cs"
-$launcherExe = Join-Path $projectRoot "RimWorldAiTranslator.exe"
+$launcherExe = Join-Path $launcherBuildRoot "RimWorldAiTranslator.exe"
+$projectLauncherExe = Join-Path $projectRoot "RimWorldAiTranslator.exe"
+$nativeSource = Join-Path $projectRoot "native\RimWorldTranslatorNative.cs"
+$nativeDll = Join-Path $launcherBuildRoot "RimWorldAiTranslator.Native.dll"
+$projectNativeDll = Join-Path $projectRoot "RimWorldAiTranslator.Native.dll"
 
 function Assert-SafeBuildPath([string]$Path) {
     $projectFull = [System.IO.Path]::GetFullPath($projectRoot).TrimEnd("\", "/")
@@ -29,6 +35,13 @@ function Assert-SafeBuildPath([string]$Path) {
 
 Assert-SafeBuildPath $distRoot
 Assert-SafeBuildPath $packageRoot
+Assert-SafeBuildPath $launcherBuildRoot
+
+if (Test-Path -LiteralPath $launcherBuildRoot) {
+    Get-ChildItem -LiteralPath $launcherBuildRoot -Force | Remove-Item -Recurse -Force
+} else {
+    New-Item -ItemType Directory -Force -Path $launcherBuildRoot | Out-Null
+}
 
 $cscCandidates = @(
     (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
@@ -46,11 +59,42 @@ if (-not $csc) {
     /platform:anycpu `
     /codepage:65001 `
     /reference:System.Windows.Forms.dll `
+    /reference:System.Drawing.dll `
     /out:$launcherExe `
     $launcherSource
 
 if ($LASTEXITCODE -ne 0) {
     throw "Launcher build failed with exit code $LASTEXITCODE."
+}
+
+& $csc `
+    /nologo `
+    /target:library `
+    /optimize+ `
+    /platform:anycpu `
+    /codepage:65001 `
+    /reference:System.dll `
+    /reference:System.Core.dll `
+    /reference:System.Xml.dll `
+    /reference:System.Xml.Linq.dll `
+    /reference:System.IO.Compression.dll `
+    /reference:System.IO.Compression.FileSystem.dll `
+    /out:$nativeDll `
+    $nativeSource
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Native reader build failed with exit code $LASTEXITCODE."
+}
+
+try {
+    Copy-Item -LiteralPath $launcherExe -Destination $projectLauncherExe -Force -ErrorAction Stop
+} catch {
+    Write-Warning "The development launcher is currently in use and was not replaced. The packaged launcher is still current."
+}
+try {
+    Copy-Item -LiteralPath $nativeDll -Destination $projectNativeDll -Force -ErrorAction Stop
+} catch {
+    Write-Warning "The development native reader is currently in use and was not replaced. The packaged reader is still current."
 }
 
 if (Test-Path -LiteralPath $packageRoot) {
@@ -61,6 +105,7 @@ if (Test-Path -LiteralPath $packageRoot) {
 
 $packageFiles = @(
     "RimWorldAiTranslator.exe",
+    "RimWorldAiTranslator.Native.dll",
     "Start-RimWorldAiTranslatorGui.ps1",
     "Start-RimWorldAiTranslatorGui.cmd",
     "Start-RimWorldAiReviewGui.ps1",
@@ -77,7 +122,13 @@ $packageFiles = @(
 )
 
 foreach ($file in $packageFiles) {
-    $source = Join-Path $projectRoot $file
+    $source = if ($file -eq "RimWorldAiTranslator.exe") {
+        $launcherExe
+    } elseif ($file -eq "RimWorldAiTranslator.Native.dll") {
+        $nativeDll
+    } else {
+        Join-Path $projectRoot $file
+    }
     if (-not (Test-Path -LiteralPath $source)) {
         throw "Missing package file: $file"
     }
@@ -88,6 +139,9 @@ if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
 Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -Force
+
+Get-ChildItem -LiteralPath $launcherBuildRoot -Force | Remove-Item -Recurse -Force
+Remove-Item -LiteralPath $launcherBuildRoot -Force
 
 Write-Host "Package folder: $packageRoot"
 Write-Host "Package zip:    $zipPath"

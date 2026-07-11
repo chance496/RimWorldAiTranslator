@@ -38,8 +38,12 @@ $payload = [System.IO.File]::ReadAllText($argumentFull, [System.Text.Encoding]::
 $allowedParameters = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($name in @(
     "ModRoot", "LanguageFolderName", "SourceLanguageFolder", "ReviewOnly", "ReviewRoot",
-    "BatchSize", "MaxGeneratedGlossaryTermsPerBatch", "ReferenceLanguageRoot",
-    "TranslateMissingOnly", "PreserveTranslationFile", "IncludePatches", "DryRun"
+    "BatchSize", "MaxGeneratedGlossaryTermsPerBatch", "ReferenceLanguageRoot", "ReferenceSourceWorkbook",
+    "TranslateMissingOnly", "PreserveTranslationFile", "IncludePatches", "DryRun", "SourceOnly",
+    "TranslationProvider", "ProviderName", "BaseUrl", "Model", "Temperature",
+    "ResponseFormatMode", "CompletionTokenParameter", "ReasoningEffort",
+    "RequestsPerMinutePerKey", "InputTokensPerMinutePerKey", "DailyTokenBudgetPerKey",
+    "MaxCompletionTokens"
 )) { [void]$allowedParameters.Add($name) }
 $parameters = @{}
 if (-not $payload.parameters) { throw "ArgumentFile does not contain parameters." }
