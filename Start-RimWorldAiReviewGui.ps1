@@ -67,6 +67,14 @@ $script:decisions = @{}
 $script:validationCache = @{}
 $script:fileGroups = @()
 $script:reviewStats = $null
+$script:projectStatsCache = @{}
+$script:projectStatsCacheDirty = $false
+$script:dashboardProjectsDirty = $true
+$script:lastDashboardRenderKey = ""
+$script:appliedThemeSignature = ""
+$script:windowsDarkModeCacheValid = $false
+$script:windowsDarkModeCached = $false
+$script:windowsDarkModeCheckedAt = [datetime]::MinValue
 $script:visibleRowIndexes = @()
 $script:maxRenderedCards = 80
 $script:currentRowIndex = -1
@@ -85,6 +93,7 @@ $script:appDataRoot = Join-Path $env:LOCALAPPDATA "RimWorldAiTranslator"
 $script:projectStorePath = Join-Path $script:appDataRoot "projects.json"
 $script:settingsPath = Join-Path $script:appDataRoot "settings.json"
 $script:modCatalogCachePath = Join-Path $script:appDataRoot "mod-catalog.json"
+$script:projectStatsCachePath = Join-Path $script:appDataRoot "project-stats.json"
 $script:appReviewRoot = Join-Path $script:appDataRoot "reviews"
 $script:themeMode = "System"
 $script:textSize = 10
@@ -231,12 +240,18 @@ function Get-AccessibilityAuditRows([System.Windows.Forms.Control]$Parent, [stri
 function Get-IsWindowsDarkMode {
     if ($script:themeMode -eq "Dark") { return $true }
     if ($script:themeMode -eq "Light") { return $false }
+    if ($script:windowsDarkModeCacheValid -and ((Get-Date) - $script:windowsDarkModeCheckedAt).TotalSeconds -lt 5) {
+        return $script:windowsDarkModeCached
+    }
     try {
         $value = (Get-ItemProperty -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name AppsUseLightTheme -ErrorAction Stop).AppsUseLightTheme
-        return [int]$value -eq 0
+        $script:windowsDarkModeCached = [int]$value -eq 0
     } catch {
-        return $false
+        $script:windowsDarkModeCached = $false
     }
+    $script:windowsDarkModeCheckedAt = Get-Date
+    $script:windowsDarkModeCacheValid = $true
+    return $script:windowsDarkModeCached
 }
 
 function Ensure-AppDataStore {
@@ -503,18 +518,83 @@ function Get-TextFingerprint([string]$Text) {
     }
 }
 
+function Invalidate-DashboardProjectData([string]$ProjectId = "") {
+    $script:dashboardProjectsDirty = $true
+    if ($ProjectId -and $script:projectStatsCache.ContainsKey($ProjectId)) {
+        $script:projectStatsCache.Remove($ProjectId)
+        $script:projectStatsCacheDirty = $true
+    }
+}
+
+function Load-ProjectStatsCache {
+    $script:projectStatsCache = @{}
+    $script:projectStatsCacheDirty = $false
+    if (-not (Test-Path -LiteralPath $script:projectStatsCachePath -PathType Leaf)) { return }
+    try {
+        $json = [System.IO.File]::ReadAllText($script:projectStatsCachePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ([int]$json.version -ne 1) { return }
+        foreach ($entry in @($json.entries)) {
+            if (-not $entry -or [string]::IsNullOrWhiteSpace([string]$entry.projectId) -or
+                [string]::IsNullOrWhiteSpace([string]$entry.stamp) -or -not $entry.stats) { continue }
+            $script:projectStatsCache[[string]$entry.projectId] = [pscustomobject]@{
+                Stamp = [string]$entry.stamp
+                Stats = $entry.stats
+            }
+        }
+    } catch {
+        $script:projectStatsCache = @{}
+    }
+}
+
+function Save-ProjectStatsCache {
+    if (-not $script:projectStatsCacheDirty) { return }
+    try {
+        Ensure-AppDataStore
+        $entries = foreach ($projectId in @($script:projectStatsCache.Keys | Sort-Object)) {
+            $entry = $script:projectStatsCache[$projectId]
+            if (-not $entry -or -not $entry.Stats -or [string]::IsNullOrWhiteSpace([string]$entry.Stamp)) { continue }
+            [ordered]@{
+                projectId = [string]$projectId
+                stamp = [string]$entry.Stamp
+                stats = $entry.Stats
+            }
+        }
+        $payload = [ordered]@{ version = 1; entries = @($entries) }
+        [System.IO.File]::WriteAllText(
+            $script:projectStatsCachePath,
+            ($payload | ConvertTo-Json -Depth 7),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $script:projectStatsCacheDirty = $false
+    } catch {
+    }
+}
+
 function Load-ProjectStore {
     Ensure-AppDataStore
-    if (-not (Test-Path -LiteralPath $script:projectStorePath)) {
-        $script:projects = @()
-        return
+    $script:dashboardProjectsDirty = $true
+    $script:projects = @()
+    if (Test-Path -LiteralPath $script:projectStorePath -PathType Leaf) {
+        try {
+            $json = [System.IO.File]::ReadAllText($script:projectStorePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $script:projects = @($json.projects)
+        } catch {
+            $script:projects = @()
+        }
     }
-    try {
-        $json = [System.IO.File]::ReadAllText($script:projectStorePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-        $script:projects = @($json.projects)
-    } catch {
-        $script:projects = @()
+
+    Load-ProjectStatsCache
+    $activeProjectIds = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($project in @($script:projects)) {
+        if ($project -and $project.id) { [void]$activeProjectIds.Add([string]$project.id) }
     }
+    foreach ($projectId in @($script:projectStatsCache.Keys)) {
+        if (-not $activeProjectIds.Contains([string]$projectId)) {
+            $script:projectStatsCache.Remove($projectId)
+            $script:projectStatsCacheDirty = $true
+        }
+    }
+    Save-ProjectStatsCache
 }
 
 function Save-ProjectStore {
@@ -525,6 +605,7 @@ function Save-ProjectStore {
         projects = @($script:projects)
     }
     $payload | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $script:projectStorePath -Encoding UTF8
+    $script:dashboardProjectsDirty = $true
 }
 
 function Get-ProjectIdForMod([string]$ModRoot, [string]$PackageId = "", [string]$WorkshopId = "") {
@@ -576,6 +657,29 @@ function Get-SelectedProject {
     return $null
 }
 
+function Test-ReviewRootBelongsToProject([object]$Project, [string]$ReviewRoot) {
+    if (-not $Project -or [string]::IsNullOrWhiteSpace($ReviewRoot)) { return $false }
+    try {
+        $reviewFull = [System.IO.Path]::GetFullPath($ReviewRoot).TrimEnd("\", "/")
+    } catch {
+        return $false
+    }
+
+    $candidateRoots = New-Object "System.Collections.Generic.List[string]"
+    if ($Project.latestReviewRoot) { [void]$candidateRoots.Add([string]$Project.latestReviewRoot) }
+    foreach ($run in @($Project.runs)) {
+        if ($run -and $run.reviewRoot) { [void]$candidateRoots.Add([string]$run.reviewRoot) }
+    }
+    foreach ($candidateRoot in $candidateRoots) {
+        try {
+            $candidateFull = [System.IO.Path]::GetFullPath($candidateRoot).TrimEnd("\", "/")
+            if ($reviewFull.Equals($candidateFull, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        } catch {
+        }
+    }
+    return $false
+}
+
 function Get-ActiveProjectModRoot([switch]$Require) {
     $path = ""
     $project = Get-SelectedProject
@@ -618,8 +722,184 @@ function Set-ActiveProject([object]$Project) {
     if ($btnApply) { $btnApply.Enabled = [bool]($script:reviewRoot -and (Test-Path -LiteralPath $script:reviewRoot) -and $hasProjectMod) }
     if ($btnApplyTranslated) { $btnApplyTranslated.Enabled = [bool]($script:reviewRoot -and (Test-Path -LiteralPath $script:reviewRoot) -and $hasProjectMod) }
     Refresh-ProjectList
+}
+
+function Test-PathStrictlyInsideRoot([string]$Path, [string]$Root) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Root)) { return $false }
+    try {
+        $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd("\", "/")
+        $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd("\", "/")
+        $prefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
+        return $pathFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+function Test-PathContainsReparsePoint([string]$Path, [string]$StopRoot) {
+    try {
+        $current = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $stopFull = [System.IO.Path]::GetFullPath($StopRoot).TrimEnd("\", "/")
+        while ($current) {
+            if (($current.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            $currentFull = [System.IO.Path]::GetFullPath($current.FullName).TrimEnd("\", "/")
+            if ($currentFull.Equals($stopFull, [System.StringComparison]::OrdinalIgnoreCase)) { break }
+            $parentPath = Split-Path -Parent $current.FullName
+            if (-not $parentPath) { break }
+            $current = Get-Item -LiteralPath $parentPath -Force -ErrorAction Stop
+        }
+    } catch {
+        return $true
+    }
+    return $false
+}
+
+function Get-AppOwnedReviewRoots {
+    $roots = New-Object "System.Collections.Generic.List[string]"
+    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($candidate in @($script:appReviewRoot, (Join-Path $scriptRoot "reviews"))) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        try { $full = [System.IO.Path]::GetFullPath($candidate).TrimEnd("\", "/") } catch { continue }
+        if ($seen.Add($full)) { [void]$roots.Add($full) }
+    }
+    return $roots.ToArray()
+}
+
+function Get-AppOwnedReviewDirectory([string]$Path, [object]$Project = $null) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Container)) { return "" }
+    try { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd("\", "/") } catch { return "" }
+    if ($Project -and $Project.modRoot) {
+        $modRoot = [string]$Project.modRoot
+        try { $modFull = [System.IO.Path]::GetFullPath($modRoot).TrimEnd("\", "/") } catch { return "" }
+        if ($full.Equals($modFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+            (Test-PathStrictlyInsideRoot -Path $full -Root $modRoot)) {
+            return ""
+        }
+    }
+    foreach ($root in Get-AppOwnedReviewRoots) {
+        if (-not (Test-PathStrictlyInsideRoot -Path $full -Root $root)) { continue }
+        if (Test-PathContainsReparsePoint -Path $full -StopRoot $root) { return "" }
+        return $full
+    }
+    return ""
+}
+
+function Write-ProjectReviewMarker([object]$Project, [string]$ReviewRoot) {
+    if (-not $Project -or -not $Project.id) { return }
+    $safeRoot = Get-AppOwnedReviewDirectory -Path $ReviewRoot -Project $Project
+    if (-not $safeRoot) { return }
+    try {
+        $marker = [ordered]@{
+            version = 1
+            projectId = [string]$Project.id
+            modRoot = [string]$Project.modRoot
+            workshopId = [string]$Project.workshopId
+            createdAt = (Get-Date).ToString("o")
+        }
+        [System.IO.File]::WriteAllText(
+            (Join-Path $safeRoot ".rimworld-ai-project.json"),
+            ($marker | ConvertTo-Json -Depth 4),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+    } catch {
+        Add-Log "프로젝트 검수 기록 표식 저장 실패: $($_.Exception.Message)"
+    }
+}
+
+function Get-ProjectCleanupPlan([object]$Project) {
+    $safePaths = New-Object "System.Collections.Generic.List[string]"
+    $unsafePaths = New-Object "System.Collections.Generic.List[string]"
+    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    $recorded = New-Object "System.Collections.Generic.List[string]"
+    if ($Project.latestReviewRoot) { [void]$recorded.Add([string]$Project.latestReviewRoot) }
+    foreach ($run in @($Project.runs)) {
+        if ($run -and $run.reviewRoot) { [void]$recorded.Add([string]$run.reviewRoot) }
+    }
+
+    foreach ($path in $recorded) {
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
+        try { $full = [System.IO.Path]::GetFullPath($path).TrimEnd("\", "/") } catch { [void]$unsafePaths.Add($path); continue }
+        if (-not $seen.Add($full)) { continue }
+        $safe = Get-AppOwnedReviewDirectory -Path $full -Project $Project
+        if ($safe) { [void]$safePaths.Add($safe) } else { [void]$unsafePaths.Add($full) }
+    }
+
+    foreach ($root in Get-AppOwnedReviewRoots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        foreach ($directory in Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue) {
+            $markerPath = Join-Path $directory.FullName ".rimworld-ai-project.json"
+            if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { continue }
+            try {
+                $marker = [System.IO.File]::ReadAllText($markerPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                if ([string]$marker.projectId -ne [string]$Project.id) { continue }
+                $safe = Get-AppOwnedReviewDirectory -Path $directory.FullName -Project $Project
+                if ($safe -and $seen.Add($safe)) { [void]$safePaths.Add($safe) }
+            } catch {
+            }
+        }
+    }
+    return [pscustomobject]@{ SafePaths = $safePaths.ToArray(); UnsafePaths = $unsafePaths.ToArray() }
+}
+
+function Remove-AppOwnedProjectReviewDirectories([object]$Project, [string[]]$Paths) {
+    $failures = New-Object "System.Collections.Generic.List[string]"
+    foreach ($path in @($Paths)) {
+        $verified = Get-AppOwnedReviewDirectory -Path $path -Project $Project
+        if (-not $verified) { [void]$failures.Add("안전 경계 재확인 실패: $path"); continue }
+        try {
+            Remove-Item -LiteralPath $verified -Recurse -Force -ErrorAction Stop
+        } catch {
+            [void]$failures.Add("$verified : $($_.Exception.Message)")
+        }
+    }
+    return $failures.ToArray()
+}
+
+function Remove-TranslationProject([object]$Project) {
+    if (-not $Project -or -not $Project.id) { return }
+    if ($script:process -and -not $script:process.HasExited -and [string]$Project.id -eq [string]$script:selectedProjectId) {
+        [System.Windows.Forms.MessageBox]::Show("이 프로젝트의 번역이 실행 중입니다. 먼저 번역을 중지한 뒤 삭제하세요.", "프로젝트 삭제") | Out-Null
+        return
+    }
+
+    $plan = Get-ProjectCleanupPlan $Project
+    if (@($plan.UnsafePaths).Count -gt 0) {
+        $unsafeText = [string]::Join("`r`n", @($plan.UnsafePaths | Select-Object -First 5))
+        [System.Windows.Forms.MessageBox]::Show("앱 전용 검수 폴더 밖의 기록이 있어 안전하게 삭제할 수 없습니다.`r`n`r`n$unsafeText", "프로젝트 삭제 중단", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return
+    }
+
+    $name = if ($Project.name) { [string]$Project.name } else { "이름 없는 프로젝트" }
+    $message = "'$name' 프로젝트를 삭제합니다.`r`n`r`n삭제 항목:`r`n- 프로젝트 등록 정보`r`n- 로컬 검수 작업 폴더 $(@($plan.SafePaths).Count)개`r`n`r`n보존 항목:`r`n- 원본 모드 폴더 전체`r`n- 모드의 Languages\Korean 번역`r`n`r`n계속할까요?"
+    $answer = [System.Windows.Forms.MessageBox]::Show($message, "프로젝트 삭제", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    $failures = @(Remove-AppOwnedProjectReviewDirectories -Project $Project -Paths @($plan.SafePaths))
+    if ($failures.Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show("일부 검수 폴더를 삭제하지 못해 프로젝트 등록은 유지했습니다.`r`n`r`n$([string]::Join("`r`n", $failures))", "프로젝트 삭제 실패", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return
+    }
+
+    $script:projects = @($script:projects | Where-Object { [string]$_.id -ne [string]$Project.id })
+    if ([string]$script:selectedProjectId -eq [string]$Project.id) {
+        $script:selectedProjectId = ""
+        $script:selectedModRoot = ""
+        $script:reviewRoot = ""
+        $script:comparisonFile = ""
+        $script:rows = @()
+        $script:decisions = @{}
+        $script:reviewStats = $null
+        $script:currentRowIndex = -1
+        if ($btnApply) { $btnApply.Enabled = $false }
+        if ($btnApplyTranslated) { $btnApplyTranslated.Enabled = $false }
+    }
+    Invalidate-DashboardProjectData ([string]$Project.id)
+    Save-ProjectStore
+    Save-ProjectStatsCache
+    Refresh-ProjectList
     Refresh-DashboardProjects
     Refresh-DashboardActivity
+    Add-Log "프로젝트 삭제 완료: $name (원본 모드와 Korean 폴더 보존)"
 }
 
 function Register-ProjectRun([string]$ReviewRoot, [string]$Provider = "") {
@@ -660,12 +940,16 @@ function Register-ProjectRun([string]$ReviewRoot, [string]$Provider = "") {
         if (@($project.runs).Count -gt 40) {
             $project.runs = @($project.runs | Select-Object -Last 40)
         }
+        Write-ProjectReviewMarker -Project $project -ReviewRoot $project.latestReviewRoot
     }
     $project.updatedAt = (Get-Date).ToString("o")
     Save-ProjectStore
     Refresh-ProjectList
-    Refresh-DashboardProjects
-    Refresh-DashboardActivity
+    Invalidate-DashboardProjectData ([string]$project.id)
+    if ($dashboardPanel -and $dashboardPanel.Visible) {
+        Refresh-DashboardProjects
+        Refresh-DashboardActivity
+    }
 }
 
 function Mark-ProjectApplied {
@@ -679,8 +963,11 @@ function Mark-ProjectApplied {
     }
     Save-ProjectStore
     Refresh-ProjectList
-    Refresh-DashboardProjects
-    Refresh-DashboardActivity
+    Invalidate-DashboardProjectData ([string]$script:selectedProjectId)
+    if ($dashboardPanel -and $dashboardPanel.Visible) {
+        Refresh-DashboardProjects
+        Refresh-DashboardActivity
+    }
 }
 
 function Add-UniqueExistingDirectory($List, $Seen, [string]$Path) {
@@ -904,6 +1191,22 @@ function Test-ModContainerState([object[]]$Cached, [object[]]$Current) {
     return $true
 }
 
+function Test-ModContainerStateFast([object[]]$Cached) {
+    $cachedRows = @($Cached)
+    if ($cachedRows.Count -eq 0) { return $false }
+    foreach ($row in $cachedRows) {
+        $path = [string]$row.path
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Container)) { return $false }
+        try {
+            $item = Get-Item -LiteralPath $path -ErrorAction Stop
+            if ([string]$row.lastWriteUtc -ne $item.LastWriteTimeUtc.ToString("o")) { return $false }
+        } catch {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Save-ModCatalogCache {
     try {
         Ensure-AppDataStore
@@ -923,13 +1226,17 @@ function Save-ModCatalogCache {
     }
 }
 
-function Try-LoadModCatalogCache {
+function Try-LoadModCatalogCache([switch]$FastValidation) {
     if (-not (Test-Path -LiteralPath $script:modCatalogCachePath -PathType Leaf)) { return $false }
     try {
         $cache = [System.IO.File]::ReadAllText($script:modCatalogCachePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
         if ([int]$cache.version -ne 1) { return $false }
-        $currentState = @(Get-ModContainerState)
-        if (-not (Test-ModContainerState -Cached @($cache.containers) -Current $currentState)) { return $false }
+        if ($FastValidation) {
+            if (-not (Test-ModContainerStateFast -Cached @($cache.containers))) { return $false }
+        } else {
+            $currentState = @(Get-ModContainerState)
+            if (-not (Test-ModContainerState -Cached @($cache.containers) -Current $currentState)) { return $false }
+        }
         $script:modCatalog = @($cache.mods | Sort-Object @{ Expression = "Name"; Ascending = $true }, @{ Expression = "Folder"; Ascending = $true })
         return $true
     } catch {
@@ -1106,7 +1413,7 @@ function Get-TranslationValidation([object]$Row, [string]$Translation) {
 }
 
 function Get-TranslationValidationCacheEntry([object]$Row, [string]$Translation) {
-    $identity = Get-RowIdentity $Row
+    $identity = "$([string]$script:reviewRoot)|$(Get-RowIdentity $Row)"
     $source = ConvertTo-FlatString $Row.source
     $translationText = ConvertTo-FlatString $Translation
     if ($script:validationCache.ContainsKey($identity)) {
@@ -1168,6 +1475,112 @@ function Get-RelativeTarget([object]$Row) {
     } catch {
     }
     return $target
+}
+
+function Get-OptionalRowText([object]$Row, [string[]]$Names) {
+    if (-not $Row) { return "" }
+    foreach ($name in $Names) {
+        $property = $Row.PSObject.Properties[$name]
+        if (-not $property) { continue }
+        $value = ConvertTo-FlatString $property.Value
+        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value.Trim() }
+    }
+    return ""
+}
+
+function Get-DefClassDescription([string]$DefClass) {
+    $normalized = if ($DefClass) { $DefClass.ToLowerInvariant() } else { "" }
+    switch ($normalized) {
+        "abilitydef" { return "능력의 이름, 설명과 작동 정보를 정의합니다" }
+        "biomedef" { return "생태계와 지형 환경을 정의합니다" }
+        "damagedef" { return "피해 유형, 방어 판정과 사망 메시지를 정의합니다" }
+        "factiondef" { return "세력의 이름, 성격과 관계 정보를 정의합니다" }
+        "genedef" { return "유전자와 그 효과를 정의합니다" }
+        "hediffdef" { return "부상, 질병과 건강 상태를 정의합니다" }
+        "incidentdef" { return "습격이나 사건 같은 월드 이벤트를 정의합니다" }
+        "jobdef" { return "폰이 수행하는 작업 행동을 정의합니다" }
+        "letterdef" { return "게임 내 편지와 알림 형식을 정의합니다" }
+        "memedef" { return "이데올로기 밈과 관련 규칙을 정의합니다" }
+        "pawnkinddef" { return "등장하는 폰이나 생물의 종류를 정의합니다" }
+        "preceptdef" { return "이데올로기 규율과 의례를 정의합니다" }
+        "questscriptdef" { return "퀘스트의 생성 규칙과 문구를 정의합니다" }
+        "recipedef" { return "제작, 가공과 수술 작업을 정의합니다" }
+        "researchprojectdef" { return "연구 과제와 해금 내용을 정의합니다" }
+        "rulepackdef" { return "이름이나 문장을 조합하는 언어 규칙을 정의합니다" }
+        "terraindef" { return "바닥과 지형의 표시 및 속성을 정의합니다" }
+        "thingdef" { return "아이템, 건물, 식물과 생물 같은 게임 대상을 정의합니다" }
+        "thoughtdef" { return "폰의 기분에 영향을 주는 생각을 정의합니다" }
+        "traitdef" { return "폰의 특성과 단계별 효과를 정의합니다" }
+        default {
+            if ([string]::IsNullOrWhiteSpace($DefClass)) { return "RimWorld 번역 문자열의 분류를 확인하지 못했습니다" }
+            return "RimWorld의 $DefClass 유형 데이터를 정의합니다"
+        }
+    }
+}
+
+function Get-NodeDescription([string]$Field) {
+    $leaf = if ($Field) { $Field.ToLowerInvariant() } else { "" }
+    switch -Regex ($leaf) {
+        "^label" { return "화면에 표시되는 짧은 이름입니다" }
+        "^(description|desc)$" { return "정보 창이나 도움말에 표시되는 상세 설명입니다" }
+        "deathmessage$" { return "해당 원인으로 죽었을 때 표시되는 사망 문구입니다" }
+        "reportstring$" { return "폰의 현재 행동으로 표시되는 문구입니다" }
+        "jobstring$" { return "작업 상태에 표시되는 문구입니다" }
+        "inspectstring$" { return "대상을 선택했을 때 정보 창에 표시되는 문구입니다" }
+        "^letterlabel$" { return "편지 창의 제목입니다" }
+        "^lettertext$" { return "편지 창의 본문입니다" }
+        "message$" { return "게임 알림이나 메시지에 표시되는 문구입니다" }
+        "^(gerund|verb)$" { return "행동이나 작업을 나타내는 문구입니다" }
+        "^name$" { return "화면에 표시되는 이름입니다" }
+        default { return "해당 Def 안에서 번역할 XML 값의 경로입니다" }
+    }
+}
+
+function Get-RowDefContext([object]$Row) {
+    $relative = Get-RelativeTarget $Row
+    $kind = Get-OptionalRowText -Row $Row -Names @("kind", "Kind")
+    $defClass = Get-OptionalRowText -Row $Row -Names @("defClass", "defType", "typeName", "TypeName")
+    $node = Get-OptionalRowText -Row $Row -Names @("node", "key", "Key")
+    $field = Get-OptionalRowText -Row $Row -Names @("field", "Field")
+
+    $defMatch = [System.Text.RegularExpressions.Regex]::Match($relative, "(?:^|[\\/])DefInjected[\\/]([^\\/]+)(?:[\\/]|$)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $defClass -and $defMatch.Success) { $defClass = $defMatch.Groups[1].Value }
+    if (-not $kind) {
+        if ($defMatch.Success) { $kind = "DefInjected" }
+        elseif ($relative -match "(?:^|[\\/])Keyed(?:[\\/]|$)") { $kind = "Keyed" }
+    }
+
+    $segments = @($node -split "\.")
+    if (-not $field -and $segments.Count -gt 0) { $field = $segments[$segments.Count - 1] }
+    $defName = if ($kind -eq "DefInjected" -and $segments.Count -gt 1) { $segments[0] } else { "" }
+    $fieldPath = if ($kind -eq "DefInjected" -and $segments.Count -gt 1) { [string]::Join(".", @($segments[1..($segments.Count - 1)])) } else { $field }
+
+    if ($kind -eq "Keyed" -or (-not $defClass -and $relative -match "(?:^|[\\/])Keyed(?:[\\/]|$)")) {
+        $displayClass = "Keyed"
+        $classDescription = "Def에 속하지 않는 일반 UI/알림 문자열입니다"
+        $nodeDescription = "코드가 이 문구를 찾는 고유 키입니다"
+        $explanation = "Keyed: $classDescription. Node '$node': $nodeDescription."
+    } else {
+        $displayClass = if ($defClass) { $defClass } else { "알 수 없음" }
+        $classDescription = Get-DefClassDescription $defClass
+        $nodeDescription = Get-NodeDescription $field
+        if ($defName) {
+            $explanation = "${displayClass}는 $classDescription.`r`n'$defName' Def의 '$fieldPath' 노드는 $nodeDescription."
+        } else {
+            $nodeLabel = if ($node) { "'$node' Node" } else { "Node" }
+            $explanation = "${displayClass}는 $classDescription.`r`n${nodeLabel}는 번역할 XML 값의 경로입니다."
+        }
+    }
+
+    return [pscustomobject]@{
+        DefClass = $displayClass
+        Node = $node
+        DefName = $defName
+        Field = $fieldPath
+        ClassDescription = $classDescription
+        NodeDescription = $nodeDescription
+        Explanation = $explanation
+    }
 }
 
 function Get-DefaultTranslationForRow([object]$Row) {
@@ -1479,6 +1892,7 @@ function Save-Decisions {
     $path = Get-DecisionPath
     $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding UTF8
     $script:dirty = $false
+    Invalidate-DashboardProjectData ([string]$script:selectedProjectId)
     $lblSave.Text = "저장됨 " + (Get-Date -Format "HH:mm:ss")
 }
 
@@ -1597,7 +2011,7 @@ function Confirm-DuplicateSourceTranslation {
 
 function Save-ReviewWithDuplicatePrompt {
     $changed = Confirm-DuplicateSourceTranslation
-    Save-Decisions
+    if ($script:dirty -or $changed -gt 0) { Save-Decisions }
     if ($changed -gt 0) {
         $current = $script:currentRowIndex
         Refresh-FileList
@@ -1816,7 +2230,8 @@ function Refresh-ItemList([int]$SelectRowIndex = -1) {
             $stripe.SetBounds(0, 0, 3, $card.Height)
             $stripe.BackColor = $statusColor
 
-            $keyText = [string]$row.key
+            $defContext = Get-RowDefContext $row
+            $keyText = "$($defContext.DefClass)  ·  $($defContext.Node)"
             if ($keyText.Length -gt 46) { $keyText = $keyText.Substring(0, 43) + "..." }
             $statusWidth = if ($isUpdated) { 70 } else { 60 }
             $lblStatus = New-Label $statusText ($card.Width - $statusWidth - 14) 9 $statusWidth 20 $statusColor 8 ([System.Drawing.FontStyle]::Bold)
@@ -1836,7 +2251,7 @@ function Refresh-ItemList([int]$SelectRowIndex = -1) {
                 $lblTranslationPreview.ForeColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(238, 183, 92) } else { [System.Drawing.Color]::FromArgb(145, 91, 16) }
             }
             $card.AccessibleName = "$statusText, $keyText"
-            $card.AccessibleDescription = "$($preview[0]). 번역: $($lblTranslationPreview.Text)"
+            $card.AccessibleDescription = "$($preview[0]). $($defContext.Explanation) 번역: $($lblTranslationPreview.Text)"
 
             $card.Controls.AddRange(@($stripe, $lblSourcePreview, $lblStatus, $lblTranslationPreview, $lblKey))
             foreach ($control in @($card, $stripe, $lblKey, $lblSourcePreview, $lblStatus, $lblTranslationPreview)) {
@@ -1979,7 +2394,19 @@ function Select-RowIndex([int]$Index) {
         $txtMemo.Text = [string]$decision.note
         $wordCount = @($source -split '\s+' | Where-Object { $_ }).Count
         $safeText = if ($translationValidation.SafeToApply) { "예" } else { "아니요" }
-        $txtMeta.Text = "키  $($row.key)`r`n파일  $relative`r`nID  $($row.id)   ·   단어 $wordCount   ·   안전 적용 $safeText"
+        $defContext = Get-RowDefContext $row
+        $classNote = if ($defContext.DefClass -eq "Keyed") {
+            "$($defContext.ClassDescription)."
+        } else {
+            "$($defContext.DefClass)는 $($defContext.ClassDescription)."
+        }
+        $nodeNote = if ($defContext.DefClass -eq "Keyed") {
+            "$($defContext.NodeDescription)."
+        } else {
+            "'$($defContext.Field)' 노드는 $($defContext.NodeDescription)."
+        }
+        $txtMeta.Text = "Def Class :  $($defContext.DefClass) ($classNote)`r`nNode :  $($defContext.Node) ($nodeNote)`r`n파일  $relative`r`nID  $($row.id)   ·   단어 $wordCount   ·   안전 적용 $safeText"
+        $txtMeta.AccessibleDescription = "Def Class는 문자열이 속한 RimWorld 정의 유형이고, Node는 Def 이름과 번역 필드 경로입니다. $($txtMeta.Text)"
         $issueLines = New-Object "System.Collections.Generic.List[string]"
         if ($sourceChanged) { [void]$issueLines.Add("업데이트로 원문이 변경되었습니다. 다시 번역하거나 검토해야 적용할 수 있습니다.") }
         foreach ($warning in $warnings) { [void]$issueLines.Add([string]$warning) }
@@ -2180,7 +2607,7 @@ function Load-ReviewRoot([string]$Root) {
     $script:comparisonFile = Find-ComparisonFile $script:reviewRoot
     $parsed = [System.IO.File]::ReadAllText($script:comparisonFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
     $script:rows = @($parsed)
-    $script:validationCache = @{}
+    if ($script:validationCache.Count -gt 20000) { $script:validationCache = @{} }
     $script:reviewStats = $null
     $script:currentRowIndex = -1
     Load-Decisions
@@ -2256,12 +2683,14 @@ function Refresh-ProjectList {
 
 function Update-ModCatalogControls {
     if (-not $cmbModCatalog) { return }
-    $cmbModCatalog.BeginUpdate()
-    try {
-        $cmbModCatalog.Items.Clear()
-        foreach ($mod in $script:modCatalog) { [void]$cmbModCatalog.Items.Add($mod) }
-    } finally {
-        $cmbModCatalog.EndUpdate()
+    if ($cmbModCatalog.Visible) {
+        $cmbModCatalog.BeginUpdate()
+        try {
+            $cmbModCatalog.Items.Clear()
+            foreach ($mod in $script:modCatalog) { [void]$cmbModCatalog.Items.Add($mod) }
+        } finally {
+            $cmbModCatalog.EndUpdate()
+        }
     }
     if ($cmbDashboardMods) {
         $cmbDashboardMods.BeginUpdate()
@@ -2277,7 +2706,7 @@ function Update-ModCatalogControls {
 
 function Refresh-ModCatalog([switch]$PreferCache) {
     if (-not $cmbModCatalog) { return }
-    if ($PreferCache -and (Try-LoadModCatalogCache)) {
+    if ($PreferCache -and (Try-LoadModCatalogCache -FastValidation)) {
         Update-ModCatalogControls
         $lblRunStatus.Text = "모드 $($script:modCatalog.Count)개 준비됨"
         return
@@ -2344,6 +2773,52 @@ function Set-TranslationRunning([bool]$Running) {
     Update-StopButtonAppearance
 }
 
+function Get-ExistingProjectTranslationInfo([string]$ModRoot) {
+    $reviewCount = 0
+    $project = Get-SelectedProject
+    $currentReviewBelongsToProject = $project -and (Test-ReviewRootBelongsToProject -Project $project -ReviewRoot $script:reviewRoot)
+    if ($currentReviewBelongsToProject -and $script:rows.Count -gt 0 -and $script:decisions.Count -gt 0) {
+        $reviewCount = @($script:decisions.Values | Where-Object { -not [string]::IsNullOrWhiteSpace((ConvertTo-FlatString $_.text)) }).Count
+    } else {
+        if ($project -and $project.latestReviewRoot) {
+            $decisionPath = Join-Path ([string]$project.latestReviewRoot) "review-decisions.json"
+            if (Test-Path -LiteralPath $decisionPath -PathType Leaf) {
+                try {
+                    $saved = [System.IO.File]::ReadAllText($decisionPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                    $reviewCount = @($saved.items | Where-Object { -not [string]::IsNullOrWhiteSpace((ConvertTo-FlatString $_.text)) }).Count
+                } catch {
+                }
+            }
+        }
+    }
+
+    $koreanFileCount = 0
+    $koreanRoot = Join-Path $ModRoot "Languages\Korean"
+    if (Test-Path -LiteralPath $koreanRoot -PathType Container) {
+        try { $koreanFileCount = @(Get-ChildItem -LiteralPath $koreanRoot -Recurse -File -Filter "*.xml" -ErrorAction Stop).Count } catch {}
+    }
+    return [pscustomobject]@{
+        ReviewTranslationCount = $reviewCount
+        KoreanFileCount = $koreanFileCount
+        HasExistingTranslation = ($reviewCount -gt 0 -or $koreanFileCount -gt 0)
+    }
+}
+
+function Confirm-AiTranslationOverwrite([string]$ModRoot) {
+    $existing = Get-ExistingProjectTranslationInfo $ModRoot
+    if (-not $existing.HasExistingTranslation) { return $true }
+
+    $message = "현재 프로젝트에 기존 번역이 있습니다.`r`n`r`n- 검수 프로젝트 번역: $($existing.ReviewTranslationCount)개`r`n- 모드 Korean XML 파일: $($existing.KoreanFileCount)개`r`n`r`nAI 번역을 시작하면 기존 번역문이 새 AI 초벌 번역으로 덮어써질 수 있습니다.`r`n검토 완료한 내용과 수동 수정 내용을 확인한 뒤 진행하세요.`r`n`r`n계속할까요?"
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        $message,
+        "기존 번역 덮어쓰기 경고",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning,
+        [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+    )
+    return $answer -eq [System.Windows.Forms.DialogResult]::Yes
+}
+
 function Start-Translation {
     if ($script:process -and -not $script:process.HasExited) {
         [System.Windows.Forms.MessageBox]::Show("이미 번역이 실행 중입니다.", "RimWorld AI Translator") | Out-Null
@@ -2359,8 +2834,9 @@ function Start-Translation {
         [System.Windows.Forms.MessageBox]::Show("번역 스크립트를 찾을 수 없습니다.`r`n$script:translatorScript", "RimWorld AI Translator") | Out-Null
         return
     }
-
     Save-ReviewWithDuplicatePrompt
+    if (-not (Confirm-AiTranslationOverwrite $modRoot)) { return }
+
     Ensure-AppDataStore
     Remove-TempFiles
     $script:lastReviewOutputPath = ""
@@ -2576,9 +3052,22 @@ function Get-ProjectReviewStats([object]$Project) {
 
     try {
         $comparison = Find-ComparisonFile ([string]$Project.latestReviewRoot)
+        $comparisonInfo = Get-Item -LiteralPath $comparison -ErrorAction Stop
+        $decisionPath = Join-Path ([string]$Project.latestReviewRoot) "review-decisions.json"
+        $decisionStamp = "missing"
+        if (Test-Path -LiteralPath $decisionPath -PathType Leaf) {
+            $decisionInfo = Get-Item -LiteralPath $decisionPath -ErrorAction Stop
+            $decisionStamp = "$($decisionInfo.Length):$($decisionInfo.LastWriteTimeUtc.Ticks)"
+        }
+        $cacheKey = if ($Project.id) { [string]$Project.id } else { [System.IO.Path]::GetFullPath([string]$Project.latestReviewRoot).ToLowerInvariant() }
+        $stamp = "$($comparisonInfo.FullName)|$($comparisonInfo.Length):$($comparisonInfo.LastWriteTimeUtc.Ticks)|$decisionStamp"
+        if ($script:projectStatsCache.ContainsKey($cacheKey)) {
+            $cached = $script:projectStatsCache[$cacheKey]
+            if ([string]$cached.Stamp -eq $stamp) { return $cached.Stats }
+        }
+
         $parsedRows = [System.IO.File]::ReadAllText($comparison, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
         $rows = @($parsedRows)
-        $decisionPath = Join-Path ([string]$Project.latestReviewRoot) "review-decisions.json"
         $decisions = @{}
         if (Test-Path -LiteralPath $decisionPath -PathType Leaf) {
             $json = [System.IO.File]::ReadAllText($decisionPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -2600,9 +3089,6 @@ function Get-ProjectReviewStats([object]$Project) {
                     break
                 }
             }
-            $translation = if ($decision) { ConvertTo-FlatString $decision.text } else { Get-DefaultTranslationForRow $row }
-            if (@(Get-RowWarnings -Row $row -Translation $translation).Count -gt 0) { $stats.Warnings++ }
-
             $status = if ($decision -and $decision.status) { [string]$decision.status } else {
                 if ([string]::IsNullOrWhiteSpace((Get-DefaultTranslationForRow $row))) { "pending" } else { "translated" }
             }
@@ -2611,12 +3097,11 @@ function Get-ProjectReviewStats([object]$Project) {
             $sourceChanged = $false
             if ($decision) {
                 $source = ConvertTo-FlatString $row.source
-                $sourceHash = Get-TextFingerprint $source
                 $sourceChanged = $decision.PSObject.Properties["sourceChanged"] -and (ConvertTo-BoolValue $decision.sourceChanged)
-                if ($decision.PSObject.Properties["sourceHash"] -and -not [string]::IsNullOrWhiteSpace([string]$decision.sourceHash)) {
-                    $sourceChanged = $sourceChanged -or (([string]$decision.sourceHash) -ne $sourceHash)
-                } elseif ($decision.PSObject.Properties["sourceText"] -and -not [string]::IsNullOrWhiteSpace([string]$decision.sourceText)) {
+                if (-not $sourceChanged -and $decision.PSObject.Properties["sourceText"] -and -not [string]::IsNullOrWhiteSpace([string]$decision.sourceText)) {
                     $sourceChanged = $sourceChanged -or ((ConvertTo-FlatString $decision.sourceText) -ne $source)
+                } elseif (-not $sourceChanged -and $decision.PSObject.Properties["sourceHash"] -and -not [string]::IsNullOrWhiteSpace([string]$decision.sourceHash)) {
+                    $sourceChanged = ([string]$decision.sourceHash) -ne (Get-TextFingerprint $source)
                 }
                 if ($sourceChanged) { $status = "pending" }
             }
@@ -2630,6 +3115,8 @@ function Get-ProjectReviewStats([object]$Project) {
         }
 
         $stats.Label = "전체 $($stats.Total) / 미번역 $($stats.Pending) / 번역됨 $($stats.Translated) / 검토됨 $($stats.Approved) / 변경 $($stats.Updated)"
+        $script:projectStatsCache[$cacheKey] = [pscustomobject]@{ Stamp = $stamp; Stats = $stats }
+        $script:projectStatsCacheDirty = $true
     } catch {
         $stats.Label = "검수 통계 읽기 실패"
     }
@@ -2687,7 +3174,15 @@ function Open-ProjectWorkspace([object]$Project) {
     Set-ActiveProject $Project
     if ($Project.modRoot -and (Test-Path -LiteralPath $Project.modRoot -PathType Container)) {
         Show-Workspace
+        [System.Windows.Forms.Application]::DoEvents()
         if ($Project.latestReviewRoot -and (Test-Path -LiteralPath $Project.latestReviewRoot -PathType Container)) {
+            try {
+                $sameReview = $script:reviewRoot -and
+                    ([System.IO.Path]::GetFullPath([string]$script:reviewRoot).TrimEnd("\", "/") -ieq [System.IO.Path]::GetFullPath([string]$Project.latestReviewRoot).TrimEnd("\", "/")) -and
+                    $script:rows.Count -gt 0
+                if ($sameReview) { return }
+            } catch {
+            }
             Load-ReviewRoot ([string]$Project.latestReviewRoot)
         } else {
             Load-SourceOnlyForSelectedMod
@@ -2695,6 +3190,13 @@ function Open-ProjectWorkspace([object]$Project) {
         return
     }
     if ($Project.latestReviewRoot -and (Test-Path -LiteralPath $Project.latestReviewRoot -PathType Container)) {
+        try {
+            $sameReview = $script:reviewRoot -and
+                ([System.IO.Path]::GetFullPath([string]$script:reviewRoot).TrimEnd("\", "/") -ieq [System.IO.Path]::GetFullPath([string]$Project.latestReviewRoot).TrimEnd("\", "/")) -and
+                $script:rows.Count -gt 0
+            if ($sameReview) { Show-Workspace; return }
+        } catch {
+        }
         Load-ReviewRoot ([string]$Project.latestReviewRoot)
         Show-Workspace
         return
@@ -2705,11 +3207,16 @@ function Open-ProjectWorkspace([object]$Project) {
 function Refresh-DashboardProjects {
     if (-not $flowDashboardProjects) { return }
     $filter = if ($txtDashboardSearch) { $txtDashboardSearch.Text.Trim().ToLowerInvariant() } else { "" }
+    $projectRevision = [string]::Join(";", @($script:projects | ForEach-Object { "$($_.id):$($_.updatedAt):$($_.latestReviewRoot)" }))
+    $renderKey = "$filter|$($script:themeMode)|$(Get-IsWindowsDarkMode)|$($script:highContrast)|$($script:textSize)|$projectRevision"
+    if (-not $script:dashboardProjectsDirty -and $script:lastDashboardRenderKey -eq $renderKey) { return }
     $projectAccent = if ($script:highContrast) {
         if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(224, 177, 92) } else { [System.Drawing.Color]::FromArgb(119, 77, 22) }
     } else {
         if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(190, 150, 92) } else { [System.Drawing.Color]::FromArgb(166, 124, 70) }
     }
+    $deleteColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(139, 67, 62) } else { [System.Drawing.Color]::FromArgb(151, 71, 65) }
+    $renderSucceeded = $false
     $flowDashboardProjects.SuspendLayout()
     try {
         $flowDashboardProjects.Controls.Clear()
@@ -2722,6 +3229,7 @@ function Refresh-DashboardProjects {
         if ($matches.Count -eq 0) {
             $empty = New-Label "아직 프로젝트가 없습니다. 감지된 모드를 선택해 프로젝트를 만들거나 폴더를 직접 추가하세요." 12 12 820 34 $script:itemMuted 10
             $flowDashboardProjects.Controls.Add($empty)
+            $renderSucceeded = $true
             return
         }
 
@@ -2758,13 +3266,19 @@ function Refresh-DashboardProjects {
             $progressFill.BackColor = $projectAccent
             $progressTrack.Controls.Add($progressFill)
 
-            $lblTime = New-Label ("최근 작업 " + (Format-LocalTimeText ([string]$project.latestReviewAt))) 22 170 262 20 $script:itemSubtle 8.1
+            $lblTime = New-Label ("최근 작업 " + (Format-LocalTimeText ([string]$project.latestReviewAt))) 22 170 196 20 $script:itemSubtle 8.1
             $btnOpen = New-Button "열기" $projectAccent
             $btnOpen.ForeColor = [System.Drawing.Color]::White
             $btnOpen.SetBounds(304, 154, 86, 34)
             $btnOpen.Tag = $project
             Set-AccessibleControl $btnOpen "$name 프로젝트 열기" "$name 모드의 번역 및 검수 작업 화면을 엽니다." 0
             $btnOpen.Add_Click({ Open-ProjectWorkspace $this.Tag })
+            $btnDelete = New-Button "삭제" $deleteColor
+            $btnDelete.ForeColor = [System.Drawing.Color]::White
+            $btnDelete.SetBounds(226, 154, 70, 34)
+            $btnDelete.Tag = $project
+            Set-AccessibleControl $btnDelete "$name 프로젝트 삭제" "$name 프로젝트의 로컬 검수 기록을 삭제합니다. 원본 모드와 Korean 폴더는 보존합니다." 0
+            $btnDelete.Add_Click({ Remove-TranslationProject $this.Tag })
 
             $card.AccessibleName = "$name 프로젝트"
             $card.AccessibleDescription = "$idText, $($stats.Label), 최근 검수 $(Format-LocalTimeText ([string]$project.latestReviewAt))"
@@ -2773,11 +3287,17 @@ function Refresh-DashboardProjects {
                 $clickTarget.Tag = $project
                 $clickTarget.Add_Click({ Open-ProjectWorkspace $this.Tag })
             }
-            $card.Controls.AddRange(@($accentLine, $lblName, $lblId, $lblTotal, $lblCoverage, $lblPending, $lblUpdated, $progressTrack, $lblTime, $btnOpen))
+            $card.Controls.AddRange(@($accentLine, $lblName, $lblId, $lblTotal, $lblCoverage, $lblPending, $lblUpdated, $progressTrack, $lblTime, $btnDelete, $btnOpen))
             $flowDashboardProjects.Controls.Add($card)
         }
+        $renderSucceeded = $true
     } finally {
         $flowDashboardProjects.ResumeLayout()
+        if ($renderSucceeded) {
+            $script:dashboardProjectsDirty = $false
+            $script:lastDashboardRenderKey = $renderKey
+            Save-ProjectStatsCache
+        }
     }
 }
 
@@ -2836,7 +3356,7 @@ function Apply-TextSize {
     $txtTerms.Font = New-Font $bodySize
     $txtMemo.Font = New-Font $bodySize
     $txtWarnings.Font = New-Font $bodySize
-    $txtMeta.Font = New-Font ([Math]::Max(8.5, $bodySize - 1.5))
+    $txtMeta.Font = New-Font ([Math]::Max(9, $bodySize - 1))
     $script:historyTitleFont = New-Font ([Math]::Max(8.5, $bodySize - 1.5)) ([System.Drawing.FontStyle]::Bold)
     $script:historyBodyFont = New-Font ([Math]::Max(9, $bodySize - 0.5))
     $txtHistory.Font = $script:historyBodyFont
@@ -2856,7 +3376,7 @@ function Apply-DashboardPreferences {
     if ($script:rows.Count -gt 0) {
         Refresh-ItemList -SelectRowIndex $script:currentRowIndex
     }
-    Refresh-DashboardProjects
+    Invalidate-DashboardProjectData
     if ($dashboardPanel.Visible) { Show-Dashboard "settings" }
 }
 
@@ -3199,7 +3719,7 @@ $translationAccent.Height = 3
 $pnlTranslationFrame.Controls.AddRange(@($txtTranslation, $translationAccent))
 
 $txtMeta = New-TextBox -Multiline
-$txtMeta.SetBounds(18, 296, 640, 76)
+$txtMeta.SetBounds(18, 296, 640, 92)
 $txtMeta.ReadOnly = $true
 $txtMeta.BackColor = [System.Drawing.Color]::FromArgb(248, 249, 250)
 
@@ -3259,7 +3779,7 @@ function Resize-ReviewEditorLayout {
     $compact = $contentHeight -lt 760
     $sourceHeight = if ($veryCompact) { 72 } elseif ($compact) { 92 } else { 118 }
     $translationHeight = if ($veryCompact) { 112 } elseif ($compact) { 148 } else { 190 }
-    $metaHeight = if ($veryCompact) { 52 } else { 58 }
+    $metaHeight = if ($veryCompact) { 82 } else { 92 }
 
     $lblCurrent.SetBounds($pad, 18, [Math]::Max(180, $contentWidth - 178), 28)
     $lblUpdateBadge.SetBounds(($pad + $contentWidth - 168), 18, 168, 26)
@@ -3650,6 +4170,8 @@ function Update-SplitMinimumSizes {
 
 function Apply-AppTheme {
     $isDark = Get-IsWindowsDarkMode
+    $themeSignature = "$isDark|$($script:highContrast)|$($script:textSize)|$($form.ClientSize.Width)x$($form.ClientSize.Height)"
+    if ($script:appliedThemeSignature -eq $themeSignature) { return }
     if ($isDark) {
         $bg = [System.Drawing.Color]::FromArgb(25, 28, 27)
         $surface = [System.Drawing.Color]::FromArgb(34, 38, 36)
@@ -4009,6 +4531,7 @@ function Apply-AppTheme {
     $flowDashboardProjects.SetBounds(22, 152, [Math]::Max(320, $dashWidth - 44), [Math]::Max(260, $dashHeight - 176))
     $lvDashboardActivity.SetBounds(24, 66, [Math]::Max(320, $dashWidth - 48), [Math]::Max(260, $dashHeight - 154))
     Update-SplitMinimumSizes
+    $script:appliedThemeSignature = $themeSignature
 }
 
 $form.AccessibleName = "RimWorld AI Translator"
@@ -4039,7 +4562,7 @@ for ($i = 0; $i -lt $statusFilterButtons.Count; $i++) {
 }
 Set-AccessibleControl $txtSource "원문" "선택된 문자열의 읽기 전용 원문입니다." 0
 Set-AccessibleControl $txtTranslation "번역문 편집" "선택된 문자열의 한국어 번역문을 편집합니다." 1
-Set-AccessibleControl $txtMeta "문자열 정보" "키, 파일, ID, 단어 수와 안전 적용 여부입니다." 2
+Set-AccessibleControl $txtMeta "문자열 정보" "Def Class, Node, 문맥 설명, 파일, ID, 단어 수와 안전 적용 여부입니다." 2
 Set-AccessibleControl $btnPrev "이전 문자열" "이전 검색 결과로 이동합니다. 단축키 Alt+위쪽 화살표." 3
 Set-AccessibleControl $btnNext "다음 문자열" "다음 검색 결과로 이동합니다. 단축키 Alt+아래쪽 화살표." 4
 Set-AccessibleControl $btnUseCandidate "AI 후보 사용" "AI 초벌 번역을 편집기에 넣습니다." 5
@@ -4103,7 +4626,6 @@ $toolTip.SetToolTip($cmbDashboardTextSize, "번역문, 기존 번역, AI 후보�
 
 Sync-DashboardSettingsFromMain
 Apply-TextSize
-Apply-AppTheme
 
 $form.Add_Resize({
     if ($script:layouting -or $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { return }
@@ -4127,6 +4649,13 @@ $autoSaveTimer.Add_Tick({
         $lblSave.Text = "자동 저장 실패"
         Add-Log "자동 저장 실패: $($_.Exception.Message)"
     }
+})
+
+$dashboardSearchTimer = New-Object System.Windows.Forms.Timer
+$dashboardSearchTimer.Interval = 180
+$dashboardSearchTimer.Add_Tick({
+    $dashboardSearchTimer.Stop()
+    Refresh-DashboardProjects
 })
 
 $cmbProject.Add_SelectedIndexChanged({
@@ -4158,7 +4687,10 @@ $btnSave.Add_Click({ Save-ReviewWithDuplicatePrompt })
 $btnDashProjects.Add_Click({ Show-Dashboard "projects" })
 $btnDashActivity.Add_Click({ Show-Dashboard "activity" })
 $btnDashSettings.Add_Click({ Show-Dashboard "settings" })
-$txtDashboardSearch.Add_TextChanged({ Refresh-DashboardProjects })
+$txtDashboardSearch.Add_TextChanged({
+    $dashboardSearchTimer.Stop()
+    $dashboardSearchTimer.Start()
+})
 $btnDashboardRefreshMods.Add_Click({ Refresh-ModCatalog; Refresh-DashboardProjects })
 $btnDashboardChooseMod.Add_Click({ Choose-ModFolder })
 $btnDashboardAddMod.Add_Click({
@@ -4371,6 +4903,8 @@ $timer.Start()
 
 $form.Add_FormClosing({
     if ($autoSaveTimer) { $autoSaveTimer.Stop() }
+    if ($dashboardSearchTimer) { $dashboardSearchTimer.Stop() }
+    Save-ProjectStatsCache
     if ($script:process -and -not $script:process.HasExited) {
         try { Stop-ProcessTree $script:process.Id } catch {}
     }

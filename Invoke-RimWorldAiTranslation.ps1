@@ -1428,6 +1428,10 @@ if ($SourceOnly) {
         [void]$comparisonRows.Add([pscustomobject]@{
             id = $entry.Id
             key = $entry.Key
+            kind = $entry.Kind
+            defClass = $entry.TypeName
+            node = $entry.Key
+            field = $entry.Field
             target = $targetPath
             source = $entry.Text
             existing = $existingTranslation
@@ -1515,6 +1519,10 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
         [void]$translatedRows.Add([pscustomobject]@{
             id = $entry.Id
             key = $entry.Key
+            kind = $entry.Kind
+            defClass = $entry.TypeName
+            node = $entry.Key
+            field = $entry.Field
             target = $targetPath
             source = $entry.Text
             translation = $translated
@@ -1523,6 +1531,10 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
         [void]$comparisonRows.Add([pscustomobject]@{
             id = $entry.Id
             key = $entry.Key
+            kind = $entry.Kind
+            defClass = $entry.TypeName
+            node = $entry.Key
+            field = $entry.Field
             target = $targetPath
             source = $entry.Text
             existing = $existingTranslation
