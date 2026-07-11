@@ -1,3 +1,22 @@
+# RimWorld AI Translator v0.1.18
+
+## Changes
+
+- Added local RMK integration that discovers the Steam subscription and a `bus` branch working clone by Workshop or Package ID.
+- Reuses RMK translations as editable defaults and sends only missing strings to AI translation.
+- Added an `RMK에 적용` destination checkbox: unchecked writes to the original mod, while checked merges the same reviewed statuses into the RMK working clone.
+- Replaced the AI overwrite warning with explicit `Overwrite`, `Translate missing only`, and `Cancel` choices; missing-only mode also preserves manual review translations that have not been applied to the mod yet.
+- Added project-time source-language selection when a mod contains multiple language folders; the choice is stored per project and reused for refresh and AI translation.
+- Added dedicated `Def Class` and `Node` search scopes.
+- Added editing-focused keyboard shortcuts for navigation, candidate selection, status changes, source refresh, and AI translation control.
+- Debounced review search, replaced repeated array growth, limited initial card rendering, and deferred full warning checks to visible or explicitly filtered rows for faster large-project interaction.
+- Indexed glossary lookup without changing selected term order; repeated batch term selection is substantially faster while producing the same prompt terms.
+- Removed the `cmd.exe` translation launch hop. API keys remain environment-only, while a local runner accepts only an allowlisted parameter set from a bounded JSON file.
+- Improved low-resolution behavior with a 900x600 minimum layout, compact header controls, and scrollable editor/settings surfaces.
+- Existing RMK keys remain in their original XML files, new keys are added once, changed or unsafe strings are skipped, and `LoadFoldersBuilder` runs after export.
+- RMK Builder output is decoded with its native Korean code page and completion is verified from regenerated, valid output files instead of a localized log phrase.
+- RMK subscription files are read-only references; Git commits and pushes remain manual.
+
 # RimWorld AI Translator v0.1.17
 
 ## Changes
