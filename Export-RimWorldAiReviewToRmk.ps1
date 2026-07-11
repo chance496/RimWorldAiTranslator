@@ -7,6 +7,8 @@
 
     [string]$ReviewLanguageFolderName = "Korean",
     [string]$RmkLanguageFolderName = ("Korean (" + [char]0xD55C + [char]0xAD6D + [char]0xC5B4 + ")"),
+    [string]$SourceLanguage = "English",
+    [string]$WorkbookPath,
     [ValidateSet("ApprovedOnly", "TranslatedAndApproved")]
     [string]$ApplyStatus = "ApprovedOnly",
     [switch]$Overwrite,
@@ -176,6 +178,85 @@ function Escape-XmlText([string]$Text) {
     return [System.Security.SecurityElement]::Escape((Remove-InvalidXmlChars $Text))
 }
 
+function Test-PathInsideRoot([string]$Path, [string]$Root) {
+    try {
+        $pathFull = [System.IO.Path]::GetFullPath($Path)
+        $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd("\", "/")
+        $prefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
+        return $pathFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+function Initialize-RmkXlsxSupport {
+    if (("RimWorldTranslatorRmkXlsxReader" -as [type]) -and ("RimWorldTranslatorRmkXlsxWriter" -as [type])) { return }
+    $assemblyPath = Join-Path $PSScriptRoot "RimWorldAiTranslator.Native.dll"
+    $sourcePath = Join-Path $PSScriptRoot "native\RimWorldTranslatorNative.cs"
+    $useSource = (Test-Path -LiteralPath $sourcePath -PathType Leaf) -and
+        ((-not (Test-Path -LiteralPath $assemblyPath -PathType Leaf)) -or
+         (Get-Item -LiteralPath $sourcePath).LastWriteTimeUtc -gt (Get-Item -LiteralPath $assemblyPath).LastWriteTimeUtc)
+    if ($useSource) {
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        Add-Type -AssemblyName System.Xml.Linq
+        $references = @(
+            [System.IO.Compression.ZipArchive].Assembly.Location,
+            [System.IO.Compression.ZipFile].Assembly.Location,
+            [System.Xml.Linq.XDocument].Assembly.Location,
+            [System.Xml.XmlDocument].Assembly.Location,
+            [System.Linq.Enumerable].Assembly.Location
+        ) | Select-Object -Unique
+        Add-Type -LiteralPath $sourcePath -ReferencedAssemblies $references -ErrorAction Stop
+    } elseif (Test-Path -LiteralPath $assemblyPath -PathType Leaf) {
+        Add-Type -LiteralPath $assemblyPath -ErrorAction Stop
+    } else {
+        throw "RMK XLSX support is missing. Reinstall the package."
+    }
+    if (-not ("RimWorldTranslatorRmkXlsxReader" -as [type]) -or -not ("RimWorldTranslatorRmkXlsxWriter" -as [type])) {
+        throw "RMK XLSX support failed to load."
+    }
+}
+
+function Get-RmkWorkbookOutputPath([string]$RequestedPath, [string]$EntryRoot) {
+    $entryFull = [System.IO.Path]::GetFullPath($EntryRoot).TrimEnd("\", "/")
+    $candidate = ""
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        $candidate = if ([System.IO.Path]::IsPathRooted($RequestedPath)) { $RequestedPath } else { Join-Path $entryFull $RequestedPath }
+    } else {
+        $existing = Get-ChildItem -LiteralPath $entryFull -File -Filter "*.xlsx" -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1
+        if ($existing) {
+            $candidate = $existing.FullName
+        } else {
+            $workshopId = ""
+            $cursor = $entryFull
+            for ($depth = 0; $depth -lt 3 -and $cursor; $depth++) {
+                $leaf = Split-Path -Leaf $cursor
+                if ($leaf -match ' - (\d+)$') { $workshopId = $matches[1]; break }
+                $parent = Split-Path -Parent $cursor
+                if ($parent -eq $cursor) { break }
+                $cursor = $parent
+            }
+            $fileName = if ($workshopId) { "$workshopId.xlsx" } else { "RimWorldTranslation.xlsx" }
+            $candidate = Join-Path $entryFull $fileName
+        }
+    }
+    $full = [System.IO.Path]::GetFullPath($candidate)
+    if (-not (Test-PathInsideRoot -Path $full -Root $entryFull) -or [System.IO.Path]::GetExtension($full) -ine ".xlsx") {
+        throw "RMK workbook path must be an XLSX file inside the RMK entry root: $full"
+    }
+    return $full
+}
+
+function Get-RmkHistoryIdentifier([object]$Row) {
+    if (-not $Row) { return "" }
+    $kind = if ($Row.PSObject.Properties["kind"]) { [string]$Row.kind } else { "" }
+    $className = if ($kind -eq "Keyed") { "Keyed" } elseif ($Row.PSObject.Properties["defClass"] -and $Row.defClass) { [string]$Row.defClass } else { $kind }
+    $node = if ($Row.PSObject.Properties["node"] -and $Row.node) { [string]$Row.node } else { [string]$Row.key }
+    if ([string]::IsNullOrWhiteSpace($className) -or [string]::IsNullOrWhiteSpace($node)) { return "" }
+    return "$className+$node"
+}
+
 function New-FileState([string]$Path) {
     $entries = [ordered]@{}
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
@@ -253,6 +334,26 @@ foreach ($row in $rows) {
     }
 }
 
+function Resolve-ReviewDecisionRow([object]$Item) {
+    if (-not $Item) { return $null }
+    if ($Item.target -and $Item.key) {
+        $targetKey = "target:$($Item.target)|key:$($Item.key)"
+        if ($rowByTargetKey.ContainsKey($targetKey)) { return $rowByTargetKey[$targetKey] }
+    }
+    if ($Item.id -and $rowById.ContainsKey("id:$($Item.id)")) { return $rowById["id:$($Item.id)"] }
+    if ($Item.key -and $uniqueKeyRows.ContainsKey("key:$($Item.key)")) { return $uniqueKeyRows["key:$($Item.key)"] }
+    return $null
+}
+
+$decisionByHistoryIdentifier = @{}
+foreach ($item in @($decisionData.items)) {
+    $row = Resolve-ReviewDecisionRow $item
+    $identifier = Get-RmkHistoryIdentifier $row
+    if ($identifier -and -not $decisionByHistoryIdentifier.ContainsKey($identifier)) {
+        $decisionByHistoryIdentifier[$identifier] = $item
+    }
+}
+
 $fileStates = @{}
 $keyFiles = @{}
 if (Test-Path -LiteralPath $rmkLanguageRoot -PathType Container) {
@@ -276,6 +377,7 @@ $skippedChanged = 0
 $skippedUnsafe = 0
 $skippedUnmapped = 0
 $skippedAmbiguous = 0
+$exportedTranslationByIdentifier = @{}
 
 foreach ($item in @($decisionData.items)) {
     $status = if ($item.status) { [string]$item.status } else { "pending" }
@@ -285,17 +387,7 @@ foreach ($item in @($decisionData.items)) {
         continue
     }
 
-    $row = $null
-    if ($item.target -and $item.key) {
-        $targetKey = "target:$($item.target)|key:$($item.key)"
-        if ($rowByTargetKey.ContainsKey($targetKey)) { $row = $rowByTargetKey[$targetKey] }
-    }
-    if (-not $row -and $item.id -and $rowById.ContainsKey("id:$($item.id)")) {
-        $row = $rowById["id:$($item.id)"]
-    }
-    if (-not $row -and $item.key -and $uniqueKeyRows.ContainsKey("key:$($item.key)")) {
-        $row = $uniqueKeyRows["key:$($item.key)"]
-    }
+    $row = Resolve-ReviewDecisionRow $item
     if (-not $row -or -not $row.key -or -not (Test-ValidXmlElementName ([string]$row.key))) {
         $skippedUnmapped++
         continue
@@ -348,6 +440,105 @@ foreach ($item in @($decisionData.items)) {
     $state = $fileStates[$targetPath]
     $state.Entries[$key] = $translation
     $state.Dirty = $true
+    $historyIdentifier = Get-RmkHistoryIdentifier $row
+    if ($historyIdentifier) { $exportedTranslationByIdentifier[$historyIdentifier] = $translation }
+}
+
+Initialize-RmkXlsxSupport
+$workbookFull = Get-RmkWorkbookOutputPath -RequestedPath $WorkbookPath -EntryRoot $rmkEntryFull
+$workbookExists = Test-Path -LiteralPath $workbookFull -PathType Leaf
+$workbookData = if ($workbookExists) { [RimWorldTranslatorRmkXlsxReader]::Read($workbookFull) } else { $null }
+$effectiveSourceLanguage = if ($workbookData -and $workbookData.SourceLanguage) {
+    [string]$workbookData.SourceLanguage
+} elseif ($SourceLanguage -and $SourceLanguage -ne "Auto") {
+    $SourceLanguage
+} else {
+    "English"
+}
+$selectedSourceLanguage = if ($SourceLanguage) { $SourceLanguage } else { "" }
+$workbookUsesDifferentSourceLanguage = $workbookData -and $workbookData.SourceLanguage -and $selectedSourceLanguage -and
+    -not [string]::Equals([string]$workbookData.SourceLanguage, $selectedSourceLanguage, [System.StringComparison]::OrdinalIgnoreCase)
+$historyRowsByIdentifier = @{}
+$historyOrder = New-Object "System.Collections.Generic.List[string]"
+if ($workbookData) {
+    foreach ($historyRow in $workbookData.Rows) {
+        $identifier = [string]$historyRow.Identifier
+        if ([string]::IsNullOrWhiteSpace($identifier) -or $historyRowsByIdentifier.ContainsKey($identifier)) { continue }
+        $copy = New-Object RimWorldTranslatorRmkHistoryRow
+        $copy.Identifier = $identifier
+        $copy.ClassName = [string]$historyRow.ClassName
+        $copy.Key = [string]$historyRow.Key
+        $copy.RequiredMods = [string]$historyRow.RequiredMods
+        $copy.Source = ConvertTo-FlatString $historyRow.Source
+        $copy.Translation = ConvertTo-FlatString $historyRow.Translation
+        $historyRowsByIdentifier[$identifier] = $copy
+        [void]$historyOrder.Add($identifier)
+    }
+}
+
+foreach ($row in $rows) {
+    $identifier = Get-RmkHistoryIdentifier $row
+    if (-not $identifier) { continue }
+    $kind = if ($row.PSObject.Properties["kind"]) { [string]$row.kind } else { "" }
+    $className = if ($kind -eq "Keyed") { "Keyed" } elseif ($row.PSObject.Properties["defClass"] -and $row.defClass) { [string]$row.defClass } else { $kind }
+    $node = if ($row.PSObject.Properties["node"] -and $row.node) { [string]$row.node } else { [string]$row.key }
+    $currentSource = ConvertTo-FlatString $row.source
+    $referenceCurrentSource = if ($row.PSObject.Properties["rmkCurrentSource"]) { ConvertTo-FlatString $row.rmkCurrentSource } else { "" }
+    $workbookCurrentSource = if ($referenceCurrentSource) {
+        $referenceCurrentSource
+    } elseif (-not $workbookUsesDifferentSourceLanguage) {
+        $currentSource
+    } else {
+        ""
+    }
+    $requiredMods = if ($row.PSObject.Properties["requiredMods"]) { [string]$row.requiredMods } else { "" }
+    $decision = if ($decisionByHistoryIdentifier.ContainsKey($identifier)) { $decisionByHistoryIdentifier[$identifier] } else { $null }
+    $sourceChanged = $row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $row.rmkSourceChanged)
+    if ($decision) {
+        $sourceChanged = $sourceChanged -or ($decision.PSObject.Properties["sourceChanged"] -and (ConvertTo-BoolValue $decision.sourceChanged))
+        if (-not $sourceChanged -and $decision.PSObject.Properties["sourceHash"] -and $decision.sourceHash) {
+            $sourceChanged = ([string]$decision.sourceHash) -ne (Get-TextFingerprint $currentSource)
+        }
+    }
+
+    if ($historyRowsByIdentifier.ContainsKey($identifier)) {
+        $historyRow = $historyRowsByIdentifier[$identifier]
+        if (-not $sourceChanged -and $workbookCurrentSource) { $historyRow.Source = $workbookCurrentSource }
+        if ([string]::IsNullOrWhiteSpace([string]$historyRow.ClassName)) { $historyRow.ClassName = $className }
+        if ([string]::IsNullOrWhiteSpace([string]$historyRow.Key)) { $historyRow.Key = $node }
+        if ([string]::IsNullOrWhiteSpace([string]$historyRow.RequiredMods) -and $requiredMods) { $historyRow.RequiredMods = $requiredMods }
+    } else {
+        if (-not $workbookCurrentSource -and $workbookUsesDifferentSourceLanguage) { continue }
+        $historicalSource = ""
+        if ($sourceChanged -and $decision -and $decision.PSObject.Properties["previousSourceText"]) {
+            $historicalSource = ConvertTo-FlatString $decision.previousSourceText
+        }
+        if (-not $historicalSource -and $sourceChanged -and $row.PSObject.Properties["rmkHistoricalSource"]) {
+            $historicalSource = ConvertTo-FlatString $row.rmkHistoricalSource
+        }
+        $historyRow = New-Object RimWorldTranslatorRmkHistoryRow
+        $historyRow.Identifier = $identifier
+        $historyRow.ClassName = $className
+        $historyRow.Key = $node
+        $historyRow.RequiredMods = $requiredMods
+        $historyRow.Source = if ($historicalSource) { $historicalSource } else { $workbookCurrentSource }
+        $existingOrigin = if ($row.PSObject.Properties["existingOrigin"]) { [string]$row.existingOrigin } else { "" }
+        $historyRow.Translation = if ($existingOrigin -eq "rmk") { ConvertTo-FlatString $row.existing } else { "" }
+        $historyRowsByIdentifier[$identifier] = $historyRow
+        [void]$historyOrder.Add($identifier)
+    }
+    if ($exportedTranslationByIdentifier.ContainsKey($identifier)) {
+        $historyRow.Translation = ConvertTo-FlatString $exportedTranslationByIdentifier[$identifier]
+        if ($workbookCurrentSource) { $historyRow.Source = $workbookCurrentSource }
+    }
+}
+
+$historyRows = New-Object "System.Collections.Generic.List[RimWorldTranslatorRmkHistoryRow]"
+foreach ($identifier in $historyOrder) {
+    if ($historyRowsByIdentifier.ContainsKey($identifier)) { [void]$historyRows.Add($historyRowsByIdentifier[$identifier]) }
+}
+if (-not $DryRun) {
+    [RimWorldTranslatorRmkXlsxWriter]::Write($workbookFull, $historyRows, $effectiveSourceLanguage)
 }
 
 $writtenFiles = 0
@@ -358,6 +549,8 @@ foreach ($state in @($fileStates.Values | Where-Object { $_.Dirty } | Sort-Objec
 
 Write-Host "RMK entry root: $rmkEntryFull"
 Write-Host "RMK language root: $rmkLanguageRoot"
+Write-Host "RMK workbook: $workbookFull"
+Write-Host "RMK workbook rows: $($historyRows.Count)"
 Write-Host "Apply status: $ApplyStatus"
 Write-Host "Eligible entries: $eligible"
 Write-Host "Updated existing keys: $updatedExisting"

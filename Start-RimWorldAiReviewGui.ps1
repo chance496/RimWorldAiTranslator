@@ -2130,7 +2130,7 @@ function Export-ReviewedTranslationsToRmk([string]$ApplyStatus = "ApprovedOnly")
     }
     $modeLabel = if ($ApplyStatus -eq "TranslatedAndApproved") { "번역됨과 검토됨" } else { "검토됨" }
     $creationText = if ($newTarget) { "새 RMK 항목과 LoadFolders.Build.yaml을 만듭니다." } else { "기존 RMK 항목에 키 기준으로 병합합니다." }
-    $message = "$modeLabel $eligibleCount개를 RMK 작업 클론으로 내보냅니다.`r`n`r`n$creationText`r`n대상: $targetPath`r`n`r`n완료 후 LoadFoldersBuilder를 실행하지만 Git 커밋이나 푸시는 하지 않습니다."
+    $message = "$modeLabel $eligibleCount개를 RMK 작업 클론으로 내보냅니다.`r`n`r`n$creationText`r`n원문 이력 XLSX도 생성하거나 데이터 손실 없이 갱신합니다.`r`n대상: $targetPath`r`n`r`n완료 후 LoadFoldersBuilder를 실행하지만 Git 커밋이나 푸시는 하지 않습니다."
     $answer = [System.Windows.Forms.MessageBox]::Show($message, "RMK 내보내기", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Information, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
     if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
@@ -2138,15 +2138,20 @@ function Export-ReviewedTranslationsToRmk([string]$ApplyStatus = "ApprovedOnly")
     $lblRunStatus.Text = "RMK 내보내기 중"
     try {
         if (-not $target) { $target = New-RmkTarget -Project $project -WorkspaceRoot $script:rmkWorkspaceRoot }
+        $sourceLanguage = Get-SelectedProjectSourceLanguage
         $exportArguments = @(
             "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script:rmkExportScript,
             "-RmkEntryRoot", [string]$target.Root,
             "-ReviewRoot", $script:reviewRoot,
             "-ReviewLanguageFolderName", "Korean",
             "-RmkLanguageFolderName", "Korean (한국어)",
+            "-SourceLanguage", $sourceLanguage,
             "-ApplyStatus", $ApplyStatus,
             "-Overwrite"
         )
+        if ($target.PSObject.Properties["WorkbookPath"] -and $target.WorkbookPath) {
+            $exportArguments += @("-WorkbookPath", [string]$target.WorkbookPath)
+        }
         Add-Log "RMK 내보내기 시작: $($target.Root)"
         $output = @(& $script:powershellExe @exportArguments 2>&1)
         $exitCode = $LASTEXITCODE
@@ -2167,7 +2172,7 @@ function Export-ReviewedTranslationsToRmk([string]$ApplyStatus = "ApprovedOnly")
         $lblRunStatus.Text = "RMK 내보내기 완료"
         Refresh-RmkPanel -Force
         if ($tabs -and $tabRmk) { $tabs.SelectedTab = $tabRmk }
-        [System.Windows.Forms.MessageBox]::Show("RMK 로컬 내보내기와 LoadFolders 빌드가 완료됐습니다.`r`nGit 커밋·푸시는 하지 않았습니다.", "RMK 내보내기") | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("RMK 번역 XML, 원문 이력 XLSX와 LoadFolders 빌드가 완료됐습니다.`r`nGit 커밋·푸시는 하지 않았습니다.", "RMK 내보내기") | Out-Null
     } catch {
         Add-Log "RMK 내보내기 실패: $($_.Exception.Message)"
         $lblRunStatus.Text = "RMK 내보내기 실패"
@@ -2670,7 +2675,7 @@ function New-Decision([object]$Row) {
     $defaultTranslation = Get-DefaultTranslationForRow $Row
     $translationOrigin = Get-DefaultTranslationOriginForRow $Row
     $source = ConvertTo-FlatString $Row.source
-    $rmkSourceChanged = $translationOrigin -eq "rmk" -and $Row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $Row.rmkSourceChanged)
+    $rmkSourceChanged = $translationOrigin -ne "ai" -and $Row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $Row.rmkSourceChanged)
     $rmkHistoricalSource = if ($rmkSourceChanged -and $Row.PSObject.Properties["rmkHistoricalSource"]) { ConvertTo-FlatString $Row.rmkHistoricalSource } else { "" }
     $translationUpdatedAt = Get-OptionalRowText -Row $Row -Names @("translationUpdatedAt")
     return [pscustomobject]@{
@@ -2729,7 +2734,7 @@ function Normalize-DecisionForRow([object]$Row, [object]$Decision) {
     } elseif ($Decision.PSObject.Properties["sourceText"] -and -not [string]::IsNullOrWhiteSpace([string]$Decision.sourceText)) {
         $sourceChangedNow = $storedSourceText -ne $source
     }
-    $rmkSourceChangedNow = $translationOrigin -eq "rmk" -and $Row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $Row.rmkSourceChanged)
+    $rmkSourceChangedNow = $translationOrigin -ne "ai" -and $Row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $Row.rmkSourceChanged)
     $sourceChanged = $sourceChangedNow -or $rmkSourceChangedNow -or ($Decision.PSObject.Properties["sourceChanged"] -and (ConvertTo-BoolValue $Decision.sourceChanged))
 
     if ($sourceChanged) {
@@ -2887,7 +2892,7 @@ function Load-Decisions {
     }
 }
 
-function Find-PreviousProjectDecisionFile([object]$Project, [string]$CurrentRoot) {
+function Get-PreviousProjectReviewRoots([object]$Project, [string]$CurrentRoot) {
     if (-not $Project -or [string]::IsNullOrWhiteSpace($CurrentRoot)) { return "" }
 
     $currentFull = [System.IO.Path]::GetFullPath($CurrentRoot).TrimEnd("\", "/")
@@ -2897,22 +2902,57 @@ function Find-PreviousProjectDecisionFile([object]$Project, [string]$CurrentRoot
         if ($run.reviewRoot) { [void]$candidateRoots.Add([string]$run.reviewRoot) }
     }
 
-    $seen = @{}
+    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    $result = New-Object "System.Collections.Generic.List[string]"
     foreach ($candidateRoot in $candidateRoots) {
         try {
             $candidateFull = [System.IO.Path]::GetFullPath($candidateRoot).TrimEnd("\", "/")
         } catch {
             continue
         }
-        $key = $candidateFull.ToLowerInvariant()
-        if ($seen.ContainsKey($key)) { continue }
-        $seen[$key] = $true
-        if ($candidateFull -eq $currentFull) { continue }
+        if (-not $seen.Add($candidateFull) -or $candidateFull -eq $currentFull) { continue }
+        if (Test-Path -LiteralPath $candidateFull -PathType Container) { [void]$result.Add($candidateFull) }
+    }
+    return $result.ToArray()
+}
 
+function Find-PreviousProjectDecisionFile([object]$Project, [string]$CurrentRoot) {
+    foreach ($candidateFull in @(Get-PreviousProjectReviewRoots -Project $Project -CurrentRoot $CurrentRoot)) {
         $decisionFile = Join-Path $candidateFull "review-decisions.json"
         if (Test-Path -LiteralPath $decisionFile -PathType Leaf) { return $decisionFile }
     }
     return ""
+}
+
+function Find-PreviousProjectComparisonFile([object]$Project, [string]$CurrentRoot) {
+    foreach ($candidateFull in @(Get-PreviousProjectReviewRoots -Project $Project -CurrentRoot $CurrentRoot)) {
+        $auditRoot = Join-Path $candidateFull "_TranslationAudit"
+        if (-not (Test-Path -LiteralPath $auditRoot -PathType Container)) { continue }
+        $comparisonFile = Get-ChildItem -LiteralPath $auditRoot -File -Filter "*-comparison.json" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($comparisonFile) { return $comparisonFile.FullName }
+    }
+    return ""
+}
+
+function Get-ReviewSourceIdentity([object]$Row) {
+    if (-not $Row) { return "" }
+    $kind = Get-OptionalRowText -Row $Row -Names @("kind")
+    $defClass = Get-OptionalRowText -Row $Row -Names @("defClass", "typeName")
+    $node = Get-OptionalRowText -Row $Row -Names @("node", "key")
+    if (-not $node) { return "" }
+    $className = if ($kind -eq "Keyed") { "Keyed" } elseif ($defClass) { $defClass } else { $kind }
+    if (-not $className) { return "" }
+    return "$className+$node"
+}
+
+function Test-ReviewSourceTextEqual([string]$Left, [string]$Right) {
+    $leftText = ((ConvertTo-FlatString $Left) -replace "`r`n", "`n" -replace "`r", "`n").Trim()
+    $rightText = ((ConvertTo-FlatString $Right) -replace "`r`n", "`n" -replace "`r", "`n").Trim()
+    $leftText = [System.Text.RegularExpressions.Regex]::Replace($leftText, '[ \t\u00A0]+(?=\n|$)', '')
+    $rightText = [System.Text.RegularExpressions.Regex]::Replace($rightText, '[ \t\u00A0]+(?=\n|$)', '')
+    return [string]::Equals($leftText, $rightText, [System.StringComparison]::Ordinal)
 }
 
 function Import-PreviousProjectDecisions {
@@ -2923,15 +2963,17 @@ function Import-PreviousProjectDecisions {
     if ($project.Count -eq 0) { return }
     $currentRoot = [System.IO.Path]::GetFullPath($script:reviewRoot)
     $previousDecisionFile = Find-PreviousProjectDecisionFile -Project $project[0] -CurrentRoot $currentRoot
-    if (-not $previousDecisionFile) { return }
+    $previousComparisonFile = Find-PreviousProjectComparisonFile -Project $project[0] -CurrentRoot $currentRoot
+    if (-not $previousDecisionFile -and -not $previousComparisonFile) { return }
 
     try {
-        $json = [System.IO.File]::ReadAllText($previousDecisionFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        $json = if ($previousDecisionFile) { [System.IO.File]::ReadAllText($previousDecisionFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null }
         $targetKeyLookup = @{}
         $uniqueKeyLookup = @{}
         $ambiguousKeys = @{}
         $idOnlyLookup = @{}
-        foreach ($item in @($json.items)) {
+        $previousDecisionItems = if ($json) { @($json.items) } else { @() }
+        foreach ($item in $previousDecisionItems) {
             if (-not $item) { continue }
             if ($item.key) {
                 $plainKey = "key:$($item.key)"
@@ -2945,6 +2987,25 @@ function Import-PreviousProjectDecisions {
                 }
             } elseif ($item.id) {
                 $idOnlyLookup["id:$($item.id)"] = $item
+            }
+        }
+
+        $previousSourceLookup = New-Object "System.Collections.Generic.Dictionary[string,string]" ([System.StringComparer]::OrdinalIgnoreCase)
+        $ambiguousSourceIdentities = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+        if ($previousComparisonFile) {
+            [object[]]$previousRows = [System.IO.File]::ReadAllText($previousComparisonFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            foreach ($previousRow in $previousRows) {
+                $sourceIdentity = Get-ReviewSourceIdentity $previousRow
+                if (-not $sourceIdentity -or $ambiguousSourceIdentities.Contains($sourceIdentity)) { continue }
+                $previousSource = ConvertTo-FlatString $previousRow.source
+                if ($previousSourceLookup.ContainsKey($sourceIdentity)) {
+                    if (-not (Test-ReviewSourceTextEqual -Left $previousSourceLookup[$sourceIdentity] -Right $previousSource)) {
+                        [void]$previousSourceLookup.Remove($sourceIdentity)
+                        [void]$ambiguousSourceIdentities.Add($sourceIdentity)
+                    }
+                    continue
+                }
+                $previousSourceLookup[$sourceIdentity] = $previousSource
             }
         }
 
@@ -2965,30 +3026,52 @@ function Import-PreviousProjectDecisions {
                 $idKey = "id:$($row.id)"
                 if ($idOnlyLookup.ContainsKey($idKey)) { $item = $idOnlyLookup[$idKey] }
             }
-            if (-not $item) { continue }
-            $decision = [pscustomobject]@{
-                id = [string]$row.id
-                key = [string]$row.key
-                target = $target
-                status = if ($item.status) { [string]$item.status } else { "pending" }
-                text = ConvertTo-FlatString $item.text
-                note = [string]$item.note
-                translationOrigin = if ($item.PSObject.Properties["translationOrigin"]) { [string]$item.translationOrigin } else { "" }
-                translationUpdatedAt = if ($item.PSObject.Properties["translationUpdatedAt"]) { [string]$item.translationUpdatedAt } else { "" }
-                sourceHash = [string]$item.sourceHash
-                sourceText = ConvertTo-FlatString $item.sourceText
-                sourceChanged = if ($item.PSObject.Properties["sourceChanged"]) { ConvertTo-BoolValue $item.sourceChanged } else { $false }
-                previousSourceText = if ($item.PSObject.Properties["previousSourceText"]) { ConvertTo-FlatString $item.previousSourceText } else { "" }
-                updatedAt = [string]$item.updatedAt
+            $decision = if ($item) {
+                [pscustomobject]@{
+                    id = [string]$row.id
+                    key = [string]$row.key
+                    target = $target
+                    status = if ($item.status) { [string]$item.status } else { "pending" }
+                    text = ConvertTo-FlatString $item.text
+                    note = [string]$item.note
+                    translationOrigin = if ($item.PSObject.Properties["translationOrigin"]) { [string]$item.translationOrigin } else { "" }
+                    translationUpdatedAt = if ($item.PSObject.Properties["translationUpdatedAt"]) { [string]$item.translationUpdatedAt } else { "" }
+                    sourceHash = [string]$item.sourceHash
+                    sourceText = ConvertTo-FlatString $item.sourceText
+                    sourceChanged = if ($item.PSObject.Properties["sourceChanged"]) { ConvertTo-BoolValue $item.sourceChanged } else { $false }
+                    previousSourceText = if ($item.PSObject.Properties["previousSourceText"]) { ConvertTo-FlatString $item.previousSourceText } else { "" }
+                    updatedAt = [string]$item.updatedAt
+                }
+            } else {
+                New-Decision $row
             }
             Normalize-DecisionForRow -Row $row -Decision $decision
+            $sourceIdentity = Get-ReviewSourceIdentity $row
+            $changedFromPreviousSnapshot = $false
+            if ($sourceIdentity -and $previousSourceLookup.ContainsKey($sourceIdentity)) {
+                $previousSource = ConvertTo-FlatString $previousSourceLookup[$sourceIdentity]
+                $currentSource = ConvertTo-FlatString $row.source
+                if (-not [string]::IsNullOrWhiteSpace($previousSource) -and -not (Test-ReviewSourceTextEqual -Left $previousSource -Right $currentSource)) {
+                    $changedFromPreviousSnapshot = $true
+                    $decision.status = "pending"
+                    if (-not (ConvertTo-BoolValue $decision.sourceChanged) -or [string]::IsNullOrWhiteSpace((ConvertTo-FlatString $decision.previousSourceText))) {
+                        $decision.previousSourceText = $previousSource
+                    }
+                    $decision.sourceChanged = $true
+                    $decision.sourceHash = Get-RowSourceFingerprint $row
+                    $decision.sourceText = $currentSource
+                    if ([string]::IsNullOrWhiteSpace([string]$decision.updatedAt)) { $decision.updatedAt = (Get-Date).ToString("o") }
+                }
+            }
+            if ($item -or $changedFromPreviousSnapshot -or (ConvertTo-BoolValue $decision.sourceChanged)) {
+                $script:decisions[(Get-RowIdentity $row)] = $decision
+            }
+            if ($item) { $imported++ }
             if (ConvertTo-BoolValue $decision.sourceChanged) { $changedSources++ }
-            $script:decisions[(Get-RowIdentity $row)] = $decision
-            $imported++
         }
-        if ($imported -gt 0) {
+        if ($imported -gt 0 -or $changedSources -gt 0) {
             Add-Log "이전 검수 상태 ${imported}개를 이어받았습니다."
-            if ($changedSources -gt 0) { Add-Log "원문이 바뀐 ${changedSources}개 항목을 변경됨·미번역 상태로 표시했습니다." }
+            if ($changedSources -gt 0) { Add-Log "직전 프로젝트 원문과 달라진 ${changedSources}개 항목을 변경됨·미번역 상태로 표시했습니다." }
             $script:dirty = $true
             Save-Decisions
         }
@@ -3012,7 +3095,7 @@ function Save-Decisions {
         } elseif (-not [string]::IsNullOrWhiteSpace($existing)) {
             if ($row.PSObject.Properties["existingOrigin"] -and $row.existingOrigin) { [string]$row.existingOrigin } else { "existing" }
         } else { "" }
-        $defaultChanged = $defaultOrigin -eq "rmk" -and $row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $row.rmkSourceChanged)
+        $defaultChanged = $defaultOrigin -ne "ai" -and $row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $row.rmkSourceChanged)
         $defaultStatus = if ([string]::IsNullOrWhiteSpace($defaultText) -or $defaultChanged) { "pending" } else { "translated" }
         $defaultTranslationUpdatedAt = if ($row.PSObject.Properties["translationUpdatedAt"]) { [string]$row.translationUpdatedAt } else { "" }
 
@@ -3086,19 +3169,22 @@ function Save-CurrentEdit {
     if ($script:loading -or $script:currentRowIndex -lt 0 -or $script:currentRowIndex -ge $script:rows.Count) { return }
     $row = $script:rows[$script:currentRowIndex]
     $decision = Get-Decision $row
-    $textChanged = $decision.text -ne $txtTranslation.Text
+    $editorText = ConvertTo-FlatString $txtTranslation.Text
+    $textChanged = (ConvertTo-FlatString $decision.text) -ne $editorText
+    $textEditedByUser = $textChanged -and $script:translationEditedByUser
+    if ($textChanged -and -not $textEditedByUser) { $textChanged = $false }
     $noteChanged = $decision.note -ne $txtMemo.Text
     if ($textChanged -or $noteChanged) {
         $before = if ($script:reviewStats) { Get-DecisionStateSnapshot $row } else { $null }
-        $decision.text = ConvertTo-FlatString $txtTranslation.Text
+        if ($textChanged) { $decision.text = $editorText }
         $decision.note = [string]$txtMemo.Text
-        if ($textChanged) {
+        if ($textEditedByUser) {
             $decision.translationOrigin = if ($script:translationEditorOrigin) { [string]$script:translationEditorOrigin } else { "local" }
             $decision.translationUpdatedAt = (Get-Date).ToString("o")
         }
         if ([string]::IsNullOrWhiteSpace($decision.text)) {
             $decision.status = "pending"
-        } elseif ($decision.status -eq "pending" -or $decision.status -eq "approved") {
+        } elseif ($textEditedByUser -and ($decision.status -eq "pending" -or $decision.status -eq "approved")) {
             $decision.status = "translated"
             $decision.sourceChanged = $false
             $decision.previousSourceText = ""
@@ -3412,7 +3498,7 @@ function Build-FileGroups {
             } elseif (-not [string]::IsNullOrWhiteSpace($existing)) {
                 if ($row.existingOrigin) { [string]$row.existingOrigin } else { "existing" }
             } else { "" }
-            $rowUpdated = $defaultOrigin -eq "rmk" -and (ConvertTo-BoolValue $row.rmkSourceChanged)
+            $rowUpdated = $defaultOrigin -ne "ai" -and (ConvertTo-BoolValue $row.rmkSourceChanged)
             $rowStatus = if ([string]::IsNullOrWhiteSpace($defaultText) -or $rowUpdated) { "pending" } else { "translated" }
         }
         switch ($rowStatus) {
@@ -4363,7 +4449,11 @@ function Start-Translation {
         Add-Log "번역 방식: 전체 항목의 번역 후보를 새로 생성"
     }
     if ($rmkReference) { Add-Log "RMK 기존 번역 참조: $rmkReference" }
-    if ($rmkWorkbook) { Add-Log "RMK 번역 당시 원문 비교: $rmkWorkbook" }
+    if ($rmkWorkbook) {
+        Add-Log "RMK 번역 당시 원문 비교: $rmkWorkbook"
+    } elseif ($rmkReference) {
+        Add-Log "RMK 원문 기록 XLSX 없음: 직전 로컬 프로젝트 원문 이력으로 업데이트 여부를 비교합니다."
+    }
 
     $argumentFile = New-TempFilePath "translation-arguments" ".json"
     $argumentPayload = [ordered]@{ version = 1; parameters = $translationParameters }
@@ -4467,7 +4557,11 @@ function Load-SourceOnlyForSelectedMod {
     Add-Log "원문 로드 시작: $modRoot"
     Add-Log "원문 기준 언어: $sourceLanguage"
     if ($rmkReference) { Add-Log "RMK 기존 번역을 기본 번역으로 불러옵니다: $rmkReference" }
-    if ($rmkWorkbook) { Add-Log "RMK 번역 당시 원문과 현재 원문을 비교합니다: $rmkWorkbook" }
+    if ($rmkWorkbook) {
+        Add-Log "RMK 번역 당시 원문과 현재 원문을 비교합니다: $rmkWorkbook"
+    } elseif ($rmkReference) {
+        Add-Log "RMK 원문 기록 XLSX 없음: 직전 로컬 프로젝트 원문 이력으로 업데이트 여부를 비교합니다."
+    }
 
     $argumentFile = New-TempFilePath "source-refresh-arguments" ".json"
     $argumentPayload = [ordered]@{ version = 1; parameters = $translationParameters }
@@ -4532,8 +4626,10 @@ function Apply-ReviewedTranslations([string]$ApplyStatus = "ApprovedOnly") {
     $modeLabel = if ($ApplyStatus -eq "TranslatedAndApproved") { "번역됨 적용" } else { "검토됨 적용" }
     $eligibleCount = 0
     foreach ($row in $script:rows) {
-        $status = [string](Get-Decision $row).status
-        if ($status -eq "approved" -or ($ApplyStatus -eq "TranslatedAndApproved" -and $status -eq "translated")) {
+        $decision = Get-Decision $row
+        $status = [string]$decision.status
+        if (-not (ConvertTo-BoolValue $decision.sourceChanged) -and
+            ($status -eq "approved" -or ($ApplyStatus -eq "TranslatedAndApproved" -and $status -eq "translated"))) {
             $eligibleCount++
         }
     }
@@ -4639,17 +4735,18 @@ function Get-ProjectReviewStats([object]$Project) {
             }
             if ($status -eq "reviewed") { $status = "approved" }
 
-            $sourceChanged = $false
+            $defaultOrigin = Get-DefaultTranslationOriginForRow $row
+            $sourceChanged = $defaultOrigin -ne "ai" -and $row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $row.rmkSourceChanged)
             if ($decision) {
                 $source = ConvertTo-FlatString $row.source
-                $sourceChanged = $decision.PSObject.Properties["sourceChanged"] -and (ConvertTo-BoolValue $decision.sourceChanged)
+                $sourceChanged = $sourceChanged -or ($decision.PSObject.Properties["sourceChanged"] -and (ConvertTo-BoolValue $decision.sourceChanged))
                 if (-not $sourceChanged -and $decision.PSObject.Properties["sourceText"] -and -not [string]::IsNullOrWhiteSpace([string]$decision.sourceText)) {
                     $sourceChanged = $sourceChanged -or ((ConvertTo-FlatString $decision.sourceText) -ne $source)
                 } elseif (-not $sourceChanged -and $decision.PSObject.Properties["sourceHash"] -and -not [string]::IsNullOrWhiteSpace([string]$decision.sourceHash)) {
                     $sourceChanged = ([string]$decision.sourceHash) -ne (Get-TextFingerprint $source)
                 }
-                if ($sourceChanged) { $status = "pending" }
             }
+            if ($sourceChanged) { $status = "pending" }
             if ($sourceChanged) { $stats.Updated++ }
 
             switch ($status) {

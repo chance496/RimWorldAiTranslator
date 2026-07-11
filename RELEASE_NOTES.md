@@ -1,3 +1,10 @@
+# Unreleased
+
+## Changes
+
+- Detect source changes from the previous full project snapshot when an RMK entry has no source-history XLSX, so imported RMK translations cannot hide an update.
+- Create or merge a RimworldExtractor-compatible source-history XLSX during RMK export while preserving existing workbook styles, comments, extra columns, required-mod data, and unreviewed historical source text.
+
 # RimWorld AI Translator v0.2.0
 
 ## Changes
