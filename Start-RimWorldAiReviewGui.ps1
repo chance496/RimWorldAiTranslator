@@ -104,7 +104,14 @@ $script:glossaryLoaded = $false
 $script:glossaryIndexedTerms = @()
 $script:glossaryPrefixIndex = @{}
 $script:DisplayLocalizationFieldPattern = '^(label|labelshort|description|jobstring|reportstring|deathmessage|deathmessagefemale|deathmessagemale|letterlabel|lettertext|header|headertip|summary|formatstring|formatstringunfinalized|fixedname|reason|text|slateref)$'
-$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
+$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|nodeclass|debuglabel|tagdef|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
+$script:DeniedLocalizationFields = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+$defFieldRulePath = Join-Path $scriptRoot "rimworld-def-field-rules.txt"
+if (Test-Path -LiteralPath $defFieldRulePath -PathType Leaf) {
+    foreach ($line in [System.IO.File]::ReadAllLines($defFieldRulePath, [System.Text.Encoding]::UTF8)) {
+        if ($line -match '^\s*deny\t([A-Za-z_][A-Za-z0-9_]*)\s*$') { [void]$script:DeniedLocalizationFields.Add($matches[1]) }
+    }
+}
 $script:appDataRoot = Join-Path $env:LOCALAPPDATA "RimWorldAiTranslator"
 $script:projectStorePath = Join-Path $script:appDataRoot "projects.json"
 $script:settingsPath = Join-Path $script:appDataRoot "settings.json"
@@ -313,7 +320,71 @@ function Ensure-AppDataStore {
 
 function Write-Utf8JsonFile([string]$Path, [object]$Value, [int]$Depth = 8) {
     $json = ConvertTo-Json -InputObject $Value -Depth $Depth -Compress
-    [System.IO.File]::WriteAllText($Path, $json, [System.Text.UTF8Encoding]::new($false))
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
+
+    $tempPath = Join-Path $directory (".{0}.{1}.tmp" -f [System.IO.Path]::GetFileName($fullPath), [System.Guid]::NewGuid().ToString("N"))
+    $backupPath = "$fullPath.bak"
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $bytes = $encoding.GetBytes($json)
+    try {
+        $stream = [System.IO.FileStream]::new(
+            $tempPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        } finally {
+            $stream.Dispose()
+        }
+
+        if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
+            [System.IO.File]::Replace($tempPath, $fullPath, $backupPath, $true)
+        } else {
+            [System.IO.File]::Move($tempPath, $fullPath)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tempPath -PathType Leaf) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-Utf8JsonStoreExists([string]$Path) {
+    return (Test-Path -LiteralPath $Path -PathType Leaf) -or (Test-Path -LiteralPath "$Path.bak" -PathType Leaf)
+}
+
+function Read-Utf8JsonFile([string]$Path, [switch]$AllowMissing) {
+    $candidates = @($Path, "$Path.bak")
+    $errors = New-Object "System.Collections.Generic.List[string]"
+    $found = $false
+    foreach ($candidate in $candidates) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        $found = $true
+        try {
+            $raw = [System.IO.File]::ReadAllText($candidate, [System.Text.Encoding]::UTF8)
+            if ([string]::IsNullOrWhiteSpace($raw)) { throw "JSON file is empty." }
+            $value = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($candidate -ne $Path) {
+                if (-not $script:jsonRecoveryNotices) {
+                    $script:jsonRecoveryNotices = New-Object "System.Collections.Generic.List[string]"
+                }
+                [void]$script:jsonRecoveryNotices.Add("손상된 상태 파일을 백업에서 복구해 읽었습니다: $Path")
+            }
+            return $value
+        } catch {
+            [void]$errors.Add("$candidate : $($_.Exception.Message)")
+        }
+    }
+    if ($AllowMissing -and -not $found) { return $null }
+    if (-not $found) { throw "JSON file was not found: $Path" }
+    throw "JSON file and its backup could not be read. $([string]::Join(' | ', $errors))"
 }
 
 function Reset-ApiProviderSettings {
@@ -349,9 +420,9 @@ function Load-AppSettings {
     $script:autoSave = $true
     $script:rmkWorkspaceRoot = ""
     $script:rmkUseExisting = $true
-    if (-not (Test-Path -LiteralPath $script:settingsPath -PathType Leaf)) { return }
+    if (-not (Test-Utf8JsonStoreExists $script:settingsPath)) { return }
     try {
-        $settings = [System.IO.File]::ReadAllText($script:settingsPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        $settings = Read-Utf8JsonFile $script:settingsPath
         if ([string]$settings.themeMode -in @("System", "Light", "Dark")) {
             $script:themeMode = [string]$settings.themeMode
         }
@@ -470,6 +541,22 @@ function Remove-TempFiles {
         }
     }
     $script:tempFiles.Clear()
+}
+
+function Remove-StaleTempFiles {
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) "RimWorldAiTranslatorGui"
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return }
+    try {
+        $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return }
+        $cutoff = [DateTime]::UtcNow.AddDays(-2)
+        foreach ($file in Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue) {
+            if ($file.LastWriteTimeUtc -lt $cutoff) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+    }
 }
 
 function Get-ApiKeyLines([string]$Text) {
@@ -649,9 +736,9 @@ function Invalidate-DashboardProjectData([string]$ProjectId = "") {
 function Load-ProjectStatsCache {
     $script:projectStatsCache = @{}
     $script:projectStatsCacheDirty = $false
-    if (-not (Test-Path -LiteralPath $script:projectStatsCachePath -PathType Leaf)) { return }
+    if (-not (Test-Utf8JsonStoreExists $script:projectStatsCachePath)) { return }
     try {
-        $json = [System.IO.File]::ReadAllText($script:projectStatsCachePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        $json = Read-Utf8JsonFile $script:projectStatsCachePath
         if ([int]$json.version -ne 1) { return }
         foreach ($entry in @($json.entries)) {
             if (-not $entry -or [string]::IsNullOrWhiteSpace([string]$entry.projectId) -or
@@ -690,9 +777,9 @@ function Load-ProjectStore {
     Ensure-AppDataStore
     $script:dashboardProjectsDirty = $true
     $script:projects = @()
-    if (Test-Path -LiteralPath $script:projectStorePath -PathType Leaf) {
+    if (Test-Utf8JsonStoreExists $script:projectStorePath) {
         try {
-            $json = [System.IO.File]::ReadAllText($script:projectStorePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $json = Read-Utf8JsonFile $script:projectStorePath
             $script:projects = @($json.projects)
         } catch {
             $script:projects = @()
@@ -1527,9 +1614,9 @@ function Save-ModCatalogCache {
 }
 
 function Try-LoadModCatalogCache([switch]$FastValidation) {
-    if (-not (Test-Path -LiteralPath $script:modCatalogCachePath -PathType Leaf)) { return $false }
+    if (-not (Test-Utf8JsonStoreExists $script:modCatalogCachePath)) { return $false }
     try {
-        $cache = [System.IO.File]::ReadAllText($script:modCatalogCachePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        $cache = Read-Utf8JsonFile $script:modCatalogCachePath
         if ([int]$cache.version -ne 2) { return $false }
         if ($FastValidation) {
             if (-not (Test-ModContainerStateFast -Cached @($cache.containers))) { return $false }
@@ -2332,27 +2419,45 @@ function Refresh-StatusFilterButtons {
     }
 }
 
-function Get-ProtectedTokensForValidation([string]$Text) {
-    $tokens = New-Object "System.Collections.Generic.HashSet[string]"
-    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
-    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
-        [void]$tokens.Add($match.Value)
+function Get-ProtectedTokenCountsForValidation([string]$Text) {
+    $counts = New-Object "System.Collections.Generic.Dictionary[string,int]" ([System.StringComparer]::Ordinal)
+    $pattern = '(\\r\\n|\\[nrt]|\{[^}\r\n]+\}|\[[A-Za-z0-9_.:;''" -]+\]|</?[A-Za-z][^>\r\n]*>|\$[A-Za-z_][A-Za-z0-9_]*\$?|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
+    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches([string]$Text, $pattern)) {
+        $token = [string]$match.Value
+        if ($counts.ContainsKey($token)) { $counts[$token]++ } else { $counts[$token] = 1 }
     }
-    $result = New-Object string[] $tokens.Count
-    $tokens.CopyTo($result)
-    return $result
+    return $counts
 }
 
-function Get-MissingTranslationTokens([string]$Source, [string]$Translation) {
+function Get-TranslationTokenIssues([string]$Source, [string]$Translation) {
+    $sourceCounts = Get-ProtectedTokenCountsForValidation $Source
+    $targetCounts = Get-ProtectedTokenCountsForValidation $Translation
     $missing = New-Object "System.Collections.Generic.List[string]"
-    foreach ($token in (Get-ProtectedTokensForValidation $Source)) {
-        if (-not $Translation.Contains($token)) { [void]$missing.Add($token) }
+    $unexpected = New-Object "System.Collections.Generic.List[string]"
+    $countMismatches = New-Object "System.Collections.Generic.List[string]"
+    foreach ($token in $sourceCounts.Keys) {
+        $sourceCount = [int]$sourceCounts[$token]
+        $targetCount = if ($targetCounts.ContainsKey($token)) { [int]$targetCounts[$token] } else { 0 }
+        if ($targetCount -lt $sourceCount) { [void]$missing.Add($token) }
+        if ($targetCount -ne $sourceCount) { [void]$countMismatches.Add("$token ($sourceCount->$targetCount)") }
+    }
+    foreach ($token in $targetCounts.Keys) {
+        $targetCount = [int]$targetCounts[$token]
+        $sourceCount = if ($sourceCounts.ContainsKey($token)) { [int]$sourceCounts[$token] } else { 0 }
+        if ($targetCount -gt $sourceCount) { [void]$unexpected.Add($token) }
     }
     $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($Source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
+    $grammarPrefixMoved = $false
     if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($Translation, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) {
+        $grammarPrefixMoved = $true
         if (-not $missing.Contains($grammarPrefix.Groups[1].Value)) { [void]$missing.Add($grammarPrefix.Groups[1].Value) }
     }
-    return $missing.ToArray()
+    return [pscustomobject]@{
+        MissingTokens = $missing.ToArray()
+        UnexpectedTokens = $unexpected.ToArray()
+        TokenCountMismatches = $countMismatches.ToArray()
+        GrammarPrefixMoved = $grammarPrefixMoved
+    }
 }
 
 function Get-RmkReferenceWorkbookPath([object]$Project = $null) {
@@ -2370,9 +2475,11 @@ function Get-InternalLocalizationIdentifierReason([object]$Row) {
     $typeLower = if ($Row.PSObject.Properties["defClass"] -and $Row.defClass) { ([string]$Row.defClass).Trim().ToLowerInvariant() } else { "" }
     $fieldLower = if ($Row.PSObject.Properties["field"] -and $Row.field) { ([string]$Row.field).Trim().ToLowerInvariant() } else { ($keyLower -replace "^.*\.", "") }
     $isDisplayField = $fieldLower -match $script:DisplayLocalizationFieldPattern
+    if ($script:DeniedLocalizationFields.Contains($fieldLower)) { return "RimWorld NoTranslate 필드 '$fieldLower'" }
     if ($fieldLower -match $script:TechnicalLocalizationFieldPattern) { return "내부 참조 필드 '$fieldLower'" }
     if ($keyLower -match "\.alienrace\.generalsettings\.alienpartgenerator\.colorchannels\.") { return "AlienRace 색상 채널 식별자" }
     if ($fieldLower -eq "name" -and $keyLower -match "\.alienrace\.") { return "AlienRace 내부 이름" }
+    if ($fieldLower -eq "name" -and $keyLower -match "\.(colorchannels|bodyaddons|powermodes)\.") { return "실행 중 사용하는 목록 식별자" }
     if ($keyLower -match "\.(graphicpaths?|rendernodes?|rendertree)\." -and -not $isDisplayField) { return "렌더링 또는 그래픽 경로 식별자" }
     if ($typeLower -match "pawnrendertreedef" -and -not $isDisplayField) { return "PawnRenderTreeDef 내부 식별자" }
     return ""
@@ -2407,16 +2514,22 @@ function Get-TranslationValidation([object]$Row, [string]$Translation) {
     $translationText = ConvertTo-FlatString $Translation
     $isBlank = [string]::IsNullOrWhiteSpace($translationText)
     $isPathological = Test-PathologicalTranslationText $translationText
-    $missingTokens = @(Get-MissingTranslationTokens -Source $source -Translation $translationText)
+    $tokenIssues = Get-TranslationTokenIssues -Source $source -Translation $translationText
+    $missingTokens = @($tokenIssues.MissingTokens)
+    $unexpectedTokens = @($tokenIssues.UnexpectedTokens)
+    $tokenCountMismatches = @($tokenIssues.TokenCountMismatches)
     $sameAsSource = [string]::Equals($source, $translationText, [System.StringComparison]::Ordinal)
     $hasKorean = Test-ContainsKoreanText $translationText
     $invalidKoreanParticles = @(Get-InvalidKoreanParticleNotations $translationText)
-    $safeToApply = -not $isBlank -and -not $isPathological -and $missingTokens.Count -eq 0 -and $invalidKoreanParticles.Count -eq 0 -and -not $sameAsSource -and $hasKorean
+    $safeToApply = -not $isBlank -and -not $isPathological -and $missingTokens.Count -eq 0 -and $unexpectedTokens.Count -eq 0 -and $tokenCountMismatches.Count -eq 0 -and -not $tokenIssues.GrammarPrefixMoved -and $invalidKoreanParticles.Count -eq 0 -and -not $sameAsSource -and $hasKorean
     return [pscustomobject]@{
         SafeToApply = $safeToApply
         IsBlank = $isBlank
         IsPathological = $isPathological
         MissingTokens = $missingTokens
+        UnexpectedTokens = $unexpectedTokens
+        TokenCountMismatches = $tokenCountMismatches
+        GrammarPrefixMoved = [bool]$tokenIssues.GrammarPrefixMoved
         InvalidKoreanParticles = $invalidKoreanParticles
         SameAsSource = $sameAsSource
         HasKorean = $hasKorean
@@ -2461,6 +2574,9 @@ function Get-RowWarnings([object]$Row, [string]$Translation) {
     if ($validation.IsBlank) { [void]$warnings.Add("빈 번역") }
     if ($validation.IsPathological) { [void]$warnings.Add("비정상 개행") }
     if ($validation.MissingTokens.Count -gt 0) { [void]$warnings.Add("토큰 누락: $([string]::Join('|', $validation.MissingTokens))") }
+    if ($validation.UnexpectedTokens.Count -gt 0) { [void]$warnings.Add("추가된 토큰: $([string]::Join('|', $validation.UnexpectedTokens))") }
+    if ($validation.TokenCountMismatches.Count -gt 0) { [void]$warnings.Add("토큰 개수 변경: $([string]::Join('|', $validation.TokenCountMismatches))") }
+    if ($validation.GrammarPrefixMoved) { [void]$warnings.Add("문법 접두사 위치 변경") }
     if ($validation.InvalidKoreanParticles.Count -gt 0) { [void]$warnings.Add("림월드 조사 표기 오류: $([string]::Join('|', $validation.InvalidKoreanParticles))") }
     if ($validation.SameAsSource) { [void]$warnings.Add("원문과 동일") }
     if (-not $validation.HasKorean) { [void]$warnings.Add("한글 없음") }
@@ -2859,14 +2975,15 @@ function Load-Decisions {
     $script:decisions = @{}
     $script:validateLoadedDecisionSources = $false
     $path = Get-DecisionPath
-    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return }
+    if (-not $path -or -not (Test-Utf8JsonStoreExists $path)) { return }
     try {
         if ($script:comparisonFile -and (Test-Path -LiteralPath $script:comparisonFile -PathType Leaf)) {
-            $decisionInfo = Get-Item -LiteralPath $path -ErrorAction Stop
+            $decisionReadPath = if (Test-Path -LiteralPath $path -PathType Leaf) { $path } else { "$path.bak" }
+            $decisionInfo = Get-Item -LiteralPath $decisionReadPath -ErrorAction Stop
             $comparisonInfo = Get-Item -LiteralPath $script:comparisonFile -ErrorAction Stop
             $script:validateLoadedDecisionSources = $comparisonInfo.LastWriteTimeUtc -gt $decisionInfo.LastWriteTimeUtc
         }
-        $json = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        $json = Read-Utf8JsonFile $path
         foreach ($item in @($json.items)) {
             $key = if ($item.id) { "id:$($item.id)" } else { "key:$($item.key)" }
             $loadedStatus = if ($item.status) { [string]$item.status } else { "pending" }
@@ -4698,8 +4815,9 @@ function Get-ProjectReviewStats([object]$Project) {
         $comparisonInfo = Get-Item -LiteralPath $comparison -ErrorAction Stop
         $decisionPath = Join-Path ([string]$Project.latestReviewRoot) "review-decisions.json"
         $decisionStamp = "missing"
-        if (Test-Path -LiteralPath $decisionPath -PathType Leaf) {
-            $decisionInfo = Get-Item -LiteralPath $decisionPath -ErrorAction Stop
+        if (Test-Utf8JsonStoreExists $decisionPath) {
+            $decisionReadPath = if (Test-Path -LiteralPath $decisionPath -PathType Leaf) { $decisionPath } else { "$decisionPath.bak" }
+            $decisionInfo = Get-Item -LiteralPath $decisionReadPath -ErrorAction Stop
             $decisionStamp = "$($decisionInfo.Length):$($decisionInfo.LastWriteTimeUtc.Ticks)"
         }
         $cacheKey = if ($Project.id) { [string]$Project.id } else { [System.IO.Path]::GetFullPath([string]$Project.latestReviewRoot).ToLowerInvariant() }
@@ -4712,8 +4830,8 @@ function Get-ProjectReviewStats([object]$Project) {
         $parsedRows = [System.IO.File]::ReadAllText($comparison, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
         $rows = @($parsedRows | Where-Object { -not (Get-InternalLocalizationIdentifierReason $_) })
         $decisions = @{}
-        if (Test-Path -LiteralPath $decisionPath -PathType Leaf) {
-            $json = [System.IO.File]::ReadAllText($decisionPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if (Test-Utf8JsonStoreExists $decisionPath) {
+            $json = Read-Utf8JsonFile $decisionPath
             foreach ($item in @($json.items)) {
                 if (-not $item) { continue }
                 if ($item.id) { $decisions["id:$($item.id)"] = $item }
@@ -4851,7 +4969,11 @@ function Refresh-DashboardProjects {
     if (-not $flowDashboardProjects) { return }
     $filter = if ($txtDashboardSearch) { $txtDashboardSearch.Text.Trim().ToLowerInvariant() } else { "" }
     $projectRevision = [string]::Join(";", @($script:projects | ForEach-Object { "$($_.id):$($_.updatedAt):$($_.latestReviewRoot)" }))
-    $renderKey = "$filter|$($script:themeMode)|$(Get-IsWindowsDarkMode)|$($script:highContrast)|$($script:textSize)|$projectRevision"
+    $availableWidth = [Math]::Max(320, $flowDashboardProjects.ClientSize.Width - 20)
+    $columnCount = [Math]::Max(1, [Math]::Min(4, [int][Math]::Floor($availableWidth / 360)))
+    $cardWidth = [Math]::Max(320, [Math]::Min(440, [int][Math]::Floor($availableWidth / $columnCount) - 20))
+    $cardInnerWidth = $cardWidth - 44
+    $renderKey = "$filter|$($script:themeMode)|$(Get-IsWindowsDarkMode)|$($script:highContrast)|$($script:textSize)|$availableWidth|$projectRevision"
     if (-not $script:dashboardProjectsDirty -and $script:lastDashboardRenderKey -eq $renderKey) { return }
     $projectAccent = if ($script:highContrast) {
         if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(224, 177, 92) } else { [System.Drawing.Color]::FromArgb(119, 77, 22) }
@@ -4880,7 +5002,7 @@ function Refresh-DashboardProjects {
             $stats = Get-ProjectReviewStats $project
             $hasReview = $project.latestReviewRoot -and (Test-Path -LiteralPath ([string]$project.latestReviewRoot) -PathType Container)
             $card = [System.Windows.Forms.Panel]::new()
-            $card.Size = [System.Drawing.Size]::new(410, 204)
+            $card.Size = [System.Drawing.Size]::new($cardWidth, 204)
             $card.Margin = [System.Windows.Forms.Padding]::new(10)
             $card.BackColor = $script:itemCardBack
             $card.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
@@ -4891,42 +5013,43 @@ function Refresh-DashboardProjects {
             $accentLine = [System.Windows.Forms.Panel]::new()
             $accentLine.SetBounds(0, 0, 4, 204)
             $accentLine.BackColor = $projectAccent
-            $lblName = New-Label $name 22 18 366 26 $script:itemText 11.5 ([System.Drawing.FontStyle]::Bold)
+            $lblName = New-Label $name 22 18 $cardInnerWidth 26 $script:itemText 11.5 ([System.Drawing.FontStyle]::Bold)
             $lblName.AutoEllipsis = $true
             if ($toolTip) { $toolTip.SetToolTip($lblName, $name) }
             $idText = if ($project.workshopId) { "Workshop $($project.workshopId)" } elseif ($project.packageId) { [string]$project.packageId } else { Split-Path -Leaf ([string]$project.modRoot) }
             $sourceFolder = if ($project.PSObject.Properties["sourceLanguageFolder"]) { [string]$project.sourceLanguageFolder } else { "Auto" }
             $sourceText = if ($sourceFolder -eq "Auto") { "자동" } else { Get-ProjectSourceLanguageName $sourceFolder }
-            $lblId = New-Label "$idText  ·  원문 $sourceText" 22 48 366 20 $script:itemMuted 8.3
+            $lblId = New-Label "$idText  ·  원문 $sourceText" 22 48 $cardInnerWidth 20 $script:itemMuted 8.3
+            $lblId.AutoEllipsis = $true
             $totalText = if ($hasReview) { "전체 $($stats.Total)" } else { "원문 미로드" }
             $coverageText = if ($hasReview) { "번역 $($stats.Translated)  ·  검토 $($stats.Approved)" } else { "열어서 원문을 불러오세요" }
             $lblTotal = New-Label $totalText 22 78 132 30 $script:itemText $(if ($hasReview) { 13 } else { 11 }) ([System.Drawing.FontStyle]::Bold)
-            $lblCoverage = New-Label $coverageText 160 83 228 24 $script:itemMuted 8.8
+            $lblCoverage = New-Label $coverageText 154 83 ([Math]::Max(140, $cardWidth - 176)) 24 $script:itemMuted 8.8
             $lblPending = New-Label ("미번역 " + $stats.Pending) 22 116 110 22 (Get-StatusColor "pending") 8.7 ([System.Drawing.FontStyle]::Bold)
-            $lblUpdated = New-Label ("업데이트 변경 " + $stats.Updated) 160 116 200 22 $(if ($stats.Updated -gt 0) { Get-UpdateColor } else { $script:itemSubtle }) 8.7 ([System.Drawing.FontStyle]::Bold)
+            $lblUpdated = New-Label ("업데이트 변경 " + $stats.Updated) 154 116 ([Math]::Max(140, $cardWidth - 176)) 22 $(if ($stats.Updated -gt 0) { Get-UpdateColor } else { $script:itemSubtle }) 8.7 ([System.Drawing.FontStyle]::Bold)
             $lblPending.Visible = [bool]$hasReview
             $lblUpdated.Visible = [bool]$hasReview
 
             $progressTrack = [System.Windows.Forms.Panel]::new()
-            $progressTrack.SetBounds(22, 146, 366, 5)
+            $progressTrack.SetBounds(22, 146, $cardInnerWidth, 5)
             $progressTrack.BackColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(69, 70, 66) } else { [System.Drawing.Color]::FromArgb(220, 222, 216) }
             $progressFill = [System.Windows.Forms.Panel]::new()
             $completed = $stats.Translated + $stats.Approved
-            $fillWidth = if ($stats.Total -gt 0) { [int][Math]::Round(366 * ($completed / [double]$stats.Total)) } else { 0 }
-            $progressFill.SetBounds(0, 0, [Math]::Max(0, [Math]::Min(366, $fillWidth)), 5)
+            $fillWidth = if ($stats.Total -gt 0) { [int][Math]::Round($cardInnerWidth * ($completed / [double]$stats.Total)) } else { 0 }
+            $progressFill.SetBounds(0, 0, [Math]::Max(0, [Math]::Min($cardInnerWidth, $fillWidth)), 5)
             $progressFill.BackColor = $projectAccent
             $progressTrack.Controls.Add($progressFill)
 
-            $lblTime = New-Label ("최근 작업 " + (Format-LocalTimeText ([string]$project.latestReviewAt))) 22 170 196 20 $script:itemSubtle 8.1
+            $lblTime = New-Label ("최근 작업 " + (Format-LocalTimeText ([string]$project.latestReviewAt))) 22 170 ([Math]::Max(110, $cardWidth - 218)) 20 $script:itemSubtle 8.1
             $btnOpen = New-Button "열기" $projectAccent
             $btnOpen.ForeColor = [System.Drawing.Color]::White
-            $btnOpen.SetBounds(304, 158, 86, 36)
+            $btnOpen.SetBounds(($cardWidth - 106), 158, 86, 36)
             $btnOpen.Tag = $project
             Set-AccessibleControl $btnOpen "$name 프로젝트 열기" "$name 모드의 번역 및 검수 작업 화면을 엽니다." 0
             $btnOpen.Add_Click({ Open-ProjectWorkspace $this.Tag })
             $btnDelete = New-Button "삭제" $deleteColor
             $btnDelete.ForeColor = [System.Drawing.Color]::White
-            $btnDelete.SetBounds(226, 158, 70, 36)
+            $btnDelete.SetBounds(($cardWidth - 184), 158, 70, 36)
             $btnDelete.Tag = $project
             Set-AccessibleControl $btnDelete "$name 프로젝트 삭제" "$name 프로젝트의 로컬 검수 기록을 삭제합니다. 원본 모드와 Korean 폴더는 보존합니다." 0
             $btnDelete.Add_Click({ Remove-TranslationProject $this.Tag })
@@ -5077,7 +5200,7 @@ function Resize-ApiProviderSettingsLayout {
     $cmbApiProviderModel.Width = $modelWidth
     $lblApiProviderTemperature.SetBounds($tempX, 234, $tempWidth, 20)
     $cmbApiProviderTemperature.SetBounds($tempX, 256, $tempWidth, 30)
-    $lblDashSettingsNote.SetBounds(286, 332, [Math]::Max(100, $fieldWidth - 286), 24)
+    $lblDashSettingsNote.SetBounds(132, 332, [Math]::Max(180, $fieldWidth - 132), 24)
 }
 
 function Resize-RmkSettingsLayout {
@@ -5128,7 +5251,8 @@ function Sync-DashboardSettingsFromMain {
             $script:apiProviderKeys[$script:selectedApiProviderId] = $txtApiKeys.Text
         }
         Show-ApiProviderControls -ProviderId $script:selectedApiProviderId -SkipCurrentSave
-        $chkDashboardIncludePatches.Checked = $chkIncludePatches.Checked
+        $chkDashboardIncludePatches.Checked = $false
+        $chkIncludePatches.Checked = $false
         $chkDashboardDryRun.Checked = $chkDryRun.Checked
         $cmbDashboardTheme.SelectedIndex = switch ($script:themeMode) { "Light" { 1 } "Dark" { 2 } default { 0 } }
         $sizeIndex = $cmbDashboardTextSize.Items.IndexOf([string]$script:textSize)
@@ -5148,7 +5272,7 @@ function Sync-MainSettingsFromDashboard {
     try {
         Save-CurrentApiProviderControls
         $txtApiKeys.Text = [string]$script:apiProviderKeys[$script:selectedApiProviderId]
-        $chkIncludePatches.Checked = $chkDashboardIncludePatches.Checked
+        $chkIncludePatches.Checked = $false
         $chkDryRun.Checked = $chkDashboardDryRun.Checked
     } finally {
         $script:syncingSettings = $false
@@ -5691,7 +5815,7 @@ function Resize-ReviewEditorLayout {
     $compact = $contentHeight -lt 760
     $sourceHeight = if ($ultraCompact) { 52 } elseif ($veryCompact) { 72 } elseif ($compact) { 92 } else { 118 }
     $translationHeight = if ($ultraCompact) { 72 } elseif ($veryCompact) { 112 } elseif ($compact) { 148 } else { 190 }
-    $metaHeight = if ($ultraCompact) { 46 } elseif ($veryCompact) { 82 } else { 92 }
+    $metaHeight = if ($ultraCompact) { 42 } elseif ($veryCompact) { 82 } else { 92 }
 
     $lblCurrent.SetBounds($pad, 18, [Math]::Max(180, $contentWidth - 178), 28)
     $lblUpdateBadge.SetBounds(($pad + $contentWidth - 168), 18, 168, 26)
@@ -5713,46 +5837,50 @@ function Resize-ReviewEditorLayout {
     $toolbarY = $dividerY + $(if ($ultraCompact) { 8 } else { 12 })
 
     $utilityButtons = @($btnPrev, $btnNext, $btnUseCandidate, $btnUseExisting, $btnUseSource, $btnResetEdit)
-    $utilityWidths = @(38, 38, 72, 62, 58, 72)
+    $utilityWidths = if ($ultraCompact) { @(36, 36, 62, 54, 50, 62) } else { @(38, 38, 72, 62, 58, 72) }
+    $btnResetEdit.Text = if ($ultraCompact) { "↶" } else { "되돌리기" }
     $statusButtons = @($btnPending, $btnTranslated, $btnApprove, $btnApproveNext, $btnApproveAll)
-    $statusWidths = @(72, 76, 88, 108, 88)
-    $gap = 7
+    $statusWidths = if ($ultraCompact) { @(64, 68, 80, 96, 80) } else { @(72, 76, 88, 108, 88) }
+    $gap = if ($ultraCompact) { 5 } else { 7 }
+    $toolbarHeight = if ($ultraCompact) { 32 } else { 36 }
     $utilityTotal = ($utilityWidths | Measure-Object -Sum).Sum + ($gap * ($utilityWidths.Count - 1))
     $statusTotal = ($statusWidths | Measure-Object -Sum).Sum + ($gap * ($statusWidths.Count - 1))
     $singleRow = $contentWidth -ge ($utilityTotal + $statusTotal + 22)
 
     $x = $pad
     for ($i = 0; $i -lt $utilityButtons.Count; $i++) {
-        $utilityButtons[$i].SetBounds($x, $toolbarY, $utilityWidths[$i], 36)
+        $utilityButtons[$i].SetBounds($x, $toolbarY, $utilityWidths[$i], $toolbarHeight)
         $x += $utilityWidths[$i] + $gap
     }
 
     if ($singleRow) {
         $x = $pad + $contentWidth - $statusTotal
         $statusY = $toolbarY
-        $toolbarBottom = $toolbarY + 36
+        $toolbarBottom = $toolbarY + $toolbarHeight
     } else {
         $x = $pad
-        $statusY = $toolbarY + $(if ($ultraCompact) { 40 } else { 44 })
-        $toolbarBottom = $statusY + 36
+        $statusY = $toolbarY + $(if ($ultraCompact) { 36 } else { 44 })
+        $toolbarBottom = $statusY + $toolbarHeight
     }
     for ($i = 0; $i -lt $statusButtons.Count; $i++) {
-        $statusButtons[$i].SetBounds($x, $statusY, $statusWidths[$i], 36)
+        $statusButtons[$i].SetBounds($x, $statusY, $statusWidths[$i], $toolbarHeight)
         $x += $statusWidths[$i] + $gap
     }
 
-    $referenceTitleY = $toolbarBottom + 17
-    $suggestionLabelY = $referenceTitleY + 25
+    $referenceTitleY = $toolbarBottom + $(if ($ultraCompact) { 8 } else { 17 })
+    $suggestionLabelY = $referenceTitleY + $(if ($ultraCompact) { 21 } else { 25 })
     $lblReferenceTitle.SetBounds($pad, $referenceTitleY, $contentWidth, 20)
     $halfWidth = [Math]::Max(140, [int](($contentWidth - 14) / 2))
-    $bottomBoxY = $suggestionLabelY + 22
-    $bottomHeight = [Math]::Max(76, $center.ClientSize.Height - $bottomBoxY - 18)
+    $bottomBoxY = $suggestionLabelY + $(if ($ultraCompact) { 19 } else { 22 })
+    $minimumBottomHeight = if ($ultraCompact) { 52 } else { 76 }
+    $bottomMargin = if ($ultraCompact) { 8 } else { 18 }
+    $bottomHeight = [Math]::Max($minimumBottomHeight, $center.ClientSize.Height - $bottomBoxY - $bottomMargin)
     $lblExisting.SetBounds($pad, $suggestionLabelY, $halfWidth, 18)
     $txtExisting.SetBounds($pad, $bottomBoxY, $halfWidth, $bottomHeight)
     $candidateX = $pad + $halfWidth + 14
     $lblCandidate.SetBounds($candidateX, $suggestionLabelY, $halfWidth, 18)
     $txtCandidate.SetBounds($candidateX, $bottomBoxY, $halfWidth, $bottomHeight)
-    $requiredHeight = $bottomBoxY + [Math]::Max(76, $bottomHeight) + 18
+    $requiredHeight = $bottomBoxY + [Math]::Max($minimumBottomHeight, $bottomHeight) + $bottomMargin
     $center.AutoScrollMinSize = [System.Drawing.Size]::new(0, $requiredHeight)
 }
 
@@ -6091,12 +6219,14 @@ $chkDashboardIncludePatches.Text = "Patches 포함"
 $chkDashboardIncludePatches.SetBounds(0, 332, 150, 26)
 $chkDashboardIncludePatches.ForeColor = [System.Drawing.Color]::FromArgb(218, 226, 234)
 $chkDashboardIncludePatches.BackColor = [System.Drawing.Color]::Transparent
+$chkDashboardIncludePatches.Checked = $false
+$chkDashboardIncludePatches.Visible = $false
 $chkDashboardDryRun = [System.Windows.Forms.CheckBox]::new()
 $chkDashboardDryRun.Text = "Dry run"
-$chkDashboardDryRun.SetBounds(158, 332, 120, 26)
+$chkDashboardDryRun.SetBounds(0, 332, 120, 26)
 $chkDashboardDryRun.ForeColor = [System.Drawing.Color]::FromArgb(218, 226, 234)
 $chkDashboardDryRun.BackColor = [System.Drawing.Color]::Transparent
-$lblDashSettingsNote = New-Label "배치 크기 40 · 여러 키는 입력 순서대로 순환" 286 332 300 24 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.3
+$lblDashSettingsNote = New-Label "배치 크기 40 · 여러 키는 입력 순서대로 순환" 132 332 360 24 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.3
 $pnlApiDetail.Controls.AddRange(@($lblApiProviderTitle, $lblApiProviderDescription, $lblApiProviderCustomName, $txtApiProviderCustomName, $lblApiProviderKeys, $txtDashboardApiKeys, $lblApiProviderUrl, $txtApiProviderUrl, $lblApiProviderModel, $cmbApiProviderModel, $lblApiProviderTemperature, $cmbApiProviderTemperature, $lblApiProviderNotice, $chkDashboardIncludePatches, $chkDashboardDryRun, $lblDashSettingsNote))
 $pnlApiSettings.Controls.AddRange(@($lblDashApi, $lblDashApiHint, $flowApiProviders, $apiProviderDivider, $pnlApiDetail))
 
@@ -6409,14 +6539,15 @@ function Apply-AppTheme {
     try { $main.SplitterDistance = $leftWidth } catch {}
 
     $rightWidth = [Math]::Max(1, $rightSplit.ClientSize.Width)
-    $compactWorkspace = $mainWidth -lt 1100
+    $compactWorkspace = $rightWidth -lt 1040
     try {
         $rightSplit.Panel1MinSize = 0
         $rightSplit.Panel2MinSize = 0
         if ($compactWorkspace) {
             $rightSplit.Orientation = [System.Windows.Forms.Orientation]::Horizontal
             $rightHeight = [Math]::Max(1, $rightSplit.ClientSize.Height)
-            $centerHeight = [Math]::Max(340, [Math]::Min([int]($rightHeight * 0.8), $rightHeight - 104 - $rightSplit.SplitterWidth))
+            $sideHeight = [Math]::Min(250, [Math]::Max(170, [int]($rightHeight * 0.28)))
+            $centerHeight = [Math]::Max(320, $rightHeight - $sideHeight - $rightSplit.SplitterWidth)
             $rightSplit.SplitterDistance = $centerHeight
         } else {
             $rightSplit.Orientation = [System.Windows.Forms.Orientation]::Vertical
@@ -6605,6 +6736,7 @@ function Apply-AppTheme {
     if ($dashboardPanel.Visible) { Refresh-DashboardTabButtons }
     Update-SplitMinimumSizes
     $script:appliedThemeSignature = $themeSignature
+    if ($dashboardPanel.Visible -and $dashProjectsPage.Visible) { Refresh-DashboardProjects }
 }
 
 $form.AccessibleName = "RimWorld AI Translator"
@@ -6679,7 +6811,6 @@ Set-AccessibleControl $txtDashboardApiKeys "선택한 제공자의 API 키" "한
 Set-AccessibleControl $txtApiProviderUrl "Chat Completions API URL" "선택한 제공자의 HTTPS Chat Completions 주소입니다." 1
 Set-AccessibleControl $cmbApiProviderModel "번역 모델" "기본 모델을 선택하거나 모델 ID를 직접 입력합니다." 2
 Set-AccessibleControl $cmbApiProviderTemperature "번역 Temperature" "모델 기본값 또는 0에서 2 사이의 값을 입력합니다." 3
-Set-AccessibleControl $chkDashboardIncludePatches "Patches 폴더 포함" "모드의 Patches 폴더도 번역 대상으로 포함합니다." 1
 Set-AccessibleControl $chkDashboardDryRun "시험 실행" "파일을 쓰지 않고 번역 대상을 점검합니다." 2
 Set-AccessibleControl $cmbDashboardTheme "테마" "시스템 설정, 밝은 테마 또는 어두운 테마를 선택합니다." 3
 Set-AccessibleControl $cmbDashboardTextSize "본문 글자 크기" "번역문과 참고 정보의 글자 크기를 9에서 12 사이로 선택합니다." 4
@@ -6731,7 +6862,10 @@ Sync-DashboardSettingsFromMain
 Apply-TextSize
 Resize-DashboardSettingsLayout
 
-$form.Add_Resize({
+$resizeLayoutTimer = [System.Windows.Forms.Timer]::new()
+$resizeLayoutTimer.Interval = 90
+$resizeLayoutTimer.Add_Tick({
+    $resizeLayoutTimer.Stop()
     if ($script:layouting -or $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { return }
     $script:layouting = $true
     try {
@@ -6739,6 +6873,12 @@ $form.Add_Resize({
     } finally {
         $script:layouting = $false
     }
+})
+
+$form.Add_Resize({
+    if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { return }
+    $resizeLayoutTimer.Stop()
+    $resizeLayoutTimer.Start()
 })
 
 $autoSaveTimer = [System.Windows.Forms.Timer]::new()
@@ -7140,6 +7280,7 @@ $form.Add_FormClosing({
     if ($autoSaveTimer) { $autoSaveTimer.Stop() }
     if ($dashboardSearchTimer) { $dashboardSearchTimer.Stop() }
     if ($searchTimer) { $searchTimer.Stop() }
+    if ($resizeLayoutTimer) { $resizeLayoutTimer.Stop() }
     if ($script:startupCatalogTimer) {
         $script:startupCatalogTimer.Stop()
         $script:startupCatalogTimer.Dispose()
@@ -7166,6 +7307,7 @@ $form.Add_FormClosing({
 })
 
 $form.Add_FormClosed({
+    if ($resizeLayoutTimer) { $resizeLayoutTimer.Dispose() }
     foreach ($font in @($script:fontCache.Values)) {
         try { $font.Dispose() } catch {}
     }
@@ -7173,8 +7315,14 @@ $form.Add_FormClosed({
 })
 
 Ensure-AppDataStore
+Remove-StaleTempFiles
 Load-ProjectStore
 Refresh-ProjectList
+
+if ($script:jsonRecoveryNotices) {
+    foreach ($notice in @($script:jsonRecoveryNotices)) { Add-Log $notice }
+    $script:jsonRecoveryNotices.Clear()
+}
 
 Add-Log "프로그램 시작 안내"
 Add-Log "1. 프로젝트 화면에서 모드를 골라 프로젝트를 만드세요. 프로젝트 하나가 모드 하나입니다."

@@ -187,7 +187,8 @@ third term<Tab>세 번째 번역<Tab>메모
 - `Languages\<원본 언어>\Keyed`
 - `Languages\<원본 언어>\DefInjected`
 - LanguageData가 없는 모드의 일부 `Defs` XML 텍스트 필드
-- 선택 시 `Patches` 폴더
+
+`Patches` XML은 패치 조건, 대상 XPath, 리스트 병합 결과를 실제 게임 로더 없이 확정할 수 없어 자동 번역 대상에서 제외합니다. 패치 안의 화면 문구가 꼭 필요하면 게임에서 생성된 최종 키를 확인한 뒤 수동으로 검수해야 합니다.
 
 `defName`, XML 키, 클래스명, 텍스처 경로처럼 게임 동작에 쓰이는 식별자는 번역하지 않습니다. AlienRace의 `colorChannels.*.name`, 비표시용 `PawnRenderTreeDef` 필드처럼 확실한 내부 식별자는 원문 수집 단계에서 제외되어 번역·검수 목록에 나타나지 않습니다. 제외 내역은 검수 결과의 `_TranslationAudit\*-skipped-internal-identifiers.json`에 기록됩니다.
 

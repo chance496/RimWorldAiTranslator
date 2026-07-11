@@ -23,7 +23,14 @@ try {
 }
 
 $script:DisplayLocalizationFieldPattern = '^(label|labelshort|description|jobstring|reportstring|deathmessage|deathmessagefemale|deathmessagemale|letterlabel|lettertext|header|headertip|summary|formatstring|formatstringunfinalized|fixedname|reason|text|slateref)$'
-$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
+$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|nodeclass|debuglabel|tagdef|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
+$script:DeniedLocalizationFields = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+$defFieldRulePath = Join-Path $PSScriptRoot "rimworld-def-field-rules.txt"
+if (Test-Path -LiteralPath $defFieldRulePath -PathType Leaf) {
+    foreach ($line in [System.IO.File]::ReadAllLines($defFieldRulePath, [System.Text.Encoding]::UTF8)) {
+        if ($line -match '^\s*deny\t([A-Za-z_][A-Za-z0-9_]*)\s*$') { [void]$script:DeniedLocalizationFields.Add($matches[1]) }
+    }
+}
 
 function Resolve-FullPath([string]$Path) {
     return [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path)
@@ -80,13 +87,43 @@ function Get-TextFingerprint([string]$Text) {
     }
 }
 
-function Get-ProtectedTokens([string]$Text) {
-    $tokens = New-Object "System.Collections.Generic.HashSet[string]"
-    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
-    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
-        [void]$tokens.Add($match.Value)
+function Get-ProtectedTokenCounts([string]$Text) {
+    $counts = New-Object "System.Collections.Generic.Dictionary[string,int]" ([System.StringComparer]::Ordinal)
+    $pattern = '(\\r\\n|\\[nrt]|\{[^}\r\n]+\}|\[[A-Za-z0-9_.:;''" -]+\]|</?[A-Za-z][^>\r\n]*>|\$[A-Za-z_][A-Za-z0-9_]*\$?|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
+    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches([string]$Text, $pattern)) {
+        $token = [string]$match.Value
+        if ($counts.ContainsKey($token)) { $counts[$token]++ } else { $counts[$token] = 1 }
     }
-    return @($tokens)
+    return $counts
+}
+
+function Test-JsonWithBackupExists([string]$Path) {
+    return (Test-Path -LiteralPath $Path -PathType Leaf) -or (Test-Path -LiteralPath "$Path.bak" -PathType Leaf)
+}
+
+function Read-JsonWithBackup([string]$Path) {
+    $errors = New-Object "System.Collections.Generic.List[string]"
+    foreach ($candidate in @($Path, "$Path.bak")) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        try {
+            $raw = [System.IO.File]::ReadAllText($candidate, [System.Text.Encoding]::UTF8)
+            if ([string]::IsNullOrWhiteSpace($raw)) { throw "JSON file is empty." }
+            return $raw | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            [void]$errors.Add("$candidate : $($_.Exception.Message)")
+        }
+    }
+    throw "Review decisions and backup could not be read. $([string]::Join(' | ', $errors))"
+}
+
+function Test-ProtectedTokenStructure([string]$Source, [string]$Translation) {
+    $sourceCounts = Get-ProtectedTokenCounts $Source
+    $targetCounts = Get-ProtectedTokenCounts $Translation
+    if ($sourceCounts.Count -ne $targetCounts.Count) { return $false }
+    foreach ($token in $sourceCounts.Keys) {
+        if (-not $targetCounts.ContainsKey($token) -or [int]$targetCounts[$token] -ne [int]$sourceCounts[$token]) { return $false }
+    }
+    return $true
 }
 
 function Test-InternalLocalizationIdentifierRow([object]$Row) {
@@ -95,9 +132,11 @@ function Test-InternalLocalizationIdentifierRow([object]$Row) {
     $typeLower = if ($Row.PSObject.Properties["defClass"] -and $Row.defClass) { ([string]$Row.defClass).Trim().ToLowerInvariant() } else { "" }
     $fieldLower = if ($Row.PSObject.Properties["field"] -and $Row.field) { ([string]$Row.field).Trim().ToLowerInvariant() } else { ($keyLower -replace "^.*\.", "") }
     $isDisplayField = $fieldLower -match $script:DisplayLocalizationFieldPattern
+    if ($script:DeniedLocalizationFields.Contains($fieldLower)) { return $true }
     if ($fieldLower -match $script:TechnicalLocalizationFieldPattern) { return $true }
     if ($keyLower -match "\.alienrace\.generalsettings\.alienpartgenerator\.colorchannels\.") { return $true }
     if ($fieldLower -eq "name" -and $keyLower -match "\.alienrace\.") { return $true }
+    if ($fieldLower -eq "name" -and $keyLower -match "\.(colorchannels|bodyaddons|powermodes)\.") { return $true }
     if ($keyLower -match "\.(graphicpaths?|rendernodes?|rendertree)\." -and -not $isDisplayField) { return $true }
     return $typeLower -match "pawnrendertreedef" -and -not $isDisplayField
 }
@@ -126,9 +165,7 @@ function Test-TranslationStructureSafe([object]$Row, [string]$Translation) {
     if ($translationText -match "(\r?\n\s*){8,}" -or $translationText -match "(\\u000a\s*){8,}") { return $false }
     $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($translationText, "\r?\n").Count
     if ($newlineCount -ge 20 -and $translationText.Length -lt 4000) { return $false }
-    foreach ($token in (Get-ProtectedTokens $source)) {
-        if (-not $translationText.Contains($token)) { return $false }
-    }
+    if (-not (Test-ProtectedTokenStructure -Source $source -Translation $translationText)) { return $false }
     $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
     if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($translationText, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) { return $false }
     return $true
@@ -291,7 +328,27 @@ function Write-FileState([object]$State) {
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         New-Item -ItemType Directory -Force -Path $directory | Out-Null
     }
-    [System.IO.File]::WriteAllLines($State.Path, $lines, [System.Text.UTF8Encoding]::new($false))
+    $temporaryPath = Join-Path $directory (".{0}.{1}.tmp" -f [System.IO.Path]::GetFileName([string]$State.Path), [System.Guid]::NewGuid().ToString("N"))
+    try {
+        $text = [string]::Join([Environment]::NewLine, @($lines)) + [Environment]::NewLine
+        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($text)
+        $stream = [System.IO.FileStream]::new($temporaryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        } finally {
+            $stream.Dispose()
+        }
+        if (Test-Path -LiteralPath $State.Path -PathType Leaf) {
+            [System.IO.File]::Replace($temporaryPath, [string]$State.Path, $null, $true)
+        } else {
+            [System.IO.File]::Move($temporaryPath, [string]$State.Path)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 $rmkEntryFull = Resolve-FullPath $RmkEntryRoot
@@ -304,7 +361,7 @@ $auditRoot = Join-Path $reviewFull "_TranslationAudit"
 $decisionPath = Join-Path $reviewFull "review-decisions.json"
 
 if (-not (Test-Path -LiteralPath $auditRoot -PathType Container)) { throw "Review audit folder not found: $auditRoot" }
-if (-not (Test-Path -LiteralPath $decisionPath -PathType Leaf)) { throw "Review decisions not found: $decisionPath" }
+if (-not (Test-JsonWithBackupExists $decisionPath)) { throw "Review decisions not found: $decisionPath" }
 
 $comparisonFile = Get-ChildItem -LiteralPath $auditRoot -File -Filter "*-comparison.json" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
@@ -312,8 +369,8 @@ $comparisonFile = Get-ChildItem -LiteralPath $auditRoot -File -Filter "*-compari
 if (-not $comparisonFile) { throw "Comparison JSON not found in: $auditRoot" }
 
 $parsedRows = [System.IO.File]::ReadAllText($comparisonFile.FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-$rows = @($parsedRows)
-$decisionData = [System.IO.File]::ReadAllText($decisionPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+$rows = @($parsedRows | Where-Object { -not (Test-InternalLocalizationIdentifierRow $_) })
+$decisionData = Read-JsonWithBackup $decisionPath
 $rowByTargetKey = @{}
 $rowById = @{}
 $uniqueKeyRows = @{}

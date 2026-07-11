@@ -116,6 +116,7 @@ $packageFiles = @(
     "Build-RimWorldGlossary.ps1",
     "glossary.generated.ko.json",
     "sample-glossary.txt",
+    "rimworld-def-field-rules.txt",
     "README.md",
     "PACKAGE_README.txt",
     "LICENSE"
