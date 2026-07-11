@@ -1,7 +1,7 @@
 param(
-    [string]$RimWorldDataRoot = "E:\SteamLibrary\steamapps\common\RimWorld\Data",
-    [string]$RmkRoot = "E:\SteamLibrary\steamapps\workshop\content\294100\3079466972",
-    [string]$WorkshopRoot = "E:\SteamLibrary\steamapps\workshop\content\294100",
+    [string]$RimWorldDataRoot = "",
+    [string]$RmkRoot = "",
+    [string]$WorkshopRoot = "",
     [string]$GameVersion = "1.6",
     [string[]]$WorkshopId = @(),
     [string]$OutputPath,
@@ -20,6 +20,48 @@ $ErrorActionPreference = "Stop"
 
 function Resolve-FullPathAllowMissing([string]$Path) {
     return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Add-UniqueExistingDirectory($List, $Seen, [string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return }
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) { return }
+    if ($Seen.Add($full)) { [void]$List.Add($full) }
+}
+
+function Get-SteamLibraryRoots {
+    $roots = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($regPath in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam", "HKLM:\SOFTWARE\Valve\Steam")) {
+        try {
+            $props = Get-ItemProperty -LiteralPath $regPath -ErrorAction Stop
+            Add-UniqueExistingDirectory $roots $seen $props.SteamPath
+            Add-UniqueExistingDirectory $roots $seen $props.InstallPath
+        } catch {}
+    }
+    foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:LOCALAPPDATA)) {
+        if ($base) { Add-UniqueExistingDirectory $roots $seen (Join-Path $base "Steam") }
+    }
+    foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+        if (-not $drive.IsReady -or $drive.DriveType -ne [System.IO.DriveType]::Fixed) { continue }
+        Add-UniqueExistingDirectory $roots $seen (Join-Path $drive.RootDirectory.FullName "SteamLibrary")
+        Add-UniqueExistingDirectory $roots $seen (Join-Path $drive.RootDirectory.FullName "Steam")
+    }
+    foreach ($root in @($roots.ToArray())) {
+        foreach ($vdfPath in @((Join-Path $root "steamapps\libraryfolders.vdf"), (Join-Path $root "config\libraryfolders.vdf"))) {
+            if (-not (Test-Path -LiteralPath $vdfPath -PathType Leaf)) { continue }
+            try {
+                $text = [System.IO.File]::ReadAllText($vdfPath)
+                foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($text, '"path"\s+"([^"]+)"')) {
+                    Add-UniqueExistingDirectory $roots $seen ($match.Groups[1].Value -replace '\\\\', '\')
+                }
+                foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($text, '(?m)^\s*"\d+"\s+"([^"]+)"')) {
+                    Add-UniqueExistingDirectory $roots $seen ($match.Groups[1].Value -replace '\\\\', '\')
+                }
+            } catch {}
+        }
+    }
+    return $roots.ToArray()
 }
 
 function Read-SafeXmlDocument([string]$Path) {
@@ -680,15 +722,55 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $OutputPath) { $OutputPath = Join-Path $scriptRoot "glossary.generated.ko.json" }
 if (-not $ConflictPath) { $ConflictPath = [System.IO.Path]::ChangeExtension($OutputPath, ".conflicts.csv") }
 
-$RimWorldDataRoot = Resolve-FullPathAllowMissing $RimWorldDataRoot
-$RmkRoot = Resolve-FullPathAllowMissing $RmkRoot
-$WorkshopRoot = Resolve-FullPathAllowMissing $WorkshopRoot
+$steamLibraries = @(Get-SteamLibraryRoots)
+if (-not $RimWorldDataRoot) {
+    foreach ($library in $steamLibraries) {
+        $candidate = Join-Path $library "steamapps\common\RimWorld\Data"
+        if (Test-Path -LiteralPath $candidate -PathType Container) { $RimWorldDataRoot = $candidate; break }
+    }
+}
+if (-not $WorkshopRoot) {
+    if ($RimWorldDataRoot) {
+        $rimWorldRoot = Split-Path -Parent $RimWorldDataRoot
+        $commonRoot = Split-Path -Parent $rimWorldRoot
+        $steamAppsRoot = Split-Path -Parent $commonRoot
+        $candidate = Join-Path $steamAppsRoot "workshop\content\294100"
+        if (Test-Path -LiteralPath $candidate -PathType Container) { $WorkshopRoot = $candidate }
+    }
+    if (-not $WorkshopRoot) {
+        foreach ($library in $steamLibraries) {
+            $candidate = Join-Path $library "steamapps\workshop\content\294100"
+            if (Test-Path -LiteralPath $candidate -PathType Container) { $WorkshopRoot = $candidate; break }
+        }
+    }
+}
+if (-not $RmkRoot) {
+    foreach ($library in $steamLibraries) {
+        foreach ($candidate in @(
+            (Join-Path $library "steamapps\common\RimWorld\Mods\RMK"),
+            (Join-Path $library "steamapps\workshop\content\294100\3079466972")
+        )) {
+            if (Test-Path -LiteralPath $candidate -PathType Container) { $RmkRoot = $candidate; break }
+        }
+        if ($RmkRoot) { break }
+    }
+}
+if (-not $SkipOfficial -and -not $RimWorldDataRoot) {
+    throw "RimWorld Data folder was not found. Pass -RimWorldDataRoot explicitly."
+}
+if ($IncludeRmk -and -not $SkipRmk -and (-not $RmkRoot -or -not $WorkshopRoot)) {
+    throw "RMK or RimWorld Workshop folder was not found. Pass -RmkRoot and -WorkshopRoot explicitly."
+}
+
+if ($RimWorldDataRoot) { $RimWorldDataRoot = Resolve-FullPathAllowMissing $RimWorldDataRoot }
+if ($RmkRoot) { $RmkRoot = Resolve-FullPathAllowMissing $RmkRoot }
+if ($WorkshopRoot) { $WorkshopRoot = Resolve-FullPathAllowMissing $WorkshopRoot }
 $OutputPath = Resolve-FullPathAllowMissing $OutputPath
 $ConflictPath = Resolve-FullPathAllowMissing $ConflictPath
 
-Write-Host "RimWorld data: $RimWorldDataRoot"
-Write-Host "RMK root: $RmkRoot"
-Write-Host "Workshop root: $WorkshopRoot"
+Write-Host "RimWorld data: $(if ($RimWorldDataRoot) { $RimWorldDataRoot } else { '(not used)' })"
+Write-Host "RMK root: $(if ($RmkRoot) { $RmkRoot } else { '(not used)' })"
+Write-Host "Workshop root: $(if ($WorkshopRoot) { $WorkshopRoot } else { '(not used)' })"
 Write-Host "Output: $OutputPath"
 
 $started = Get-Date

@@ -1,13 +1,14 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$ModRoot,
 
     [string[]]$ApiKey = @(),
 
-    [string]$BaseUrl = "https://api.cerebras.ai/v1",
+    [string]$BaseUrl = "https://api.cerebras.ai/v1/chat/completions",
     [string]$Model = "gemma-4-31b",
-    [ValidateSet("Auto", "Cerebras", "Google")]
+    [ValidateSet("Auto", "Cerebras", "OpenAICompatible", "Google")]
     [string]$TranslationProvider = "Auto",
+    [string]$ProviderName = "Cerebras",
     [string]$GoogleTranslateUrl = "https://translate.googleapis.com/translate_a/single",
     [string]$LanguageFolderName = "Korean",
     [string]$SourceLanguageFolder = "Auto",
@@ -19,6 +20,14 @@ param(
     [int]$MaxInputCharsPerBatch = 12000,
     [int]$MaxInputTokensPerBatch = 5500,
     [int]$MaxCompletionTokens = 32000,
+    [ValidateSet("max_completion_tokens", "max_tokens", "none")]
+    [string]$CompletionTokenParameter = "max_completion_tokens",
+    [ValidateSet("JsonSchema", "JsonObject", "PromptOnly")]
+    [string]$ResponseFormatMode = "JsonSchema",
+    [ValidateRange(-1, 2)]
+    [double]$Temperature = 0.1,
+    [ValidatePattern("^(|none|minimal|low|medium|high|xhigh|max)$")]
+    [string]$ReasoningEffort = "",
     [int]$TimeoutSec = 180,
     [int]$MaxRetries = 4,
     [int]$Limit = 0,
@@ -32,6 +41,10 @@ param(
     [switch]$ReviewOnly,
 
     [string]$ExistingLanguageRoot,
+    [string[]]$ReferenceLanguageRoot = @(),
+    [string]$ReferenceSourceWorkbook,
+    [switch]$TranslateMissingOnly,
+    [string]$PreserveTranslationFile,
     [string]$ReviewRoot,
     [string]$GeneratedGlossaryPath,
     [string]$CuratedGlossaryPath,
@@ -50,6 +63,19 @@ try {
     $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 } catch {
 }
+
+$script:RequestCompletionTokenParameter = $CompletionTokenParameter
+$script:RequestTemperature = $Temperature
+$script:RequestReasoningEffort = $ReasoningEffort
+$script:RequestTimeoutSec = $TimeoutSec
+$script:RequestMaxRetries = $MaxRetries
+$script:DisableStructuredOutputs = [bool]$NoStructuredOutputs
+
+$script:SkippedInternalLocalizationEntries = New-Object "System.Collections.Generic.List[object]"
+$script:RmkWorkbookSourceLanguage = ""
+$script:ActiveModContentRootsCache = @{}
+$script:DisplayLocalizationFieldPattern = '^(label|labelshort|description|jobstring|reportstring|deathmessage|deathmessagefemale|deathmessagemale|letterlabel|lettertext|header|headertip|summary|formatstring|formatstringunfinalized|fixedname|reason|text|slateref)$'
+$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
 
 function Resolve-FullPath([string]$Path) {
     return [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path)
@@ -116,8 +142,94 @@ function Test-ValidXmlElementName([string]$Name) {
 function Get-ChatCompletionsUrl([string]$Url) {
     $trimmed = $Url.Trim().TrimEnd("/")
     if ($trimmed -match "/chat/completions$") { return $trimmed }
-    if ($trimmed -match "/v1$") { return "$trimmed/chat/completions" }
+    if ($trimmed -match "/(v1|v1beta/openai|compatible-mode/v1|api/v1|paas/v4)$") { return "$trimmed/chat/completions" }
     return "$trimmed/v1/chat/completions"
+}
+
+function Initialize-RmkXlsxReader {
+    if ("RimWorldTranslatorRmkXlsxReader" -as [type]) { return }
+
+    $assemblyPath = Join-Path $PSScriptRoot "RimWorldAiTranslator.Native.dll"
+    if (Test-Path -LiteralPath $assemblyPath -PathType Leaf) {
+        Add-Type -LiteralPath $assemblyPath -ErrorAction Stop
+    } else {
+        $sourcePath = Join-Path $PSScriptRoot "native\RimWorldTranslatorNative.cs"
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+            throw "Native XML reader is missing. Reinstall the package: $assemblyPath"
+        }
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        Add-Type -AssemblyName System.Xml.Linq
+        $references = @(
+            [System.IO.Compression.ZipArchive].Assembly.Location,
+            [System.IO.Compression.ZipFile].Assembly.Location,
+            [System.Xml.Linq.XDocument].Assembly.Location,
+            [System.Xml.XmlDocument].Assembly.Location,
+            [System.Linq.Enumerable].Assembly.Location
+        ) | Select-Object -Unique
+        Add-Type -LiteralPath $sourcePath -ReferencedAssemblies $references -ErrorAction Stop
+    }
+
+    if (-not ("RimWorldTranslatorRmkXlsxReader" -as [type])) {
+        throw "Native XML reader failed to load: $assemblyPath"
+    }
+}
+
+function Get-RmkWorkbookHistoryMap([string]$WorkbookPath) {
+    $script:RmkWorkbookSourceLanguage = ""
+    if ([string]::IsNullOrWhiteSpace($WorkbookPath)) { return @{} }
+    if (-not (Test-Path -LiteralPath $WorkbookPath -PathType Leaf)) { throw "RMK source workbook not found: $WorkbookPath" }
+    $workbookInfo = Get-Item -LiteralPath $WorkbookPath -ErrorAction Stop
+    if ($workbookInfo.Extension -ine ".xlsx") { throw "RMK source workbook must be an .xlsx file." }
+    if ($workbookInfo.Length -gt 268435456) { throw "RMK source workbook is too large: $WorkbookPath" }
+    Initialize-RmkXlsxReader
+    $data = [RimWorldTranslatorRmkXlsxReader]::Read($workbookInfo.FullName)
+    $script:RmkWorkbookSourceLanguage = [string]$data.SourceLanguage
+    return ,$data.Map
+}
+
+function Get-RmkEntryIdentifier([object]$Entry) {
+    $className = if ([string]$Entry.Kind -eq "Keyed") { "Keyed" } else { [string]$Entry.TypeName }
+    if (-not $className -or -not $Entry.Key) { return "" }
+    return "$className+$([string]$Entry.Key)"
+}
+
+function Test-SourceTextEqual([string]$Left, [string]$Right) {
+    $leftText = ((ConvertTo-FlatString $Left) -replace "`r`n", "`n" -replace "`r", "`n").Trim()
+    $rightText = ((ConvertTo-FlatString $Right) -replace "`r`n", "`n" -replace "`r", "`n").Trim()
+    $leftText = [System.Text.RegularExpressions.Regex]::Replace($leftText, '[ \t\u00A0]+(?=\n|$)', '')
+    $rightText = [System.Text.RegularExpressions.Regex]::Replace($rightText, '[ \t\u00A0]+(?=\n|$)', '')
+    return [string]::Equals($leftText, $rightText, [System.StringComparison]::Ordinal)
+}
+
+function Get-ComparisonReferenceInfo(
+    [object]$Entry,
+    [hashtable]$ExistingOriginMap,
+    [hashtable]$ExistingTranslationUpdatedAtMap,
+    [object]$RmkHistoryMap,
+    [hashtable]$RmkCurrentSourceMap,
+    [string]$RmkWorkbook
+) {
+    $key = [string]$Entry.Key
+    $origin = if ($ExistingOriginMap.ContainsKey($key)) { [string]$ExistingOriginMap[$key] } else { "" }
+    $translationUpdatedAt = if ($ExistingTranslationUpdatedAtMap.ContainsKey($key)) { [string]$ExistingTranslationUpdatedAtMap[$key] } else { "" }
+    $identifier = Get-RmkEntryIdentifier $Entry
+    $history = if ($identifier -and $RmkHistoryMap.ContainsKey($identifier)) { $RmkHistoryMap[$identifier] } else { $null }
+    $historicalSource = if ($history) { ConvertTo-FlatString $history.Source } else { "" }
+    $currentReferenceSource = if ($identifier -and $RmkCurrentSourceMap.ContainsKey($identifier)) { ConvertTo-FlatString $RmkCurrentSourceMap[$identifier] } else { "" }
+    $sourceChanged = $false
+    if ($history -and -not [string]::IsNullOrWhiteSpace($historicalSource) -and -not [string]::IsNullOrWhiteSpace($currentReferenceSource)) {
+        $sourceChanged = -not (Test-SourceTextEqual -Left $currentReferenceSource -Right $historicalSource)
+    }
+    return [pscustomobject]@{
+        ExistingOrigin = $origin
+        TranslationUpdatedAt = $translationUpdatedAt
+        RmkIdentifier = $identifier
+        RmkHistoricalSource = $historicalSource
+        RmkCurrentSource = $currentReferenceSource
+        RmkSourceChanged = $sourceChanged
+        RmkWorkbook = $RmkWorkbook
+    }
 }
 
 function ConvertTo-FlatString([object]$Value) {
@@ -144,6 +256,31 @@ function Test-LooksLikeCodeOrPath([string]$Text) {
     if ($trim -match "^[A-Za-z0-9_./\\:-]+/[A-Za-z0-9_./\\:-]+$") { return $true }
     if ($trim -match "^\{[A-Za-z0-9_:.-]+\}$") { return $true }
     return $false
+}
+
+function Get-InternalLocalizationIdentifierReason([string]$Key, [string]$Kind, [string]$TypeName, [string]$Field) {
+    if ([string]::IsNullOrWhiteSpace($Key) -or $Kind -ne "DefInjected") { return "" }
+
+    $keyLower = $Key.Trim().ToLowerInvariant()
+    $typeLower = if ($TypeName) { $TypeName.Trim().ToLowerInvariant() } else { "" }
+    $fieldLower = if ($Field) { $Field.Trim().ToLowerInvariant() } else { ($keyLower -replace "^.*\.", "") }
+    $isDisplayField = $fieldLower -match $script:DisplayLocalizationFieldPattern
+    if ($fieldLower -match $script:TechnicalLocalizationFieldPattern) {
+        return "internal reference field '$fieldLower'"
+    }
+    if ($keyLower -match "\.alienrace\.generalsettings\.alienpartgenerator\.colorchannels\.") {
+        return "AlienRace color-channel identifier"
+    }
+    if ($fieldLower -eq "name" -and $keyLower -match "\.alienrace\.") {
+        return "AlienRace internal name"
+    }
+    if ($keyLower -match "\.(graphicpaths?|rendernodes?|rendertree)\." -and -not $isDisplayField) {
+        return "rendering or graphic-path identifier"
+    }
+    if ($typeLower -match "pawnrendertreedef" -and -not $isDisplayField) {
+        return "PawnRenderTreeDef internal identifier"
+    }
+    return ""
 }
 
 function Get-XmlElementChildren([System.Xml.XmlNode]$Node) {
@@ -188,12 +325,8 @@ function Get-ExistingLanguageKeys([string]$LanguageRoot) {
 
     Get-ChildItem -LiteralPath $LanguageRoot -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | ForEach-Object {
         try {
-            $doc = Read-SafeXmlDocument $_.FullName
-            if ($doc.DocumentElement -and $doc.DocumentElement.LocalName -eq "LanguageData") {
-                foreach ($child in (Get-XmlElementChildren $doc.DocumentElement)) {
-                    [void]$keys.Add($child.LocalName)
-                }
-            }
+            Initialize-RmkXlsxReader
+            foreach ($raw in [RimWorldTranslatorRmkXlsxReader]::ReadLanguageData($_.FullName)) { [void]$keys.Add([string]$raw.Key) }
         } catch {
         }
     }
@@ -206,12 +339,11 @@ function Get-ExistingLanguageMap([string]$LanguageRoot) {
 
     Get-ChildItem -LiteralPath $LanguageRoot -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | ForEach-Object {
         try {
-            $doc = Read-SafeXmlDocument $_.FullName
-            if ($doc.DocumentElement -and $doc.DocumentElement.LocalName -eq "LanguageData") {
-                foreach ($child in (Get-XmlElementChildren $doc.DocumentElement)) {
-                    if (-not $map.ContainsKey($child.LocalName)) {
-                        $map[$child.LocalName] = ConvertTo-FlatString $child.InnerText
-                    }
+            Initialize-RmkXlsxReader
+            foreach ($raw in [RimWorldTranslatorRmkXlsxReader]::ReadLanguageData($_.FullName)) {
+                $key = [string]$raw.Key
+                if (-not $map.ContainsKey($key)) {
+                    $map[$key] = ConvertTo-FlatString $raw.Text
                 }
             }
         } catch {
@@ -223,27 +355,42 @@ function Get-ExistingLanguageMap([string]$LanguageRoot) {
 function Import-LanguageDataEntries([string]$FilePath, [string]$TargetRelativePath, [string]$Kind, [string]$TypeName) {
     $entries = New-Object "System.Collections.Generic.List[object]"
     try {
-        $doc = Read-SafeXmlDocument $FilePath
+        Initialize-RmkXlsxReader
+        $rawEntries = [RimWorldTranslatorRmkXlsxReader]::ReadLanguageData($FilePath)
     } catch {
         Write-Warning "Skipping invalid XML: $FilePath"
         return ,$entries
     }
 
-    if (-not $doc.DocumentElement -or $doc.DocumentElement.LocalName -ne "LanguageData") { return ,$entries }
-
-    foreach ($child in (Get-XmlElementChildren $doc.DocumentElement)) {
-        $text = ConvertTo-FlatString $child.InnerText
+    foreach ($raw in $rawEntries) {
+        $text = ConvertTo-FlatString $raw.Text
         if (-not (Test-HasHumanText $text)) { continue }
         if (Test-LooksLikeCodeOrPath $text) { continue }
+        $key = [string]$raw.Key
+        $field = [string]$raw.Field
+        $internalReason = Get-InternalLocalizationIdentifierReason -Key $key -Kind $Kind -TypeName $TypeName -Field $field
+        if ($internalReason) {
+            [void]$script:SkippedInternalLocalizationEntries.Add([pscustomobject]@{
+                key = $key
+                source = $text
+                kind = $Kind
+                defClass = $TypeName
+                field = $field
+                sourceFile = $FilePath
+                target = $TargetRelativePath
+                reason = $internalReason
+            })
+            continue
+        }
         [void]$entries.Add([pscustomobject]@{
             Id = ""
-            Key = $child.LocalName
+            Key = $key
             Text = $text
             Kind = $Kind
             TypeName = $TypeName
             TargetRelativePath = $TargetRelativePath
             SourceFile = $FilePath
-            Field = ($child.LocalName -replace "^.*\.", "")
+            Field = $field
         })
     }
     return ,$entries
@@ -340,43 +487,58 @@ function Add-DefInjectedLeafEntries(
 function Import-DefEntriesFromDefs([string]$ModRoot, [string]$OutputFilePrefix, [switch]$IncludePatches) {
     $entries = New-Object "System.Collections.Generic.List[object]"
     $candidateRoots = New-Object "System.Collections.Generic.List[string]"
-    $defsRoot = Join-Path $ModRoot "Defs"
-    if (Test-Path -LiteralPath $defsRoot) { [void]$candidateRoots.Add($defsRoot) }
-    if ($IncludePatches) {
-        $patchesRoot = Join-Path $ModRoot "Patches"
-        if (Test-Path -LiteralPath $patchesRoot) { [void]$candidateRoots.Add($patchesRoot) }
+    $seenRoots = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($contentRoot in Get-ActiveModContentRoots $ModRoot) {
+        $defsRoot = Join-Path $contentRoot "Defs"
+        if ((Test-Path -LiteralPath $defsRoot -PathType Container) -and $seenRoots.Add([System.IO.Path]::GetFullPath($defsRoot))) { [void]$candidateRoots.Add($defsRoot) }
+        if ($IncludePatches) {
+            $patchesRoot = Join-Path $contentRoot "Patches"
+            if ((Test-Path -LiteralPath $patchesRoot -PathType Container) -and $seenRoots.Add([System.IO.Path]::GetFullPath($patchesRoot))) { [void]$candidateRoots.Add($patchesRoot) }
+        }
     }
 
     foreach ($root in $candidateRoots) {
         Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object {
+            $sourceFile = $_.FullName
             try {
-                $doc = Read-SafeXmlDocument $_.FullName
+                Initialize-RmkXlsxReader
+                $rawEntries = [RimWorldTranslatorRmkXlsxReader]::ReadDefs($sourceFile)
             } catch {
-                Write-Warning "Skipping invalid XML: $($_.FullName)"
+                Write-Warning "Skipping invalid XML: $sourceFile"
                 return
             }
 
-            if (-not $doc.DocumentElement -or $doc.DocumentElement.LocalName -ne "Defs") { return }
-
-            foreach ($def in (Get-XmlElementChildren $doc.DocumentElement)) {
-                $defName = Get-DirectChildText -Node $def -Name "defName"
-                if (-not $defName) { continue }
-                $segment = ConvertTo-KeySegment $defName
-                if (-not $segment) { continue }
-
-                $typeName = $def.LocalName
+            foreach ($raw in $rawEntries) {
+                $text = ConvertTo-FlatString $raw.Text
+                if (-not (Test-HasHumanText $text) -or (Test-LooksLikeCodeOrPath $text)) { continue }
+                $key = [string]$raw.Key
+                $typeName = [string]$raw.TypeName
+                $field = [string]$raw.Field
                 $targetRelative = Join-Path (Join-Path "DefInjected" $typeName) "$OutputFilePrefix.xml"
-                foreach ($child in (Get-XmlElementChildren $def)) {
-                    if ($child.LocalName -eq "defName") { continue }
-                    Add-DefInjectedLeafEntries `
-                        -Node $child `
-                        -PathSegments @($child.LocalName) `
-                        -DefName $segment `
-                        -TypeName $typeName `
-                        -TargetRelativePath $targetRelative `
-                        -SourceFile $_.FullName `
-                        -Entries $entries
+                $internalReason = Get-InternalLocalizationIdentifierReason -Key $key -Kind "DefInjected" -TypeName $typeName -Field $field
+                if ($internalReason) {
+                    [void]$script:SkippedInternalLocalizationEntries.Add([pscustomobject]@{
+                        key = $key
+                        source = $text
+                        kind = "DefInjected"
+                        defClass = $typeName
+                        field = $field
+                        sourceFile = $sourceFile
+                        target = $targetRelative
+                        reason = $internalReason
+                    })
+                    continue
                 }
+                [void]$entries.Add([pscustomobject]@{
+                    Id = ""
+                    Key = $key
+                    Text = $text
+                    Kind = "DefInjected"
+                    TypeName = $typeName
+                    TargetRelativePath = $targetRelative
+                    SourceFile = $sourceFile
+                    Field = $field
+                })
             }
         }
     }
@@ -386,6 +548,59 @@ function Import-DefEntriesFromDefs([string]$ModRoot, [string]$OutputFilePrefix, 
 function Test-LanguageRootHasXml([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     return $null -ne (Get-ChildItem -LiteralPath $Path -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
+function Get-LoadFolderVersionScore([string]$Name) {
+    $score = 0
+    foreach ($number in [System.Text.RegularExpressions.Regex]::Matches($Name, '\d+')) { $score = ($score * 100) + [int]$number.Value }
+    return $score
+}
+
+function Get-ActiveModContentRoots([string]$ModRoot) {
+    $modFull = [System.IO.Path]::GetFullPath($ModRoot).TrimEnd("\", "/")
+    $cacheKey = $modFull.ToLowerInvariant()
+    if ($script:ActiveModContentRootsCache.ContainsKey($cacheKey)) { return $script:ActiveModContentRootsCache[$cacheKey] }
+
+    $roots = New-Object "System.Collections.Generic.List[string]"
+    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    [void]$seen.Add($modFull)
+    [void]$roots.Add($modFull)
+    $loadFoldersPath = Join-Path $modFull "LoadFolders.xml"
+    if (Test-Path -LiteralPath $loadFoldersPath -PathType Leaf) {
+        try {
+            $doc = Read-SafeXmlDocument $loadFoldersPath
+            $versionNode = $null
+            $versionScore = -1
+            $rootChildren = Get-XmlElementChildren $doc.DocumentElement
+            foreach ($candidateNode in $rootChildren.ToArray()) {
+                if ($candidateNode.LocalName -notmatch '^v\d') { continue }
+                $candidateScore = Get-LoadFolderVersionScore $candidateNode.LocalName
+                if ($candidateScore -gt $versionScore) {
+                    $versionNode = $candidateNode
+                    $versionScore = $candidateScore
+                }
+            }
+            if ($versionNode) {
+                $versionChildren = Get-XmlElementChildren $versionNode
+                foreach ($item in $versionChildren.ToArray()) {
+                    if ($item.LocalName -ne "li") { continue }
+                    $relative = ([string]$item.InnerText).Trim()
+                    if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+                    $candidate = if ($relative -in @("/", "\", ".")) { $modFull } else { Join-Path $modFull $relative }
+                    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
+                    $candidateFull = [System.IO.Path]::GetFullPath($candidate).TrimEnd("\", "/")
+                    $prefix = $modFull + [System.IO.Path]::DirectorySeparatorChar
+                    if (-not $candidateFull.Equals($modFull, [System.StringComparison]::OrdinalIgnoreCase) -and -not $candidateFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                    if ($seen.Add($candidateFull)) { [void]$roots.Add($candidateFull) }
+                }
+            }
+        } catch {
+            Write-Warning "Could not read LoadFolders.xml; using the selected mod root only. $(Format-CompactError $_)"
+        }
+    }
+    $result = $roots.ToArray()
+    $script:ActiveModContentRootsCache[$cacheKey] = $result
+    return $result
 }
 
 function Test-ExcludedSourceLanguageFolder([string]$Name) {
@@ -408,39 +623,54 @@ function Get-SourceLanguageRank([string]$Name) {
 
 function Get-SourceLanguageRoots([string]$ModRoot, [string]$SourceLanguageFolder) {
     $roots = New-Object "System.Collections.Generic.List[object]"
-    $languagesRoot = Join-Path $ModRoot "Languages"
-    if (-not (Test-Path -LiteralPath $languagesRoot)) { return $roots.ToArray() }
+    $contentRoots = @(Get-ActiveModContentRoots $ModRoot)
 
     if ($SourceLanguageFolder -and $SourceLanguageFolder -ne "Auto") {
-        $explicitRoot = if ([System.IO.Path]::IsPathRooted($SourceLanguageFolder)) {
-            $SourceLanguageFolder
+        $explicitRoots = New-Object "System.Collections.Generic.List[string]"
+        if ([System.IO.Path]::IsPathRooted($SourceLanguageFolder)) {
+            [void]$explicitRoots.Add($SourceLanguageFolder)
         } else {
-            Join-Path $languagesRoot $SourceLanguageFolder
+            foreach ($contentRoot in $contentRoots) { [void]$explicitRoots.Add((Join-Path (Join-Path $contentRoot "Languages") $SourceLanguageFolder)) }
         }
-        if (-not (Test-LanguageRootHasXml $explicitRoot)) {
-            throw "Source language folder has no XML files: $explicitRoot"
+        $seenExplicit = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($explicitRoot in $explicitRoots) {
+            if (-not (Test-LanguageRootHasXml $explicitRoot)) { continue }
+            $explicitFull = [System.IO.Path]::GetFullPath($explicitRoot)
+            if (-not $seenExplicit.Add($explicitFull)) { continue }
+            [void]$roots.Add([pscustomobject]@{
+                Name = Split-Path -Leaf $explicitFull
+                Path = $explicitFull
+                Rank = -1
+            })
         }
-        [void]$roots.Add([pscustomobject]@{
-            Name = Split-Path -Leaf $explicitRoot
-            Path = [System.IO.Path]::GetFullPath($explicitRoot)
-            Rank = -1
-        })
+        if ($roots.Count -eq 0) { throw "Source language folder has no XML files: $SourceLanguageFolder" }
         return $roots.ToArray()
     }
 
     $candidates = New-Object "System.Collections.Generic.List[object]"
-    Get-ChildItem -LiteralPath $languagesRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        if (Test-ExcludedSourceLanguageFolder $_.Name) { return }
-        if (-not (Test-LanguageRootHasXml $_.FullName)) { return }
-        [void]$candidates.Add([pscustomobject]@{
-            Name = $_.Name
-            Path = $_.FullName
-            Rank = Get-SourceLanguageRank $_.Name
-        })
+    $seenCandidates = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($contentRoot in $contentRoots) {
+        $languagesRoot = Join-Path $contentRoot "Languages"
+        if (-not (Test-Path -LiteralPath $languagesRoot -PathType Container)) { continue }
+        Get-ChildItem -LiteralPath $languagesRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            if (Test-ExcludedSourceLanguageFolder $_.Name) { return }
+            if (-not (Test-LanguageRootHasXml $_.FullName)) { return }
+            $candidateFull = [System.IO.Path]::GetFullPath($_.FullName)
+            if (-not $seenCandidates.Add($candidateFull)) { return }
+            [void]$candidates.Add([pscustomobject]@{
+                Name = $_.Name
+                Path = $candidateFull
+                Rank = Get-SourceLanguageRank $_.Name
+            })
+        }
     }
 
     $best = $candidates | Sort-Object Rank, Name | Select-Object -First 1
-    if ($best) { [void]$roots.Add($best) }
+    if ($best) {
+        foreach ($candidate in $candidates) {
+            if ([string]$candidate.Name -eq [string]$best.Name) { [void]$roots.Add($candidate) }
+        }
+    }
     return $roots.ToArray()
 }
 
@@ -464,6 +694,40 @@ function Import-SourceEntries([string]$ModRoot, [string]$OutputFilePrefix, [stri
         [void]$entries.Add($entry)
     }
 
+    return ,$entries
+}
+
+function Import-SpecificLanguageEntries([string]$ModRoot, [string]$LanguageName) {
+    $entries = New-Object "System.Collections.Generic.List[object]"
+    if ([string]::IsNullOrWhiteSpace($LanguageName)) { return ,$entries }
+    $languageRoots = New-Object "System.Collections.Generic.List[string]"
+    $seenRoots = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($contentRoot in Get-ActiveModContentRoots $ModRoot) {
+        $languagesRoot = Join-Path $contentRoot "Languages"
+        if (-not (Test-Path -LiteralPath $languagesRoot -PathType Container)) { continue }
+        $languageRoot = Join-Path $languagesRoot $LanguageName
+        if (-not (Test-LanguageRootHasXml $languageRoot)) {
+            $match = Get-ChildItem -LiteralPath $languagesRoot -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -eq $LanguageName -or $_.Name.StartsWith("$LanguageName ", [System.StringComparison]::OrdinalIgnoreCase) } |
+                Sort-Object Name |
+                Select-Object -First 1
+            if (-not $match) { continue }
+            $languageRoot = $match.FullName
+        }
+        $languageFull = [System.IO.Path]::GetFullPath($languageRoot)
+        if ($seenRoots.Add($languageFull)) { [void]$languageRoots.Add($languageFull) }
+    }
+    foreach ($languageRoot in $languageRoots) {
+        Get-ChildItem -LiteralPath $languageRoot -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object {
+            $relative = $_.FullName.Substring($languageRoot.Length).TrimStart("\", "/")
+            $parts = $relative -split "[\\/]"
+            $kind = if ($parts.Count -gt 0) { $parts[0] } else { "Keyed" }
+            $typeName = if ($kind -eq "DefInjected" -and $parts.Count -gt 1) { $parts[1] } else { "" }
+            foreach ($entry in (Import-LanguageDataEntries -FilePath $_.FullName -TargetRelativePath $relative -Kind $kind -TypeName $typeName)) {
+                [void]$entries.Add($entry)
+            }
+        }
+    }
     return ,$entries
 }
 
@@ -560,19 +824,61 @@ function Test-GlossaryTermAppears([string]$TermSource, [string]$Text) {
     return $Text.IndexOf($TermSource, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
+function Initialize-GlossarySelectionIndex([object[]]$Terms) {
+    $script:GlossaryAlwaysTerms = New-Object "System.Collections.Generic.List[object]"
+    $script:GlossaryGeneratedTerms = New-Object "System.Collections.Generic.List[object]"
+    $script:GlossaryGeneratedPrefixIndex = @{}
+    $order = 0
+    foreach ($term in @($Terms)) {
+        if (-not $term -or [string]::IsNullOrWhiteSpace([string]$term.source)) { continue }
+        $searchSource = ([string]$term.source).Trim().ToLowerInvariant()
+        if ($term.alwaysInclude) {
+            [void]$script:GlossaryAlwaysTerms.Add($term)
+            $order++
+            continue
+        }
+        if ($searchSource.Length -lt 3) { $order++; continue }
+        $indexedTerm = [pscustomobject]@{ Term = $term; SearchSource = $searchSource; Order = $order }
+        $order++
+        [void]$script:GlossaryGeneratedTerms.Add($indexedTerm)
+        $prefix = $searchSource.Substring(0, 3)
+        if (-not $script:GlossaryGeneratedPrefixIndex.ContainsKey($prefix)) {
+            $script:GlossaryGeneratedPrefixIndex[$prefix] = New-Object "System.Collections.Generic.List[object]"
+        }
+        [void]$script:GlossaryGeneratedPrefixIndex[$prefix].Add($indexedTerm)
+    }
+    $script:GlossarySelectionIndexReady = $true
+}
+
 function Select-GlossaryTermsForBatch([object[]]$Terms, [object[]]$Batch, [int]$MaxAlways, [int]$MaxGenerated) {
     if (-not $Terms -or $Terms.Count -eq 0) { return @() }
+    if (-not $script:GlossarySelectionIndexReady) { Initialize-GlossarySelectionIndex $Terms }
     $selected = New-Object "System.Collections.Generic.List[object]"
     $selectedSources = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
 
-    foreach ($term in @($Terms | Where-Object { $_.alwaysInclude } | Select-Object -First $MaxAlways)) {
+    foreach ($term in @($script:GlossaryAlwaysTerms | Select-Object -First $MaxAlways)) {
         if ($selectedSources.Add([string]$term.source)) { [void]$selected.Add($term) }
     }
 
     if ($Batch -and $MaxGenerated -gt 0) {
-        $textBlob = [string]::Join("`n", @($Batch | ForEach-Object { [string]$_.Text }))
-        $generated = @($Terms |
-            Where-Object { -not $_.alwaysInclude -and -not $selectedSources.Contains([string]$_.source) -and (Test-GlossaryTermAppears -TermSource ([string]$_.source) -Text $textBlob) } |
+        $textBlob = [string]::Join("`n", @($Batch | ForEach-Object { [string]$_.Text })).ToLowerInvariant()
+        $prefixes = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+        for ($i = 0; $i -le $textBlob.Length - 3; $i++) {
+            [void]$prefixes.Add($textBlob.Substring($i, 3))
+        }
+        $matchedOrders = New-Object "System.Collections.Generic.HashSet[int]"
+        foreach ($prefix in $prefixes) {
+            if (-not $script:GlossaryGeneratedPrefixIndex.ContainsKey($prefix)) { continue }
+            foreach ($indexedTerm in $script:GlossaryGeneratedPrefixIndex[$prefix]) {
+                if ($selectedSources.Contains([string]$indexedTerm.Term.source)) { continue }
+                if ($textBlob.Contains([string]$indexedTerm.SearchSource)) { [void]$matchedOrders.Add([int]$indexedTerm.Order) }
+            }
+        }
+        $candidates = New-Object "System.Collections.Generic.List[object]"
+        foreach ($indexedTerm in $script:GlossaryGeneratedTerms) {
+            if ($matchedOrders.Contains([int]$indexedTerm.Order)) { [void]$candidates.Add($indexedTerm.Term) }
+        }
+        $generated = @($candidates |
             Sort-Object @{ Expression = "priority"; Ascending = $true }, @{ Expression = "count"; Descending = $true }, @{ Expression = { ([string]$_.source).Length }; Descending = $true } |
             Select-Object -First $MaxGenerated)
 
@@ -616,8 +922,11 @@ Return only JSON matching this shape: {"translations":[{"id":"same id","text":"K
 
 Rules:
 - Translate only the text value. Never translate ids, XML keys, defNames, file names, class names, or paths.
-- Preserve placeholders and markup exactly: {0}, {PAWN_nameDef}, [pawn_nameDef], `$variable, <color=...>, </color>, \n, %, and XML-like tags.
-- Keep label fields short, usually a noun phrase.
+ - Preserve placeholders, grammar-rule prefixes, and markup exactly: {0}, {PAWN_nameDef}, [pawn_nameDef], r_logentry->, `$variable, <color=...>, </color>, \n, %, and XML-like tags.
+ - A grammar-rule prefix such as r_logentry-> must remain unchanged at the beginning of the translated value.
+ - When a Korean particle follows a placeholder or dynamic noun, use RimWorld's automatic particle notation with the consonant-final form in parentheses first: `(은)는`, `(이)가`, `(을)를`, `(과)와`, `(으)로`.
+ - Attach that notation directly to the placeholder, for example `[lodgersLabelSingOrPluralDef](이)가`. Never use reversed forms such as `은(는)`, `이(가)`, `을(를)`, `과(와)`, or `으로(로)`.
+ - Keep label fields short, usually a noun phrase.
 - Use polite declarative Korean for descriptions and letters when appropriate.
 - Preserve meaningful line breaks, but never add padding blank lines or more than two consecutive \n escapes.
 - Do not output repeated \u000a escapes.
@@ -645,21 +954,39 @@ function New-UserPayload([object[]]$Batch) {
     return ([ordered]@{ entries = $items } | ConvertTo-Json -Depth 10)
 }
 
-function New-RequestBody([string]$Model, [string]$SystemPrompt, [string]$UserPayload, [int]$MaxCompletionTokens, [switch]$NoStructuredOutputs) {
+function New-RequestBody(
+    [string]$Model,
+    [string]$SystemPrompt,
+    [string]$UserPayload,
+    [int]$MaxCompletionTokens,
+    [string]$CompletionTokenParameter,
+    [string]$ResponseFormatMode,
+    [double]$Temperature,
+    [string]$ReasoningEffort,
+    [switch]$NoStructuredOutputs
+) {
     $body = [ordered]@{
         model = $Model
         messages = @(
             [ordered]@{ role = "system"; content = $SystemPrompt },
             [ordered]@{ role = "user"; content = $UserPayload }
         )
-        temperature = 0.1
-        top_p = 0.9
         stream = $false
-        max_completion_tokens = $MaxCompletionTokens
-        reasoning_effort = "none"
     }
 
-    if (-not $NoStructuredOutputs) {
+    if ($Temperature -ge 0) {
+        $body.temperature = $Temperature
+        $body.top_p = 0.9
+    }
+    if ($MaxCompletionTokens -gt 0 -and $CompletionTokenParameter -ne "none") {
+        $body[$CompletionTokenParameter] = $MaxCompletionTokens
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ReasoningEffort)) {
+        $body.reasoning_effort = $ReasoningEffort.Trim()
+    }
+
+    if ($NoStructuredOutputs) { $ResponseFormatMode = "JsonObject" }
+    if ($ResponseFormatMode -eq "JsonSchema") {
         $body.response_format = [ordered]@{
             type = "json_schema"
             json_schema = [ordered]@{
@@ -686,7 +1013,7 @@ function New-RequestBody([string]$Model, [string]$SystemPrompt, [string]$UserPay
                 }
             }
         }
-    } else {
+    } elseif ($ResponseFormatMode -eq "JsonObject") {
         $body.response_format = [ordered]@{ type = "json_object" }
     }
 
@@ -701,7 +1028,7 @@ function Add-ApiKeyCandidate([System.Collections.Generic.List[string]]$List, [st
     if ($trim -match "^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)\s*$") {
         $name = $matches[1]
         $value = $matches[2].Trim()
-        if ($name -notmatch "^(CEREBRAS_API_KEY|CEREBRAS_KEY|API_KEY|KEY|RIMWORLD_TRANSLATOR_API_KEYS)$") { return }
+        if ($name -notmatch "^(CEREBRAS_API_KEY|CEREBRAS_KEY|OPENAI_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|DEEPSEEK_API_KEY|DASHSCOPE_API_KEY|GROQ_API_KEY|MISTRAL_API_KEY|OPENROUTER_API_KEY|ZAI_API_KEY|API_KEY|KEY|RIMWORLD_TRANSLATOR_API_KEYS)$") { return }
         $trim = $value
     }
 
@@ -716,12 +1043,12 @@ function Add-ApiKeyCandidate([System.Collections.Generic.List[string]]$List, [st
     }
 }
 
-function Get-ApiKeys([string[]]$ApiKey) {
+function Get-ApiKeys([string[]]$ApiKey, [string]$Provider = "Auto") {
     $all = New-Object "System.Collections.Generic.List[string]"
     foreach ($key in $ApiKey) {
         Add-ApiKeyCandidate $all $key
     }
-    if ($env:CEREBRAS_API_KEY) { Add-ApiKeyCandidate $all $env:CEREBRAS_API_KEY }
+    if ($Provider -in @("Auto", "Cerebras") -and $env:CEREBRAS_API_KEY) { Add-ApiKeyCandidate $all $env:CEREBRAS_API_KEY }
     if ($env:RIMWORLD_TRANSLATOR_API_KEYS) {
         foreach ($key in ($env:RIMWORLD_TRANSLATOR_API_KEYS -split "[,;`n]")) {
             Add-ApiKeyCandidate $all $key
@@ -803,8 +1130,12 @@ function Get-NextKeyState([object[]]$States, [int]$RequestsPerMinutePerKey, [int
         }
 
         Reset-InputTokenWindowIfNeeded $state
-        $spacing = [Math]::Ceiling(60.0 / [Math]::Max(1, $RequestsPerMinutePerKey))
-        $state.AvailableAt = [DateTime]::UtcNow.AddSeconds($spacing)
+        if ($RequestsPerMinutePerKey -gt 0) {
+            $spacing = [Math]::Ceiling(60.0 / $RequestsPerMinutePerKey)
+            $state.AvailableAt = [DateTime]::UtcNow.AddSeconds($spacing)
+        } else {
+            $state.AvailableAt = [DateTime]::UtcNow
+        }
         $state.InputTokensInWindow += $EstimatedInputTokens
         $state.Requests++
         return $state
@@ -888,7 +1219,7 @@ function Invoke-JsonPostUtf8([string]$Uri, [hashtable]$Headers, [byte[]]$BodyByt
     }
 }
 
-function Invoke-CerebrasChat([string]$ChatUrl, [object]$Body, [object[]]$KeyStates, [int]$RequestsPerMinutePerKey, [int]$InputTokensPerMinutePerKey, [int]$DailyTokenBudgetPerKey, [int]$TimeoutSec, [int]$MaxRetries) {
+function Invoke-OpenAICompatibleChat([string]$ChatUrl, [object]$Body, [object[]]$KeyStates, [int]$RequestsPerMinutePerKey, [int]$InputTokensPerMinutePerKey, [int]$DailyTokenBudgetPerKey, [int]$TimeoutSec, [int]$MaxRetries) {
     $json = $Body | ConvertTo-Json -Depth 30 -Compress
     $estimatedInputTokens = (Estimate-TokenCount $json) + 256
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
@@ -934,7 +1265,7 @@ function Invoke-CerebrasChat([string]$ChatUrl, [object]$Body, [object[]]$KeyStat
                 Write-Warning "Rate limited; rotating key and waiting before this key is reused."
                 continue
             }
-            if ($detail.Code -ge 500 -or $detail.Code -eq $null) {
+            if ($detail.Code -ge 500 -or $null -eq $detail.Code) {
                 Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
                 continue
             }
@@ -967,7 +1298,21 @@ function Format-CompactError([object]$ErrorRecord) {
 }
 
 function ConvertTo-TranslationMap([object]$Response) {
-    $content = [string]$Response.choices[0].message.content
+    $contentValue = $Response.choices[0].message.content
+    if ($contentValue -is [string]) {
+        $content = [string]$contentValue
+    } else {
+        $parts = New-Object "System.Collections.Generic.List[string]"
+        foreach ($part in @($contentValue)) {
+            if ($part -is [string]) {
+                [void]$parts.Add([string]$part)
+            } elseif ($part -and $part.PSObject.Properties["text"]) {
+                [void]$parts.Add([string]$part.text)
+            }
+        }
+        $content = [string]::Join("", $parts)
+    }
+    if ([string]::IsNullOrWhiteSpace($content)) { throw "Model response did not contain text content." }
     $parsed = ConvertFrom-ModelJson $content
     $map = @{}
 
@@ -986,7 +1331,7 @@ function ConvertTo-TranslationMap([object]$Response) {
 
 function Get-ProtectedTokens([string]$Text) {
     $tokens = New-Object "System.Collections.Generic.HashSet[string]"
-    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b)'
+    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
     foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
         [void]$tokens.Add($match.Value)
     }
@@ -999,6 +1344,10 @@ function Test-TokenPreservation([string]$Source, [string]$Target) {
     $missing = New-Object "System.Collections.Generic.List[string]"
     foreach ($token in (Get-ProtectedTokens $Source)) {
         if (-not $Target.Contains($token)) { [void]$missing.Add($token) }
+    }
+    $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($Source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
+    if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($Target, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) {
+        if (-not $missing.Contains($grammarPrefix.Groups[1].Value)) { [void]$missing.Add($grammarPrefix.Groups[1].Value) }
     }
     return $missing.ToArray()
 }
@@ -1106,7 +1455,7 @@ function Invoke-GoogleTranslateBatch([object[]]$Batch, [string]$Label) {
     foreach ($entry in $Batch) {
         $index++
         try {
-            $map[$entry.Id] = Invoke-GoogleTranslateText -Text ([string]$entry.Text) -Endpoint $GoogleTranslateUrl -TimeoutSec $TimeoutSec -MaxRetries $MaxRetries
+            $map[$entry.Id] = Invoke-GoogleTranslateText -Text ([string]$entry.Text) -Endpoint $GoogleTranslateUrl -TimeoutSec $script:RequestTimeoutSec -MaxRetries $script:RequestMaxRetries
         } catch {
             Write-Warning ("Google Translate failed for {0} entry {1}/{2}; keeping source text. {3}" -f $Label, $index, $Batch.Count, (Format-CompactError $_))
             $map[$entry.Id] = [string]$entry.Text
@@ -1170,6 +1519,17 @@ function Test-PathologicalTranslation([string]$Text) {
     return $false
 }
 
+function Get-InvalidKoreanParticleNotations([string]$Text) {
+    $result = New-Object "System.Collections.Generic.List[string]"
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $result.ToArray() }
+    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+    $pattern = '(은\(는\)|는\(은\)|이\(가\)|가\(이\)|을\(를\)|를\(을\)|과\(와\)|와\(과\)|으로\(로\)|로\(으로\)|(?:\[[^\]\r\n]+\]|\{[^}\r\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:으로|은|는|이|가|을|를|과|와|로)(?=$|[\s.,!?…:;，。！？、]))'
+    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
+        if ($seen.Add($match.Value)) { [void]$result.Add($match.Value) }
+    }
+    return $result.ToArray()
+}
+
 function Escape-XmlText([string]$Text) {
     return [System.Security.SecurityElement]::Escape((Remove-InvalidXmlChars $Text))
 }
@@ -1205,7 +1565,8 @@ function Write-AuditFile([string]$Path, [object[]]$Rows) {
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
-    $Rows | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+    $json = ConvertTo-Json -InputObject @($Rows) -Depth 8 -Compress
+    [System.IO.File]::WriteAllText($Path, $json, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Write-CsvFile([string]$Path, [object[]]$Rows) {
@@ -1242,20 +1603,24 @@ function Invoke-TranslationBatchWithSplit([object[]]$Batch, [string]$Label, [int
         -SystemPrompt (New-SystemPrompt -GlossaryText (Convert-GlossaryToPrompt (Select-GlossaryTermsForBatch -Terms $glossary -Batch $batch -MaxAlways $MaxAlwaysGlossaryTerms -MaxGenerated $MaxGeneratedGlossaryTermsPerBatch)) -ExtraPrompt $ExtraPrompt) `
         -UserPayload (New-UserPayload $batch) `
         -MaxCompletionTokens $MaxCompletionTokens `
-        -NoStructuredOutputs:$NoStructuredOutputs
+        -CompletionTokenParameter $script:RequestCompletionTokenParameter `
+        -ResponseFormatMode $ResponseFormatMode `
+        -Temperature $script:RequestTemperature `
+        -ReasoningEffort $script:RequestReasoningEffort `
+        -NoStructuredOutputs:$script:DisableStructuredOutputs
 
     $lastError = $null
-    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+    for ($attempt = 1; $attempt -le $script:RequestMaxRetries; $attempt++) {
         try {
-            $response = Invoke-CerebrasChat `
+            $response = Invoke-OpenAICompatibleChat `
                 -ChatUrl $chatUrl `
                 -Body $body `
                 -KeyStates $keyStates `
                 -RequestsPerMinutePerKey $RequestsPerMinutePerKey `
                 -InputTokensPerMinutePerKey $InputTokensPerMinutePerKey `
                 -DailyTokenBudgetPerKey $DailyTokenBudgetPerKey `
-                -TimeoutSec $TimeoutSec `
-                -MaxRetries $MaxRetries
+                -TimeoutSec $script:RequestTimeoutSec `
+                -MaxRetries $script:RequestMaxRetries
             $map = ConvertTo-TranslationMap $response
             $missingIds = @($batch | Where-Object { -not $map.ContainsKey($_.Id) })
             if ($missingIds.Count -eq 0) { return $map }
@@ -1264,7 +1629,7 @@ function Invoke-TranslationBatchWithSplit([object[]]$Batch, [string]$Label, [int
             throw "Model response missed $($missingIds.Count) ids in $Label. Missing sample: $sampleMissing"
         } catch {
             $lastError = $_
-            if ($attempt -lt $MaxRetries) {
+            if ($attempt -lt $script:RequestMaxRetries) {
                 Write-Warning "Batch $Label failed on attempt $attempt; retrying. $(Format-CompactError $_)"
                 Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
             }
@@ -1275,7 +1640,7 @@ function Invoke-TranslationBatchWithSplit([object[]]$Batch, [string]$Label, [int
         $leftCount = [int][Math]::Ceiling($batch.Count / 2.0)
         $left = @($batch[0..($leftCount - 1)])
         $right = @($batch[$leftCount..($batch.Count - 1)])
-        Write-Warning ("Batch {0} failed after {1} attempts; splitting {2} entries into {3}+{4}. {5}" -f $Label, $MaxRetries, $batch.Count, $left.Count, $right.Count, (Format-CompactError $lastError))
+        Write-Warning ("Batch {0} failed after {1} attempts; splitting {2} entries into {3}+{4}. {5}" -f $Label, $script:RequestMaxRetries, $batch.Count, $left.Count, $right.Count, (Format-CompactError $lastError))
 
         $merged = @{}
         $leftMap = Invoke-TranslationBatchWithSplit -Batch $left -Label "$Label.1" -Depth ($Depth + 1)
@@ -1303,6 +1668,27 @@ Assert-SafePathSegment -Value $LanguageFolderName -Name "LanguageFolderName"
 Assert-SafePathSegment -Value $OutputFilePrefix -Name "OutputFilePrefix"
 $languageRoot = Join-Path (Join-Path $modFull "Languages") $LanguageFolderName
 $existingLanguageFull = if ($ExistingLanguageRoot) { Resolve-FullPath $ExistingLanguageRoot } else { $languageRoot }
+$referenceLanguageFull = New-Object "System.Collections.Generic.List[string]"
+$referenceLanguageSeen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($referenceRoot in @($ReferenceLanguageRoot)) {
+    if ([string]::IsNullOrWhiteSpace($referenceRoot)) { continue }
+    $resolvedReference = Resolve-FullPath $referenceRoot
+    if ($referenceLanguageSeen.Add($resolvedReference)) { [void]$referenceLanguageFull.Add($resolvedReference) }
+}
+$referenceSourceWorkbookFull = ""
+if ($ReferenceSourceWorkbook) {
+    $referenceSourceWorkbookFull = Resolve-FullPath $ReferenceSourceWorkbook
+    $referenceWorkbookInfo = Get-Item -LiteralPath $referenceSourceWorkbookFull -ErrorAction Stop
+    if ($referenceWorkbookInfo.Extension -ine ".xlsx" -or $referenceWorkbookInfo.Length -gt 268435456) {
+        throw "ReferenceSourceWorkbook must be an XLSX file no larger than 256 MB."
+    }
+}
+$preserveTranslationFull = ""
+if ($PreserveTranslationFile) {
+    $preserveTranslationFull = Resolve-FullPath $PreserveTranslationFile
+    $preserveFileInfo = Get-Item -LiteralPath $preserveTranslationFull -ErrorAction Stop
+    if ($preserveFileInfo.Length -gt 67108864) { throw "Preserved translation file is too large: $preserveTranslationFull" }
+}
 $chatUrl = ""
 if ($ExtraPromptFile) {
     if (-not (Test-Path -LiteralPath $ExtraPromptFile)) { throw "Extra prompt file not found: $ExtraPromptFile" }
@@ -1315,9 +1701,15 @@ if ($ExtraPromptFile) {
         }
     }
 }
-$glossary = Import-Glossary -ScriptRoot $scriptRoot -GeneratedGlossaryPath $GeneratedGlossaryPath -CuratedGlossaryPath $CuratedGlossaryPath -UseCuratedGlossary:$UseCuratedGlossary
-$baseGlossary = Select-GlossaryTermsForBatch -Terms $glossary -Batch @() -MaxAlways $MaxAlwaysGlossaryTerms -MaxGenerated 0
-$systemPrompt = New-SystemPrompt -GlossaryText (Convert-GlossaryToPrompt $baseGlossary) -ExtraPrompt $ExtraPrompt
+if ($SourceOnly) {
+    $glossary = @()
+    $baseGlossary = @()
+    $systemPrompt = ""
+} else {
+    $glossary = Import-Glossary -ScriptRoot $scriptRoot -GeneratedGlossaryPath $GeneratedGlossaryPath -CuratedGlossaryPath $CuratedGlossaryPath -UseCuratedGlossary:$UseCuratedGlossary
+    $baseGlossary = Select-GlossaryTermsForBatch -Terms $glossary -Batch @() -MaxAlways $MaxAlwaysGlossaryTerms -MaxGenerated 0
+    $systemPrompt = New-SystemPrompt -GlossaryText (Convert-GlossaryToPrompt $baseGlossary) -ExtraPrompt $ExtraPrompt
+}
 $auditStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 if ($ReviewOnly) {
@@ -1331,40 +1723,60 @@ if ($ReviewOnly) {
     $auditRoot = Join-Path $modFull "_TranslationAudit"
 }
 
-$keys = Get-ApiKeys -ApiKey $ApiKey
+$keys = Get-ApiKeys -ApiKey $ApiKey -Provider $TranslationProvider
 if ($SourceOnly) {
     $script:ActiveTranslationProvider = "SourceOnly"
 } elseif ($MockTranslations) {
     $script:ActiveTranslationProvider = "Mock"
 } elseif ($TranslationProvider -eq "Auto") {
-    $script:ActiveTranslationProvider = if ($keys.Count -gt 0) { "Cerebras" } else { "Google" }
+    $script:ActiveTranslationProvider = if ($keys.Count -gt 0) { "OpenAICompatible" } else { "Google" }
 } else {
     $script:ActiveTranslationProvider = $TranslationProvider
 }
 
-if ($script:ActiveTranslationProvider -eq "Cerebras") {
+$usesChatApi = $script:ActiveTranslationProvider -in @("Cerebras", "OpenAICompatible")
+if ($usesChatApi) {
     Assert-HttpsUri -Value $BaseUrl -Name "BaseUrl"
     $chatUrl = Get-ChatCompletionsUrl $BaseUrl
 } elseif ($script:ActiveTranslationProvider -eq "Google") {
     Assert-HttpsUri -Value $GoogleTranslateUrl -Name "GoogleTranslateUrl"
 }
 
-if (-not $DryRun -and -not $MockTranslations -and $script:ActiveTranslationProvider -eq "Cerebras" -and $keys.Count -eq 0) {
-    throw "No Cerebras API key provided. Enter keys in the GUI, use -ApiKey, or set TranslationProvider Google."
+if ($usesChatApi) {
+    $ProviderName = $ProviderName.Trim()
+    if ([string]::IsNullOrWhiteSpace($ProviderName) -or $ProviderName.Length -gt 80 -or $ProviderName -match "[\x00-\x1F\x7F]") {
+        throw "ProviderName is invalid."
+    }
+    $Model = $Model.Trim()
+    if ([string]::IsNullOrWhiteSpace($Model) -or $Model.Length -gt 200 -or $Model -match "[\x00-\x1F\x7F]") {
+        throw "Model is invalid."
+    }
 }
 
-$keyStates = if ($script:ActiveTranslationProvider -eq "Cerebras") { New-KeyStates $keys } else { @() }
-$auditBase = Join-Path $auditRoot "$($script:ActiveTranslationProvider.ToLowerInvariant())-$auditStamp"
+if (-not $DryRun -and -not $MockTranslations -and $usesChatApi -and $keys.Count -eq 0) {
+    throw "No API key provided for $ProviderName. Enter one or more keys in the GUI, or select Google Translate."
+}
+
+$keyStates = if ($usesChatApi) { New-KeyStates $keys } else { @() }
+$auditProvider = if ($usesChatApi) { ($ProviderName.ToLowerInvariant() -replace "[^a-z0-9_.-]", "-") } else { $script:ActiveTranslationProvider.ToLowerInvariant() }
+if (-not $auditProvider) { $auditProvider = "api" }
+$auditBase = Join-Path $auditRoot "$auditProvider-$auditStamp"
 
 Write-Host "Mod root: $modFull"
 Write-Host "Output language: $outputLanguageRoot"
 Write-Host "Existing translation root: $existingLanguageFull"
+foreach ($referenceRoot in $referenceLanguageFull) { Write-Host "Reference translation root: $referenceRoot" }
+if ($referenceSourceWorkbookFull) { Write-Host "RMK source history workbook: $referenceSourceWorkbookFull" }
+if ($TranslateMissingOnly) { Write-Host "Existing translation policy: translate missing keys only." }
 if ($ReviewOnly) { Write-Host "Review-only mode: source/existing translations will not be modified." }
-Write-Host "Translation provider: $script:ActiveTranslationProvider"
-if ($script:ActiveTranslationProvider -eq "Cerebras") {
-    Write-Host "Cerebras chat endpoint: $chatUrl"
+Write-Host "Translation provider: $(if ($usesChatApi) { $ProviderName } else { $script:ActiveTranslationProvider })"
+if ($usesChatApi) {
+    Write-Host "Chat endpoint: $chatUrl"
     Write-Host "Model: $Model"
-    Write-Host "Free-tier guardrails: $RequestsPerMinutePerKey requests/min/key, $InputTokensPerMinutePerKey input tokens/min/key, $DailyTokenBudgetPerKey total tokens/day/key, $MaxCompletionTokens max output tokens"
+    if ($RequestsPerMinutePerKey -gt 0 -or $InputTokensPerMinutePerKey -gt 0 -or $DailyTokenBudgetPerKey -gt 0) {
+        Write-Host "Rate guardrails: $RequestsPerMinutePerKey requests/min/key, $InputTokensPerMinutePerKey input tokens/min/key, $DailyTokenBudgetPerKey total tokens/day/key"
+    }
+    Write-Host "Output mode: $ResponseFormatMode; max output tokens: $MaxCompletionTokens"
     if ($keys.Count -gt 0) { Write-Host "API keys loaded: $($keys.Count)" }
     if ($keys.Count -gt 1) { Write-Host "API key rotation: input order, balanced by per-key request/token availability." }
 } elseif ($script:ActiveTranslationProvider -eq "Google") {
@@ -1373,29 +1785,121 @@ if ($script:ActiveTranslationProvider -eq "Cerebras") {
 } elseif ($script:ActiveTranslationProvider -eq "SourceOnly") {
     Write-Host "Source-only mode: no AI/API calls; translation candidates stay blank."
 }
-Write-Host "Glossary terms loaded: $($glossary.Count) total, $(@($glossary | Where-Object { $_.alwaysInclude }).Count) always-on, $MaxGeneratedGlossaryTermsPerBatch generated terms max/batch"
+if ($SourceOnly) {
+    Write-Host "Glossary loading skipped for source-only refresh."
+} else {
+    Write-Host "Glossary terms loaded: $($glossary.Count) total, $(@($glossary | Where-Object { $_.alwaysInclude }).Count) always-on, $MaxGeneratedGlossaryTermsPerBatch generated terms max/batch"
+}
 
-$existingKeys = Get-ExistingLanguageKeys $existingLanguageFull
-$existingMap = Get-ExistingLanguageMap $existingLanguageFull
+$rmkHistoryMap = Get-RmkWorkbookHistoryMap $referenceSourceWorkbookFull
+if ($referenceSourceWorkbookFull) { Write-Host "RMK source history entries: $($rmkHistoryMap.Count)" }
+$existingKeys = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+$existingMap = @{}
+$existingOriginMap = @{}
+$existingTranslationUpdatedAtMap = @{}
+foreach ($referenceRoot in $referenceLanguageFull) {
+    $referenceMap = Get-ExistingLanguageMap $referenceRoot
+    foreach ($key in $referenceMap.Keys) {
+        if (-not $existingMap.ContainsKey($key)) {
+            $existingMap[$key] = [string]$referenceMap[$key]
+            $existingOriginMap[$key] = "rmk"
+        }
+        [void]$existingKeys.Add([string]$key)
+    }
+}
+foreach ($history in $rmkHistoryMap.Values) {
+    $key = ([string]$history.Key).Trim()
+    $translation = ConvertTo-FlatString $history.Translation
+    if (-not (Test-ValidXmlElementName $key) -or [string]::IsNullOrWhiteSpace($translation) -or $existingMap.ContainsKey($key)) { continue }
+    $existingMap[$key] = $translation
+    $existingOriginMap[$key] = "rmk"
+    [void]$existingKeys.Add($key)
+}
+$primaryExistingMap = Get-ExistingLanguageMap $existingLanguageFull
+foreach ($key in $primaryExistingMap.Keys) {
+    $existingMap[$key] = [string]$primaryExistingMap[$key]
+    $existingOriginMap[$key] = "mod"
+    [void]$existingKeys.Add([string]$key)
+}
+$preservedTranslationCount = 0
+if ($preserveTranslationFull) {
+    $preservedData = [System.IO.File]::ReadAllText($preserveTranslationFull, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    foreach ($item in @($preservedData.items)) {
+        $key = ([string]$item.key).Trim()
+        $text = ConvertTo-FlatString $item.text
+        if (-not (Test-ValidXmlElementName $key) -or [string]::IsNullOrWhiteSpace($text)) { continue }
+        $existingMap[$key] = $text
+        $existingOriginMap[$key] = if ($item.PSObject.Properties["origin"] -and $item.origin) { [string]$item.origin } else { "local" }
+        if ($item.PSObject.Properties["translationUpdatedAt"] -and $item.translationUpdatedAt) {
+            $existingTranslationUpdatedAtMap[$key] = [string]$item.translationUpdatedAt
+        }
+        [void]$existingKeys.Add($key)
+        $preservedTranslationCount++
+    }
+    Write-Host "Preserved review translations: $preservedTranslationCount"
+}
 $sourceEntries = Import-SourceEntries -ModRoot $modFull -OutputFilePrefix $OutputFilePrefix -SourceLanguageFolder $SourceLanguageFolder -IncludePatches:$IncludePatches
+$rmkCurrentSourceMap = @{}
+if ($rmkHistoryMap.Count -gt 0 -and $script:RmkWorkbookSourceLanguage) {
+    $selectedSourceNames = @($script:DetectedSourceLanguageRoots | ForEach-Object { [string]$_.Name })
+    $usesSelectedSource = @($selectedSourceNames | Where-Object { $_ -eq $script:RmkWorkbookSourceLanguage -or $_.StartsWith("$($script:RmkWorkbookSourceLanguage) ", [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+    if ($usesSelectedSource) {
+        $referenceSourceEntries = $sourceEntries
+    } else {
+        $languageEntries = New-Object "System.Collections.Generic.List[object]"
+        foreach ($entry in @(Import-SpecificLanguageEntries -ModRoot $modFull -LanguageName $script:RmkWorkbookSourceLanguage)) { [void]$languageEntries.Add($entry) }
+        $definitionRoots = @((Join-Path $modFull "Defs"), (Join-Path $modFull "Patches")) | ForEach-Object {
+            try { [System.IO.Path]::GetFullPath($_).TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar } catch { "" }
+        } | Where-Object { $_ }
+        foreach ($entry in $sourceEntries) {
+            $sourceFile = try { [System.IO.Path]::GetFullPath([string]$entry.SourceFile) } catch { "" }
+            if (-not $sourceFile) { continue }
+            if (@($definitionRoots | Where-Object { $sourceFile.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) {
+                [void]$languageEntries.Add($entry)
+            }
+        }
+        $referenceSourceEntries = $languageEntries
+    }
+    foreach ($entry in $referenceSourceEntries) {
+        $identifier = Get-RmkEntryIdentifier $entry
+        if ($identifier -and -not $rmkCurrentSourceMap.ContainsKey($identifier)) { $rmkCurrentSourceMap[$identifier] = ConvertTo-FlatString $entry.Text }
+    }
+    Write-Host "RMK source comparison language: $($script:RmkWorkbookSourceLanguage); current entries: $($rmkCurrentSourceMap.Count)"
+}
 $dedupe = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+$reviewEntries = New-Object "System.Collections.Generic.List[object]"
 $pending = New-Object "System.Collections.Generic.List[object]"
 $skippedExisting = 0
 $skippedDuplicate = 0
 
 foreach ($entry in $sourceEntries) {
-    if ($existingKeys.Contains($entry.Key) -and -not $Overwrite -and -not $ReviewOnly) {
-        $skippedExisting++
-        continue
-    }
     $identity = $entry.Key
     if (-not $dedupe.Add($identity)) {
         $skippedDuplicate++
         continue
     }
-    if ($Limit -gt 0 -and $pending.Count -ge $Limit) { break }
-    $entry.Id = "E{0:d6}" -f ($pending.Count + 1)
-    [void]$pending.Add($entry)
+    if ($Limit -gt 0 -and $reviewEntries.Count -ge $Limit) { break }
+    $hasExistingKey = $existingKeys.Contains($entry.Key)
+    $hasExistingTranslation = $existingMap.ContainsKey($entry.Key) -and -not [string]::IsNullOrWhiteSpace([string]$existingMap[$entry.Key])
+    $existingOrigin = if ($existingOriginMap.ContainsKey($entry.Key)) { [string]$existingOriginMap[$entry.Key] } else { "" }
+    $rmkIdentifier = Get-RmkEntryIdentifier $entry
+    $rmkStaleTranslation = $false
+    if ($existingOrigin -eq "rmk" -and $rmkIdentifier -and $rmkHistoryMap.ContainsKey($rmkIdentifier) -and $rmkCurrentSourceMap.ContainsKey($rmkIdentifier)) {
+        $historicalSource = ConvertTo-FlatString $rmkHistoryMap[$rmkIdentifier].Source
+        $currentReferenceSource = ConvertTo-FlatString $rmkCurrentSourceMap[$rmkIdentifier]
+        if ($historicalSource -and $currentReferenceSource) { $rmkStaleTranslation = -not (Test-SourceTextEqual -Left $historicalSource -Right $currentReferenceSource) }
+    }
+    if ($hasExistingKey -and -not $Overwrite -and -not $ReviewOnly) {
+        $skippedExisting++
+        continue
+    }
+    $entry.Id = "E{0:d6}" -f ($reviewEntries.Count + 1)
+    [void]$reviewEntries.Add($entry)
+    if ($TranslateMissingOnly -and $hasExistingTranslation -and -not $rmkStaleTranslation) {
+        $skippedExisting++
+    } else {
+        [void]$pending.Add($entry)
+    }
 }
 
 if ($script:DetectedSourceLanguageRoots -and $script:DetectedSourceLanguageRoots.Count -gt 0) {
@@ -1404,12 +1908,14 @@ if ($script:DetectedSourceLanguageRoots -and $script:DetectedSourceLanguageRoots
     Write-Host "Detected source language: none; using Defs text only."
 }
 Write-Host "Source entries: $($sourceEntries.Count)"
-Write-Host "Pending entries: $($pending.Count)"
-Write-Host "Skipped existing: $skippedExisting"
+Write-Host "Review entries: $($reviewEntries.Count)"
+Write-Host "Pending translation entries: $($pending.Count)"
+Write-Host "Reused existing entries: $skippedExisting"
 Write-Host "Skipped duplicate: $skippedDuplicate"
+Write-Host "Excluded internal identifiers: $($script:SkippedInternalLocalizationEntries.Count)"
 
-if ($pending.Count -eq 0) {
-    Write-Host "Nothing to translate."
+if ($reviewEntries.Count -eq 0) {
+    Write-Host "Nothing to review or translate."
     return
 }
 
@@ -1418,20 +1924,38 @@ if ($DryRun) {
     return
 }
 
-Write-AuditFile -Path "$auditBase-source.json" -Rows $pending
+if ($ReviewOnly -and -not (Test-Path -LiteralPath $outputLanguageRoot -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $outputLanguageRoot | Out-Null
+}
+
+Write-AuditFile -Path "$auditBase-source.json" -Rows $reviewEntries
+Write-AuditFile -Path "$auditBase-skipped-internal-identifiers.json" -Rows $script:SkippedInternalLocalizationEntries
 
 if ($SourceOnly) {
     $comparisonRows = New-Object "System.Collections.Generic.List[object]"
-    foreach ($entry in $pending) {
+    foreach ($entry in $reviewEntries) {
         $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
+        $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingOriginMap $existingOriginMap -ExistingTranslationUpdatedAtMap $existingTranslationUpdatedAtMap -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
         $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
         [void]$comparisonRows.Add([pscustomobject]@{
             id = $entry.Id
             key = $entry.Key
+            kind = $entry.Kind
+            defClass = $entry.TypeName
+            node = $entry.Key
+            field = $entry.Field
             target = $targetPath
             source = $entry.Text
             existing = $existingTranslation
             candidate = ""
+            existingOrigin = $referenceInfo.ExistingOrigin
+            translationOrigin = $referenceInfo.ExistingOrigin
+            translationUpdatedAt = $referenceInfo.TranslationUpdatedAt
+            rmkIdentifier = $referenceInfo.RmkIdentifier
+            rmkHistoricalSource = $referenceInfo.RmkHistoricalSource
+            rmkCurrentSource = $referenceInfo.RmkCurrentSource
+            rmkSourceChanged = $referenceInfo.RmkSourceChanged
+            rmkWorkbook = $referenceInfo.RmkWorkbook
             existingPresent = -not [string]::IsNullOrWhiteSpace($existingTranslation)
             existingHasKorean = Test-ContainsKorean $existingTranslation
             candidateHasKorean = $false
@@ -1440,6 +1964,7 @@ if ($SourceOnly) {
             candidateBlank = $true
             missingTokens = ""
             pathologicalCandidate = $false
+            invalidKoreanParticles = ""
             safeToApply = $false
         })
     }
@@ -1469,6 +1994,45 @@ $comparisonRows = New-Object "System.Collections.Generic.List[object]"
 $warnings = New-Object "System.Collections.Generic.List[object]"
 $outputGroups = @{}
 $skippedUnsafe = 0
+$pendingIds = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($entry in $pending) { [void]$pendingIds.Add([string]$entry.Id) }
+
+foreach ($entry in $reviewEntries) {
+    if ($pendingIds.Contains([string]$entry.Id)) { continue }
+    $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
+    $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingOriginMap $existingOriginMap -ExistingTranslationUpdatedAtMap $existingTranslationUpdatedAtMap -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
+    $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
+    [void]$comparisonRows.Add([pscustomobject]@{
+        id = $entry.Id
+        key = $entry.Key
+        kind = $entry.Kind
+        defClass = $entry.TypeName
+        node = $entry.Key
+        field = $entry.Field
+        target = $targetPath
+        source = $entry.Text
+        existing = $existingTranslation
+        candidate = ""
+        existingOrigin = $referenceInfo.ExistingOrigin
+        translationOrigin = $referenceInfo.ExistingOrigin
+        translationUpdatedAt = $referenceInfo.TranslationUpdatedAt
+        rmkIdentifier = $referenceInfo.RmkIdentifier
+        rmkHistoricalSource = $referenceInfo.RmkHistoricalSource
+        rmkCurrentSource = $referenceInfo.RmkCurrentSource
+        rmkSourceChanged = $referenceInfo.RmkSourceChanged
+        rmkWorkbook = $referenceInfo.RmkWorkbook
+        existingPresent = -not [string]::IsNullOrWhiteSpace($existingTranslation)
+        existingHasKorean = Test-ContainsKorean $existingTranslation
+        candidateHasKorean = $false
+        existingSameAsSource = $existingTranslation -eq ([string]$entry.Text)
+        candidateSameAsSource = $false
+        candidateBlank = $true
+        missingTokens = ""
+        pathologicalCandidate = $false
+        invalidKoreanParticles = ""
+        safeToApply = $false
+    })
+}
 
 for ($i = 0; $i -lt $batches.Count; $i++) {
     $batch = @($batches[$i])
@@ -1481,6 +2045,7 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
         $missingTokens = @(Test-TokenPreservation -Source ([string]$entry.Text) -Target $translated)
         $isBlankCandidate = [string]::IsNullOrWhiteSpace($translated)
         $isPathologicalCandidate = Test-PathologicalTranslation $translated
+        $invalidKoreanParticles = @(Get-InvalidKoreanParticleNotations $translated)
         if ($missingTokens.Count -gt 0) {
             [void]$warnings.Add([pscustomobject]@{
                 id = $entry.Id
@@ -1501,10 +2066,22 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
                 reason = "pathological_newlines"
             })
         }
+        if ($invalidKoreanParticles.Count -gt 0) {
+            [void]$warnings.Add([pscustomobject]@{
+                id = $entry.Id
+                key = $entry.Key
+                source = $entry.Text
+                translation = $translated
+                missingTokens = @()
+                invalidKoreanParticles = $invalidKoreanParticles
+                reason = "invalid_korean_particle_notation"
+            })
+        }
 
         $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
+        $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingOriginMap $existingOriginMap -ExistingTranslationUpdatedAtMap $existingTranslationUpdatedAtMap -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
         $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
-        $safeToWrite = -not $isBlankCandidate -and -not $isPathologicalCandidate -and $missingTokens.Count -eq 0
+        $safeToWrite = -not $isBlankCandidate -and -not $isPathologicalCandidate -and $missingTokens.Count -eq 0 -and $invalidKoreanParticles.Count -eq 0
         if ($ReviewOnly -or $safeToWrite) {
             if (-not $outputGroups.ContainsKey($targetPath)) { $outputGroups[$targetPath] = @{} }
             $outputGroups[$targetPath][$entry.Key] = $translated
@@ -1515,18 +2092,35 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
         [void]$translatedRows.Add([pscustomobject]@{
             id = $entry.Id
             key = $entry.Key
+            kind = $entry.Kind
+            defClass = $entry.TypeName
+            node = $entry.Key
+            field = $entry.Field
             target = $targetPath
             source = $entry.Text
             translation = $translated
+            translationOrigin = "ai"
         })
 
         [void]$comparisonRows.Add([pscustomobject]@{
             id = $entry.Id
             key = $entry.Key
+            kind = $entry.Kind
+            defClass = $entry.TypeName
+            node = $entry.Key
+            field = $entry.Field
             target = $targetPath
             source = $entry.Text
             existing = $existingTranslation
             candidate = $translated
+            existingOrigin = $referenceInfo.ExistingOrigin
+            translationOrigin = "ai"
+            translationUpdatedAt = ""
+            rmkIdentifier = $referenceInfo.RmkIdentifier
+            rmkHistoricalSource = $referenceInfo.RmkHistoricalSource
+            rmkCurrentSource = $referenceInfo.RmkCurrentSource
+            rmkSourceChanged = $referenceInfo.RmkSourceChanged
+            rmkWorkbook = $referenceInfo.RmkWorkbook
             existingPresent = -not [string]::IsNullOrWhiteSpace($existingTranslation)
             existingHasKorean = Test-ContainsKorean $existingTranslation
             candidateHasKorean = Test-ContainsKorean $translated
@@ -1535,6 +2129,7 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
             candidateBlank = $isBlankCandidate
             missingTokens = [string]::Join("|", $missingTokens)
             pathologicalCandidate = $isPathologicalCandidate
+            invalidKoreanParticles = [string]::Join("|", $invalidKoreanParticles)
             safeToApply = $safeToWrite
         })
     }
