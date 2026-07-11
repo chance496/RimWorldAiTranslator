@@ -32,6 +32,9 @@ param(
     [switch]$ReviewOnly,
 
     [string]$ExistingLanguageRoot,
+    [string[]]$ReferenceLanguageRoot = @(),
+    [switch]$TranslateMissingOnly,
+    [string]$PreserveTranslationFile,
     [string]$ReviewRoot,
     [string]$GeneratedGlossaryPath,
     [string]$CuratedGlossaryPath,
@@ -560,19 +563,61 @@ function Test-GlossaryTermAppears([string]$TermSource, [string]$Text) {
     return $Text.IndexOf($TermSource, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
+function Initialize-GlossarySelectionIndex([object[]]$Terms) {
+    $script:GlossaryAlwaysTerms = New-Object "System.Collections.Generic.List[object]"
+    $script:GlossaryGeneratedTerms = New-Object "System.Collections.Generic.List[object]"
+    $script:GlossaryGeneratedPrefixIndex = @{}
+    $order = 0
+    foreach ($term in @($Terms)) {
+        if (-not $term -or [string]::IsNullOrWhiteSpace([string]$term.source)) { continue }
+        $searchSource = ([string]$term.source).Trim().ToLowerInvariant()
+        if ($term.alwaysInclude) {
+            [void]$script:GlossaryAlwaysTerms.Add($term)
+            $order++
+            continue
+        }
+        if ($searchSource.Length -lt 3) { $order++; continue }
+        $indexedTerm = [pscustomobject]@{ Term = $term; SearchSource = $searchSource; Order = $order }
+        $order++
+        [void]$script:GlossaryGeneratedTerms.Add($indexedTerm)
+        $prefix = $searchSource.Substring(0, 3)
+        if (-not $script:GlossaryGeneratedPrefixIndex.ContainsKey($prefix)) {
+            $script:GlossaryGeneratedPrefixIndex[$prefix] = New-Object "System.Collections.Generic.List[object]"
+        }
+        [void]$script:GlossaryGeneratedPrefixIndex[$prefix].Add($indexedTerm)
+    }
+    $script:GlossarySelectionIndexReady = $true
+}
+
 function Select-GlossaryTermsForBatch([object[]]$Terms, [object[]]$Batch, [int]$MaxAlways, [int]$MaxGenerated) {
     if (-not $Terms -or $Terms.Count -eq 0) { return @() }
+    if (-not $script:GlossarySelectionIndexReady) { Initialize-GlossarySelectionIndex $Terms }
     $selected = New-Object "System.Collections.Generic.List[object]"
     $selectedSources = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
 
-    foreach ($term in @($Terms | Where-Object { $_.alwaysInclude } | Select-Object -First $MaxAlways)) {
+    foreach ($term in @($script:GlossaryAlwaysTerms | Select-Object -First $MaxAlways)) {
         if ($selectedSources.Add([string]$term.source)) { [void]$selected.Add($term) }
     }
 
     if ($Batch -and $MaxGenerated -gt 0) {
-        $textBlob = [string]::Join("`n", @($Batch | ForEach-Object { [string]$_.Text }))
-        $generated = @($Terms |
-            Where-Object { -not $_.alwaysInclude -and -not $selectedSources.Contains([string]$_.source) -and (Test-GlossaryTermAppears -TermSource ([string]$_.source) -Text $textBlob) } |
+        $textBlob = [string]::Join("`n", @($Batch | ForEach-Object { [string]$_.Text })).ToLowerInvariant()
+        $prefixes = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+        for ($i = 0; $i -le $textBlob.Length - 3; $i++) {
+            [void]$prefixes.Add($textBlob.Substring($i, 3))
+        }
+        $matchedOrders = New-Object "System.Collections.Generic.HashSet[int]"
+        foreach ($prefix in $prefixes) {
+            if (-not $script:GlossaryGeneratedPrefixIndex.ContainsKey($prefix)) { continue }
+            foreach ($indexedTerm in $script:GlossaryGeneratedPrefixIndex[$prefix]) {
+                if ($selectedSources.Contains([string]$indexedTerm.Term.source)) { continue }
+                if ($textBlob.Contains([string]$indexedTerm.SearchSource)) { [void]$matchedOrders.Add([int]$indexedTerm.Order) }
+            }
+        }
+        $candidates = New-Object "System.Collections.Generic.List[object]"
+        foreach ($indexedTerm in $script:GlossaryGeneratedTerms) {
+            if ($matchedOrders.Contains([int]$indexedTerm.Order)) { [void]$candidates.Add($indexedTerm.Term) }
+        }
+        $generated = @($candidates |
             Sort-Object @{ Expression = "priority"; Ascending = $true }, @{ Expression = "count"; Descending = $true }, @{ Expression = { ([string]$_.source).Length }; Descending = $true } |
             Select-Object -First $MaxGenerated)
 
@@ -1303,6 +1348,19 @@ Assert-SafePathSegment -Value $LanguageFolderName -Name "LanguageFolderName"
 Assert-SafePathSegment -Value $OutputFilePrefix -Name "OutputFilePrefix"
 $languageRoot = Join-Path (Join-Path $modFull "Languages") $LanguageFolderName
 $existingLanguageFull = if ($ExistingLanguageRoot) { Resolve-FullPath $ExistingLanguageRoot } else { $languageRoot }
+$referenceLanguageFull = New-Object "System.Collections.Generic.List[string]"
+$referenceLanguageSeen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($referenceRoot in @($ReferenceLanguageRoot)) {
+    if ([string]::IsNullOrWhiteSpace($referenceRoot)) { continue }
+    $resolvedReference = Resolve-FullPath $referenceRoot
+    if ($referenceLanguageSeen.Add($resolvedReference)) { [void]$referenceLanguageFull.Add($resolvedReference) }
+}
+$preserveTranslationFull = ""
+if ($PreserveTranslationFile) {
+    $preserveTranslationFull = Resolve-FullPath $PreserveTranslationFile
+    $preserveFileInfo = Get-Item -LiteralPath $preserveTranslationFull -ErrorAction Stop
+    if ($preserveFileInfo.Length -gt 67108864) { throw "Preserved translation file is too large: $preserveTranslationFull" }
+}
 $chatUrl = ""
 if ($ExtraPromptFile) {
     if (-not (Test-Path -LiteralPath $ExtraPromptFile)) { throw "Extra prompt file not found: $ExtraPromptFile" }
@@ -1359,6 +1417,8 @@ $auditBase = Join-Path $auditRoot "$($script:ActiveTranslationProvider.ToLowerIn
 Write-Host "Mod root: $modFull"
 Write-Host "Output language: $outputLanguageRoot"
 Write-Host "Existing translation root: $existingLanguageFull"
+foreach ($referenceRoot in $referenceLanguageFull) { Write-Host "Reference translation root: $referenceRoot" }
+if ($TranslateMissingOnly) { Write-Host "Existing translation policy: translate missing keys only." }
 if ($ReviewOnly) { Write-Host "Review-only mode: source/existing translations will not be modified." }
 Write-Host "Translation provider: $script:ActiveTranslationProvider"
 if ($script:ActiveTranslationProvider -eq "Cerebras") {
@@ -1375,27 +1435,60 @@ if ($script:ActiveTranslationProvider -eq "Cerebras") {
 }
 Write-Host "Glossary terms loaded: $($glossary.Count) total, $(@($glossary | Where-Object { $_.alwaysInclude }).Count) always-on, $MaxGeneratedGlossaryTermsPerBatch generated terms max/batch"
 
-$existingKeys = Get-ExistingLanguageKeys $existingLanguageFull
-$existingMap = Get-ExistingLanguageMap $existingLanguageFull
+$existingKeys = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+$existingMap = @{}
+foreach ($referenceRoot in $referenceLanguageFull) {
+    $referenceMap = Get-ExistingLanguageMap $referenceRoot
+    foreach ($key in $referenceMap.Keys) {
+        if (-not $existingMap.ContainsKey($key)) { $existingMap[$key] = [string]$referenceMap[$key] }
+        [void]$existingKeys.Add([string]$key)
+    }
+}
+$primaryExistingMap = Get-ExistingLanguageMap $existingLanguageFull
+foreach ($key in $primaryExistingMap.Keys) {
+    $existingMap[$key] = [string]$primaryExistingMap[$key]
+    [void]$existingKeys.Add([string]$key)
+}
+$preservedTranslationCount = 0
+if ($preserveTranslationFull) {
+    $preservedData = [System.IO.File]::ReadAllText($preserveTranslationFull, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    foreach ($item in @($preservedData.items)) {
+        $key = ([string]$item.key).Trim()
+        $text = ConvertTo-FlatString $item.text
+        if (-not (Test-ValidXmlElementName $key) -or [string]::IsNullOrWhiteSpace($text)) { continue }
+        $existingMap[$key] = $text
+        [void]$existingKeys.Add($key)
+        $preservedTranslationCount++
+    }
+    Write-Host "Preserved review translations: $preservedTranslationCount"
+}
 $sourceEntries = Import-SourceEntries -ModRoot $modFull -OutputFilePrefix $OutputFilePrefix -SourceLanguageFolder $SourceLanguageFolder -IncludePatches:$IncludePatches
 $dedupe = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+$reviewEntries = New-Object "System.Collections.Generic.List[object]"
 $pending = New-Object "System.Collections.Generic.List[object]"
 $skippedExisting = 0
 $skippedDuplicate = 0
 
 foreach ($entry in $sourceEntries) {
-    if ($existingKeys.Contains($entry.Key) -and -not $Overwrite -and -not $ReviewOnly) {
-        $skippedExisting++
-        continue
-    }
     $identity = $entry.Key
     if (-not $dedupe.Add($identity)) {
         $skippedDuplicate++
         continue
     }
-    if ($Limit -gt 0 -and $pending.Count -ge $Limit) { break }
-    $entry.Id = "E{0:d6}" -f ($pending.Count + 1)
-    [void]$pending.Add($entry)
+    if ($Limit -gt 0 -and $reviewEntries.Count -ge $Limit) { break }
+    $hasExistingKey = $existingKeys.Contains($entry.Key)
+    $hasExistingTranslation = $existingMap.ContainsKey($entry.Key) -and -not [string]::IsNullOrWhiteSpace([string]$existingMap[$entry.Key])
+    if ($hasExistingKey -and -not $Overwrite -and -not $ReviewOnly) {
+        $skippedExisting++
+        continue
+    }
+    $entry.Id = "E{0:d6}" -f ($reviewEntries.Count + 1)
+    [void]$reviewEntries.Add($entry)
+    if ($TranslateMissingOnly -and $hasExistingTranslation) {
+        $skippedExisting++
+    } else {
+        [void]$pending.Add($entry)
+    }
 }
 
 if ($script:DetectedSourceLanguageRoots -and $script:DetectedSourceLanguageRoots.Count -gt 0) {
@@ -1404,12 +1497,13 @@ if ($script:DetectedSourceLanguageRoots -and $script:DetectedSourceLanguageRoots
     Write-Host "Detected source language: none; using Defs text only."
 }
 Write-Host "Source entries: $($sourceEntries.Count)"
-Write-Host "Pending entries: $($pending.Count)"
-Write-Host "Skipped existing: $skippedExisting"
+Write-Host "Review entries: $($reviewEntries.Count)"
+Write-Host "Pending translation entries: $($pending.Count)"
+Write-Host "Reused existing entries: $skippedExisting"
 Write-Host "Skipped duplicate: $skippedDuplicate"
 
-if ($pending.Count -eq 0) {
-    Write-Host "Nothing to translate."
+if ($reviewEntries.Count -eq 0) {
+    Write-Host "Nothing to review or translate."
     return
 }
 
@@ -1418,11 +1512,15 @@ if ($DryRun) {
     return
 }
 
-Write-AuditFile -Path "$auditBase-source.json" -Rows $pending
+if ($ReviewOnly -and -not (Test-Path -LiteralPath $outputLanguageRoot -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $outputLanguageRoot | Out-Null
+}
+
+Write-AuditFile -Path "$auditBase-source.json" -Rows $reviewEntries
 
 if ($SourceOnly) {
     $comparisonRows = New-Object "System.Collections.Generic.List[object]"
-    foreach ($entry in $pending) {
+    foreach ($entry in $reviewEntries) {
         $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
         $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
         [void]$comparisonRows.Add([pscustomobject]@{
@@ -1473,6 +1571,35 @@ $comparisonRows = New-Object "System.Collections.Generic.List[object]"
 $warnings = New-Object "System.Collections.Generic.List[object]"
 $outputGroups = @{}
 $skippedUnsafe = 0
+$pendingIds = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($entry in $pending) { [void]$pendingIds.Add([string]$entry.Id) }
+
+foreach ($entry in $reviewEntries) {
+    if ($pendingIds.Contains([string]$entry.Id)) { continue }
+    $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
+    $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
+    [void]$comparisonRows.Add([pscustomobject]@{
+        id = $entry.Id
+        key = $entry.Key
+        kind = $entry.Kind
+        defClass = $entry.TypeName
+        node = $entry.Key
+        field = $entry.Field
+        target = $targetPath
+        source = $entry.Text
+        existing = $existingTranslation
+        candidate = ""
+        existingPresent = -not [string]::IsNullOrWhiteSpace($existingTranslation)
+        existingHasKorean = Test-ContainsKorean $existingTranslation
+        candidateHasKorean = $false
+        existingSameAsSource = $existingTranslation -eq ([string]$entry.Text)
+        candidateSameAsSource = $false
+        candidateBlank = $true
+        missingTokens = ""
+        pathologicalCandidate = $false
+        safeToApply = $false
+    })
+}
 
 for ($i = 0; $i -lt $batches.Count; $i++) {
     $batch = @($batches[$i])
