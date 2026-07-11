@@ -340,13 +340,64 @@ function Write-FileState([object]$State) {
             $stream.Dispose()
         }
         if (Test-Path -LiteralPath $State.Path -PathType Leaf) {
-            [System.IO.File]::Replace($temporaryPath, [string]$State.Path, $null, $true)
+            [System.IO.File]::Replace($temporaryPath, [string]$State.Path, "$($State.Path).bak", $true)
         } else {
             [System.IO.File]::Move($temporaryPath, [string]$State.Path)
         }
     } finally {
         if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
             Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Copy-FileFlushed([string]$SourcePath, [string]$DestinationPath) {
+    $bytes = [System.IO.File]::ReadAllBytes($SourcePath)
+    $stream = [System.IO.FileStream]::new($DestinationPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function New-TransactionFileEntry([string]$Path) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $existed = Test-Path -LiteralPath $fullPath -PathType Leaf
+    $snapshotPath = ""
+    if ($existed) {
+        $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+        $snapshotPath = Join-Path $directory (".{0}.{1}.transaction.bak" -f [System.IO.Path]::GetFileName($fullPath), [System.Guid]::NewGuid().ToString("N"))
+        Copy-FileFlushed -SourcePath $fullPath -DestinationPath $snapshotPath
+    }
+    return [pscustomobject]@{ Path = $fullPath; Existed = $existed; SnapshotPath = $snapshotPath }
+}
+
+function Restore-TransactionFile([object]$Entry) {
+    $path = [string]$Entry.Path
+    if (-not [bool]$Entry.Existed) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        return
+    }
+
+    $directory = [System.IO.Path]::GetDirectoryName($path)
+    $restorePath = Join-Path $directory (".{0}.{1}.restore.tmp" -f [System.IO.Path]::GetFileName($path), [System.Guid]::NewGuid().ToString("N"))
+    $discardPath = Join-Path $directory (".{0}.{1}.failed.tmp" -f [System.IO.Path]::GetFileName($path), [System.Guid]::NewGuid().ToString("N"))
+    try {
+        Copy-FileFlushed -SourcePath ([string]$Entry.SnapshotPath) -DestinationPath $restorePath
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            [System.IO.File]::Replace($restorePath, $path, $discardPath, $true)
+        } else {
+            [System.IO.File]::Move($restorePath, $path)
+        }
+    } finally {
+        foreach ($temporaryPath in @($restorePath, $discardPath)) {
+            if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
@@ -594,14 +645,41 @@ $historyRows = New-Object "System.Collections.Generic.List[RimWorldTranslatorRmk
 foreach ($identifier in $historyOrder) {
     if ($historyRowsByIdentifier.ContainsKey($identifier)) { [void]$historyRows.Add($historyRowsByIdentifier[$identifier]) }
 }
-if (-not $DryRun) {
-    [RimWorldTranslatorRmkXlsxWriter]::Write($workbookFull, $historyRows, $effectiveSourceLanguage)
-}
-
+$dirtyStates = @($fileStates.Values | Where-Object { $_.Dirty } | Sort-Object Path)
 $writtenFiles = 0
-foreach ($state in @($fileStates.Values | Where-Object { $_.Dirty } | Sort-Object Path)) {
-    Write-FileState $state
-    $writtenFiles++
+$writeJournal = New-Object "System.Collections.Generic.List[object]"
+try {
+    if (-not $DryRun) {
+        [void]$writeJournal.Add((New-TransactionFileEntry $workbookFull))
+        foreach ($state in $dirtyStates) {
+            [void]$writeJournal.Add((New-TransactionFileEntry ([string]$state.Path)))
+        }
+        [RimWorldTranslatorRmkXlsxWriter]::Write($workbookFull, $historyRows, $effectiveSourceLanguage)
+    }
+    foreach ($state in $dirtyStates) {
+        Write-FileState $state
+        $writtenFiles++
+    }
+} catch {
+    $exportError = $_.Exception
+    $rollbackErrors = New-Object "System.Collections.Generic.List[string]"
+    for ($index = $writeJournal.Count - 1; $index -ge 0; $index--) {
+        try {
+            Restore-TransactionFile $writeJournal[$index]
+        } catch {
+            [void]$rollbackErrors.Add("$($writeJournal[$index].Path): $($_.Exception.Message)")
+        }
+    }
+    if ($rollbackErrors.Count -gt 0) {
+        throw "RMK export failed and rollback was incomplete. Export error: $($exportError.Message) Rollback errors: $([string]::Join(' | ', $rollbackErrors))"
+    }
+    throw "RMK export failed; the workbook and XML files written by this run were rolled back. $($exportError.Message)"
+} finally {
+    foreach ($entry in $writeJournal) {
+        if ($entry.SnapshotPath -and (Test-Path -LiteralPath ([string]$entry.SnapshotPath) -PathType Leaf)) {
+            Remove-Item -LiteralPath ([string]$entry.SnapshotPath) -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Write-Host "RMK entry root: $rmkEntryFull"

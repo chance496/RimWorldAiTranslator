@@ -35,6 +35,11 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$storageScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.Storage.ps1"
+if (-not (Test-Path -LiteralPath $storageScriptPath -PathType Leaf)) {
+    throw "State storage component was not found: $storageScriptPath"
+}
+. $storageScriptPath
 $nativeAssemblyPath = Join-Path $scriptRoot "RimWorldAiTranslator.Native.dll"
 if ((Test-Path -LiteralPath $nativeAssemblyPath -PathType Leaf) -and -not ("RimWorldTranslatorNativeMethods" -as [type])) {
     Add-Type -LiteralPath $nativeAssemblyPath -ErrorAction Stop
@@ -84,6 +89,7 @@ $script:appliedThemeSignature = ""
 $script:windowsDarkModeCacheValid = $false
 $script:windowsDarkModeCached = $false
 $script:windowsDarkModeCheckedAt = [datetime]::MinValue
+$script:startupSettingsError = ""
 $script:visibleRowIndexes = @()
 $script:visibleRowPositionMap = [int[]]@()
 $script:syncingItemSelection = $false
@@ -318,75 +324,6 @@ function Ensure-AppDataStore {
     }
 }
 
-function Write-Utf8JsonFile([string]$Path, [object]$Value, [int]$Depth = 8) {
-    $json = ConvertTo-Json -InputObject $Value -Depth $Depth -Compress
-    $fullPath = [System.IO.Path]::GetFullPath($Path)
-    $directory = [System.IO.Path]::GetDirectoryName($fullPath)
-    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
-        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
-    }
-
-    $tempPath = Join-Path $directory (".{0}.{1}.tmp" -f [System.IO.Path]::GetFileName($fullPath), [System.Guid]::NewGuid().ToString("N"))
-    $backupPath = "$fullPath.bak"
-    $encoding = [System.Text.UTF8Encoding]::new($false)
-    $bytes = $encoding.GetBytes($json)
-    try {
-        $stream = [System.IO.FileStream]::new(
-            $tempPath,
-            [System.IO.FileMode]::CreateNew,
-            [System.IO.FileAccess]::Write,
-            [System.IO.FileShare]::None
-        )
-        try {
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
-        } finally {
-            $stream.Dispose()
-        }
-
-        if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
-            [System.IO.File]::Replace($tempPath, $fullPath, $backupPath, $true)
-        } else {
-            [System.IO.File]::Move($tempPath, $fullPath)
-        }
-    } finally {
-        if (Test-Path -LiteralPath $tempPath -PathType Leaf) {
-            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Test-Utf8JsonStoreExists([string]$Path) {
-    return (Test-Path -LiteralPath $Path -PathType Leaf) -or (Test-Path -LiteralPath "$Path.bak" -PathType Leaf)
-}
-
-function Read-Utf8JsonFile([string]$Path, [switch]$AllowMissing) {
-    $candidates = @($Path, "$Path.bak")
-    $errors = New-Object "System.Collections.Generic.List[string]"
-    $found = $false
-    foreach ($candidate in $candidates) {
-        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
-        $found = $true
-        try {
-            $raw = [System.IO.File]::ReadAllText($candidate, [System.Text.Encoding]::UTF8)
-            if ([string]::IsNullOrWhiteSpace($raw)) { throw "JSON file is empty." }
-            $value = $raw | ConvertFrom-Json -ErrorAction Stop
-            if ($candidate -ne $Path) {
-                if (-not $script:jsonRecoveryNotices) {
-                    $script:jsonRecoveryNotices = New-Object "System.Collections.Generic.List[string]"
-                }
-                [void]$script:jsonRecoveryNotices.Add("손상된 상태 파일을 백업에서 복구해 읽었습니다: $Path")
-            }
-            return $value
-        } catch {
-            [void]$errors.Add("$candidate : $($_.Exception.Message)")
-        }
-    }
-    if ($AllowMissing -and -not $found) { return $null }
-    if (-not $found) { throw "JSON file was not found: $Path" }
-    throw "JSON file and its backup could not be read. $([string]::Join(' | ', $errors))"
-}
-
 function Reset-ApiProviderSettings {
     $script:selectedApiProviderId = "Cerebras"
     $script:apiProviderConfigs = @{}
@@ -449,13 +386,7 @@ function Load-AppSettings {
             }
         }
     } catch {
-        $script:themeMode = "System"
-        $script:textSize = 10
-        $script:highContrast = $false
-        $script:autoSave = $true
-        $script:rmkWorkspaceRoot = ""
-        $script:rmkUseExisting = $true
-        Reset-ApiProviderSettings
+        throw "Settings and backup could not be loaded. $($_.Exception.Message)"
     }
 }
 
@@ -778,12 +709,7 @@ function Load-ProjectStore {
     $script:dashboardProjectsDirty = $true
     $script:projects = @()
     if (Test-Utf8JsonStoreExists $script:projectStorePath) {
-        try {
-            $json = Read-Utf8JsonFile $script:projectStorePath
-            $script:projects = @($json.projects)
-        } catch {
-            $script:projects = @()
-        }
+        $script:projects = @(Read-RimWorldProjectStore $script:projectStorePath)
     }
     $storeChanged = $false
     foreach ($project in @($script:projects)) {
@@ -2984,6 +2910,10 @@ function Load-Decisions {
             $script:validateLoadedDecisionSources = $comparisonInfo.LastWriteTimeUtc -gt $decisionInfo.LastWriteTimeUtc
         }
         $json = Read-Utf8JsonFile $path
+        if (-not $json -or -not $json.PSObject.Properties["items"]) {
+            Block-Utf8JsonStoreWrites $path
+            throw "Review decision store is missing the items collection."
+        }
         foreach ($item in @($json.items)) {
             $key = if ($item.id) { "id:$($item.id)" } else { "key:$($item.key)" }
             $loadedStatus = if ($item.status) { [string]$item.status } else { "pending" }
@@ -3005,7 +2935,9 @@ function Load-Decisions {
             }
         }
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("검수 상태 파일을 읽지 못했습니다.`r`n$($_.Exception.Message)", "RimWorld AI Translator") | Out-Null
+        $script:rows = @()
+        $script:decisions = @{}
+        throw "검수 상태 파일을 읽지 못했습니다. 원본과 백업은 보존되며 이 작업은 저장할 수 없습니다. $($_.Exception.Message)"
     }
 }
 
@@ -5419,7 +5351,11 @@ function Show-Workspace {
 }
 
 Ensure-AppDataStore
-Load-AppSettings
+try {
+    Load-AppSettings
+} catch {
+    $script:startupSettingsError = $_.Exception.Message
+}
 if ($PreviewTheme -in @("System", "Light", "Dark")) { $script:themeMode = $PreviewTheme }
 if ($PreviewTextSize -ge 9 -and $PreviewTextSize -le 12) { $script:textSize = $PreviewTextSize }
 if ($PreviewHighContrast) { $script:highContrast = $true }
@@ -7316,7 +7252,20 @@ $form.Add_FormClosed({
 
 Ensure-AppDataStore
 Remove-StaleTempFiles
-Load-ProjectStore
+if ($script:startupSettingsError) {
+    $message = "설정 파일을 읽을 수 없어 안전하게 시작을 중단했습니다.`r`n`r`n주 파일: $script:settingsPath`r`n백업: $script:settingsPath.bak`r`n`r`n두 파일은 보존했으며 기본 설정으로 덮어쓰지 않았습니다.`r`n`r`n오류: $script:startupSettingsError"
+    [System.Windows.Forms.MessageBox]::Show($message, "설정 상태 복구 필요", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    $form.Dispose()
+    return
+}
+try {
+    Load-ProjectStore
+} catch {
+    $message = "프로젝트 목록을 읽을 수 없어 안전하게 시작을 중단했습니다.`r`n`r`n주 파일: $script:projectStorePath`r`n백업: $script:projectStorePath.bak`r`n`r`n두 파일은 그대로 보존했으며 새 빈 목록으로 덮어쓰지 않았습니다. 파일을 별도 위치에 복사한 뒤 정상 백업을 복원하거나 지원에 오류 내용을 전달하세요.`r`n`r`n오류: $($_.Exception.Message)"
+    [System.Windows.Forms.MessageBox]::Show($message, "프로젝트 상태 복구 필요", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    $form.Dispose()
+    return
+}
 Refresh-ProjectList
 
 if ($script:jsonRecoveryNotices) {

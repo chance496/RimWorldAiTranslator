@@ -997,7 +997,7 @@ public static class RimWorldTranslatorRmkXlsxWriter
             ? new List<RimWorldTranslatorRmkHistoryRow>()
             : sourceRows.Where(delegate(RimWorldTranslatorRmkHistoryRow row) { return row != null && !String.IsNullOrWhiteSpace(row.Identifier); }).ToList();
         string temporaryPath = fullPath + ".tmp-" + Guid.NewGuid().ToString("N");
-        string backupPath = temporaryPath + ".bak";
+        string backupPath = fullPath + ".bak";
         try
         {
             if (File.Exists(fullPath)) UpdateWorkbookArchive(fullPath, temporaryPath, rows, effectiveSourceLanguage);
@@ -1005,7 +1005,6 @@ public static class RimWorldTranslatorRmkXlsxWriter
             if (File.Exists(fullPath))
             {
                 File.Replace(temporaryPath, fullPath, backupPath, true);
-                if (File.Exists(backupPath)) File.Delete(backupPath);
             }
             else
             {
@@ -1015,7 +1014,6 @@ public static class RimWorldTranslatorRmkXlsxWriter
         finally
         {
             if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
-            if (File.Exists(backupPath)) File.Delete(backupPath);
         }
     }
 }

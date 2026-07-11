@@ -10,12 +10,35 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$script:sensitiveLogValues = New-Object "System.Collections.Generic.List[string]"
+foreach ($rawValue in @($env:RIMWORLD_TRANSLATOR_API_KEYS, $env:CEREBRAS_API_KEY)) {
+    foreach ($candidate in [System.Text.RegularExpressions.Regex]::Split([string]$rawValue, "[,;\r\n]+")) {
+        $trimmed = ([string]$candidate).Trim()
+        if ($trimmed.StartsWith("Bearer ", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $trimmed = $trimmed.Substring(7).Trim()
+        }
+        if ($trimmed.Length -ge 4 -and -not $script:sensitiveLogValues.Contains($trimmed)) {
+            [void]$script:sensitiveLogValues.Add($trimmed)
+        }
+    }
+}
+
+function Protect-SensitiveLogText([object]$Value) {
+    $text = [string]$Value
+    foreach ($secret in @($script:sensitiveLogValues | Sort-Object Length -Descending)) {
+        if (-not [string]::IsNullOrEmpty([string]$secret)) { $text = $text.Replace([string]$secret, "[REDACTED]") }
+    }
+    $text = [System.Text.RegularExpressions.Regex]::Replace($text, '(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;"'']+', '$1[REDACTED]')
+    $text = [System.Text.RegularExpressions.Regex]::Replace($text, '(?i)((?:api[_-]?key|access[_-]?token)\s*[:=]\s*)[^\s,;"'']+', '$1[REDACTED]')
+    return $text
+}
+
 trap {
     try {
         $failureLog = [System.IO.Path]::GetFullPath($LogFile)
         $failureParent = Split-Path -Parent $failureLog
         if ($failureParent -and (Test-Path -LiteralPath $failureParent -PathType Container)) {
-            [System.IO.File]::AppendAllText($failureLog, ([string]$_.Exception.Message + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+            [System.IO.File]::AppendAllText($failureLog, ((Protect-SensitiveLogText $_.Exception.Message) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
         }
     } catch {
     }
@@ -56,6 +79,10 @@ foreach ($property in @($payload.parameters.PSObject.Properties)) {
 if ($parameters.Count -eq 0 -or $parameters.Count -gt $allowedParameters.Count -or -not $parameters.ContainsKey("ModRoot")) {
     throw "ArgumentFile contains an invalid parameter set."
 }
+$apiKeys = @($script:sensitiveLogValues)
+if ($apiKeys.Count -gt 0) { $parameters["ApiKey"] = $apiKeys }
+$env:RIMWORLD_TRANSLATOR_API_KEYS = ""
+$env:CEREBRAS_API_KEY = ""
 
 $logFull = [System.IO.Path]::GetFullPath($LogFile)
 $logParent = Split-Path -Parent $logFull
@@ -72,11 +99,13 @@ $logStream = New-Object System.IO.FileStream(
 $writer = New-Object System.IO.StreamWriter($logStream, (New-Object System.Text.UTF8Encoding($false)))
 $writer.AutoFlush = $true
 try {
-    & $translatorFull @parameters *>&1 | ForEach-Object { $writer.WriteLine([string]$_) }
+    & $translatorFull @parameters *>&1 | ForEach-Object { $writer.WriteLine((Protect-SensitiveLogText $_)) }
 } catch {
-    $writer.WriteLine([string]$_.Exception.Message)
+    $writer.WriteLine((Protect-SensitiveLogText $_.Exception.Message))
     exit 1
 } finally {
+    $env:RIMWORLD_TRANSLATOR_API_KEYS = ""
+    $env:CEREBRAS_API_KEY = ""
     $writer.Dispose()
 }
 

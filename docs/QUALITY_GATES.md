@@ -4,6 +4,14 @@
 
 ## 현재 존재하는 명령
 
+### 오프라인 회귀 테스트
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-RegressionTests.ps1 -Suite All
+```
+
+테스트는 합성 fixture를 고유한 `%TEMP%` 폴더에 복제하며 실제 사용자 프로젝트와 네트워크를 사용하지 않는다. 작업 중에는 `-Suite Harness`, `Syntax`, `StateStore`, `SecretHandling`, `SourceExtraction`, `LocalApply`, `LocalRollback`, `RmkExport`처럼 가장 좁은 suite부터 실행한다.
+
 ### 실행
 
 README와 실제 CMD 진입점:
@@ -48,7 +56,7 @@ Get-ChildItem -LiteralPath . -File -Filter '*.ps1' | Sort-Object Name | ForEach-
 if ($failed) { exit 1 }
 ```
 
-현재 이 검사는 별도 저장소 스크립트나 패키징 단계에 연결되어 있지 않다.
+동일 Parser 검사는 오프라인 회귀와 `build-package.ps1`의 패키지 복사 후 단계에 연결되어 있다.
 
 ### CLI 번역/원문 로드
 
@@ -61,7 +69,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-RimWorldAiTrans
   -ReviewOnly
 ```
 
-`-SourceOnly`, `-MockTranslations`, `-DryRun` 매개변수는 엔진에 구현되어 있지만 이를 조합한 저장소 소유 테스트 명령은 아직 없다. 실제 사용자 모드나 네트워크를 자동 게이트에 사용하지 않는다.
+`-SourceOnly`, `-DryRun`과 합성 검수 결정을 조합한 저장소 소유 회귀가 있으며 실제 사용자 모드나 네트워크를 자동 게이트에 사용하지 않는다. `-MockTranslations`의 배치 재시도·재개 검증은 P1에서 확장한다.
 
 ### 검수 결과 적용
 
@@ -92,15 +100,20 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 
 ## 존재하지 않는 게이트
 
-- 자동 테스트 runner: 없음
 - Pester 또는 다른 단위/통합 테스트: 없음
 - 린터/formatter: 없음
 - CI workflow: 없음
 - benchmark runner: 없음
-- 패키지 ZIP 압축 해제 후 실행 smoke test: 없음
+- 패키지 ZIP 압축 해제 후 GUI smoke test: 없음. CLI 원문 추출 smoke는 빌드에 연결됨.
 - UI 스냅샷/DPI/접근성 자동 감사: 없음
 
-`testdata/SampleMod`는 fixture일 뿐 실행 명령이나 기대 결과가 정의되어 있지 않다. 따라서 현재 “테스트 통과”라고 말할 수 있는 저장소 표준은 없다.
+`testdata/SampleMod`의 기대 원문 7개, 내부 식별자 제외 1개, 로컬/RMK 적용과 롤백 기대값이 회귀 runner에 정의되어 있다.
+
+## 백업 복구
+
+- 기존 XML/XLSX를 교체하면 같은 경로의 `<파일>.bak`에 직전 버전이 남는다.
+- 앱과 RimWorld를 종료한 뒤 현재 파일을 별도 보관하고 `.bak`을 원래 파일명으로 복사하면 수동 복구할 수 있다.
+- 다중 파일 적용 도중 실패하면 해당 실행에서 이미 쓴 파일은 자동으로 직전 상태로 롤백된다. 롤백 자체가 실패하면 오류에 대상 경로가 표시되며 성공으로 처리하지 않는다.
 
 ## 변경별 필수 게이트
 
@@ -116,6 +129,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 
 ## 이번 점검 실행 결과
 
-- PowerShell Parser: 8/8 PASS.
-- `git diff --check`: whitespace 오류 없음. Git의 향후 LF→CRLF 변환 경고는 존재한다.
-- 패키지 빌드/GUI/네트워크/실제 파일 쓰기: 실행하지 않음. 최근 호스트 불안정과 이번 문서 전용 범위 때문에 보류했다.
+- 오프라인 회귀: 8/8 PASS (`Harness`, `Syntax`, `StateStore`, `SecretHandling`, `SourceExtraction`, `LocalApply`, `LocalRollback`, `RmkExport`).
+- 패키지 빌드: PASS. 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS.
+- 네트워크, 실제 API, Workshop, RMK 구독본과 `%LOCALAPPDATA%\RimWorldAiTranslator` 쓰기: 실행하지 않음.

@@ -239,13 +239,53 @@ function Write-Utf8LinesAtomic([string]$Path, [System.Collections.IEnumerable]$L
             $stream.Dispose()
         }
         if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
-            [System.IO.File]::Replace($temporaryPath, $fullPath, $null, $true)
+            $backupPath = "$fullPath.bak"
+            [System.IO.File]::Replace($temporaryPath, $fullPath, $backupPath, $true)
         } else {
             [System.IO.File]::Move($temporaryPath, $fullPath)
         }
     } finally {
         if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
             Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Copy-FileFlushed([string]$SourcePath, [string]$DestinationPath) {
+    $bytes = [System.IO.File]::ReadAllBytes($SourcePath)
+    $stream = [System.IO.FileStream]::new($DestinationPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Restore-TransactionFile([object]$Entry) {
+    $path = [string]$Entry.Path
+    if (-not [bool]$Entry.Existed) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        return
+    }
+
+    $directory = [System.IO.Path]::GetDirectoryName($path)
+    $restorePath = Join-Path $directory (".{0}.{1}.restore.tmp" -f [System.IO.Path]::GetFileName($path), [System.Guid]::NewGuid().ToString("N"))
+    $discardPath = Join-Path $directory (".{0}.{1}.failed.tmp" -f [System.IO.Path]::GetFileName($path), [System.Guid]::NewGuid().ToString("N"))
+    try {
+        Copy-FileFlushed -SourcePath ([string]$Entry.SnapshotPath) -DestinationPath $restorePath
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            [System.IO.File]::Replace($restorePath, $path, $discardPath, $true)
+        } else {
+            [System.IO.File]::Move($restorePath, $path)
+        }
+    } finally {
+        foreach ($temporaryPath in @($restorePath, $discardPath)) {
+            if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
@@ -449,10 +489,44 @@ if (Test-JsonWithBackupExists $decisionFile) {
 
 $appliedEntries = 0
 $skippedExisting = 0
-foreach ($targetPath in ($outputGroups.Keys | Sort-Object)) {
-    $result = Write-LanguageFile -Path $targetPath -Entries $outputGroups[$targetPath] -Overwrite:$Overwrite
-    $appliedEntries += $result.Applied
-    $skippedExisting += $result.SkippedExisting
+$writeJournal = New-Object "System.Collections.Generic.List[object]"
+try {
+    foreach ($targetPath in ($outputGroups.Keys | Sort-Object)) {
+        if (-not $DryRun) {
+            $existed = Test-Path -LiteralPath $targetPath -PathType Leaf
+            $snapshotPath = ""
+            if ($existed) {
+                $directory = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($targetPath))
+                $snapshotPath = Join-Path $directory (".{0}.{1}.transaction.bak" -f [System.IO.Path]::GetFileName($targetPath), [System.Guid]::NewGuid().ToString("N"))
+                Copy-FileFlushed -SourcePath $targetPath -DestinationPath $snapshotPath
+            }
+            [void]$writeJournal.Add([pscustomobject]@{ Path = $targetPath; Existed = $existed; SnapshotPath = $snapshotPath })
+        }
+
+        $result = Write-LanguageFile -Path $targetPath -Entries $outputGroups[$targetPath] -Overwrite:$Overwrite
+        $appliedEntries += $result.Applied
+        $skippedExisting += $result.SkippedExisting
+    }
+} catch {
+    $applyError = $_.Exception
+    $rollbackErrors = New-Object "System.Collections.Generic.List[string]"
+    for ($index = $writeJournal.Count - 1; $index -ge 0; $index--) {
+        try {
+            Restore-TransactionFile $writeJournal[$index]
+        } catch {
+            [void]$rollbackErrors.Add("$($writeJournal[$index].Path): $($_.Exception.Message)")
+        }
+    }
+    if ($rollbackErrors.Count -gt 0) {
+        throw "Translation apply failed and rollback was incomplete. Apply error: $($applyError.Message) Rollback errors: $([string]::Join(' | ', $rollbackErrors))"
+    }
+    throw "Translation apply failed; all files written by this run were rolled back. $($applyError.Message)"
+} finally {
+    foreach ($entry in $writeJournal) {
+        if ($entry.SnapshotPath -and (Test-Path -LiteralPath ([string]$entry.SnapshotPath) -PathType Leaf)) {
+            Remove-Item -LiteralPath ([string]$entry.SnapshotPath) -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Write-Host "Done."
