@@ -21,6 +21,7 @@ public sealed class RimWorldTranslatorRmkHistoryRow
     public string Identifier { get; set; }
     public string ClassName { get; set; }
     public string Key { get; set; }
+    public string RequiredMods { get; set; }
     public string Source { get; set; }
     public string Translation { get; set; }
 }
@@ -29,11 +30,13 @@ public sealed class RimWorldTranslatorRmkHistoryData
 {
     public string SourceLanguage { get; set; }
     public Dictionary<string, RimWorldTranslatorRmkHistoryRow> Map { get; private set; }
+    public List<RimWorldTranslatorRmkHistoryRow> Rows { get; private set; }
 
     public RimWorldTranslatorRmkHistoryData()
     {
         SourceLanguage = String.Empty;
         Map = new Dictionary<string, RimWorldTranslatorRmkHistoryRow>(StringComparer.OrdinalIgnoreCase);
+        Rows = new List<RimWorldTranslatorRmkHistoryRow>();
     }
 }
 
@@ -323,7 +326,7 @@ public static class RimWorldTranslatorRmkXlsxReader
         return index >= 0 && values.TryGetValue(index, out value) ? (value ?? String.Empty).Trim() : String.Empty;
     }
 
-    private static string FindWorksheetEntry(ZipArchive archive)
+    internal static string FindWorksheetEntry(ZipArchive archive)
     {
         XDocument workbook = LoadXml(archive.GetEntry("xl/workbook.xml"), WorkbookXmlLimit);
         XDocument relationships = LoadXml(archive.GetEntry("xl/_rels/workbook.xml.rels"), WorkbookXmlLimit);
@@ -353,7 +356,7 @@ public static class RimWorldTranslatorRmkXlsxReader
         return fallback == null ? String.Empty : fallback.FullName;
     }
 
-    private static List<string> ReadSharedStrings(ZipArchive archive)
+    internal static List<string> ReadSharedStrings(ZipArchive archive)
     {
         List<string> values = new List<string>();
         XmlReader reader = OpenEntryReader(archive.GetEntry("xl/sharedStrings.xml"), SharedStringsLimit);
@@ -375,6 +378,7 @@ public static class RimWorldTranslatorRmkXlsxReader
         ref int identifierColumn,
         ref int classColumn,
         ref int nodeColumn,
+        ref int requiredModsColumn,
         ref int sourceColumn,
         ref int translationColumn)
     {
@@ -388,6 +392,8 @@ public static class RimWorldTranslatorRmkXlsxReader
                 classColumn = pair.Key;
             else if (lower.StartsWith("node ", StringComparison.Ordinal) || lower.StartsWith("node[", StringComparison.Ordinal))
                 nodeColumn = pair.Key;
+            else if (lower.StartsWith("required mods", StringComparison.Ordinal))
+                requiredModsColumn = pair.Key;
 
             if (lower.IndexOf("[source string]", StringComparison.Ordinal) >= 0)
             {
@@ -415,6 +421,7 @@ public static class RimWorldTranslatorRmkXlsxReader
             int identifierColumn = -1;
             int classColumn = -1;
             int nodeColumn = -1;
+            int requiredModsColumn = -1;
             int sourceColumn = -1;
             int translationColumn = -1;
             bool headerFound = false;
@@ -432,7 +439,7 @@ public static class RimWorldTranslatorRmkXlsxReader
                     if (!headerFound)
                     {
                         if (rowIndex >= 10) return result;
-                        DetectHeader(values, result, ref identifierColumn, ref classColumn, ref nodeColumn, ref sourceColumn, ref translationColumn);
+                        DetectHeader(values, result, ref identifierColumn, ref classColumn, ref nodeColumn, ref requiredModsColumn, ref sourceColumn, ref translationColumn);
                         headerFound = sourceColumn >= 0 && translationColumn >= 0 && (identifierColumn >= 0 || (classColumn >= 0 && nodeColumn >= 0));
                         continue;
                     }
@@ -447,17 +454,471 @@ public static class RimWorldTranslatorRmkXlsxReader
                         int separator = identifier.IndexOf('+');
                         if (separator >= 0 && separator + 1 < identifier.Length) key = identifier.Substring(separator + 1);
                     }
-                    if (result.Map.ContainsKey(identifier)) continue;
-                    result.Map.Add(identifier, new RimWorldTranslatorRmkHistoryRow {
+                    RimWorldTranslatorRmkHistoryRow historyRow = new RimWorldTranslatorRmkHistoryRow {
                         Identifier = identifier,
                         ClassName = className,
                         Key = key,
+                        RequiredMods = GetValue(values, requiredModsColumn),
                         Source = GetValue(values, sourceColumn),
                         Translation = GetValue(values, translationColumn)
-                    });
+                    };
+                    result.Rows.Add(historyRow);
+                    if (!result.Map.ContainsKey(identifier)) result.Map.Add(identifier, historyRow);
                 }
             }
         }
         return result;
+    }
+}
+
+public static class RimWorldTranslatorRmkXlsxWriter
+{
+    private const string SpreadsheetNamespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    private const string RelationshipsNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+    private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
+
+    private static string CleanText(string value)
+    {
+        if (String.IsNullOrEmpty(value)) return String.Empty;
+        StringBuilder builder = new StringBuilder(value.Length);
+        for (int index = 0; index < value.Length; index++)
+        {
+            char current = value[index];
+            if (Char.IsHighSurrogate(current) && index + 1 < value.Length && Char.IsLowSurrogate(value[index + 1]))
+            {
+                builder.Append(current);
+                builder.Append(value[++index]);
+            }
+            else if (!Char.IsSurrogate(current) && XmlConvert.IsXmlChar(current))
+            {
+                builder.Append(current);
+            }
+        }
+        return builder.ToString();
+    }
+
+    private static XmlWriter CreateXmlWriter(Stream stream)
+    {
+        XmlWriterSettings settings = new XmlWriterSettings();
+        settings.Encoding = Utf8NoBom;
+        settings.Indent = false;
+        settings.CloseOutput = false;
+        return XmlWriter.Create(stream, settings);
+    }
+
+    private static void WriteStaticEntry(ZipArchive archive, string name, string content)
+    {
+        ZipArchiveEntry entry = archive.CreateEntry(name, CompressionLevel.Optimal);
+        using (Stream stream = entry.Open())
+        using (StreamWriter writer = new StreamWriter(stream, Utf8NoBom))
+        {
+            writer.Write(content);
+        }
+    }
+
+    private static void WriteTextCell(XmlWriter writer, string reference, string value)
+    {
+        writer.WriteStartElement("c", SpreadsheetNamespace);
+        writer.WriteAttributeString("r", reference);
+        writer.WriteAttributeString("t", "inlineStr");
+        writer.WriteStartElement("is", SpreadsheetNamespace);
+        writer.WriteStartElement("t", SpreadsheetNamespace);
+        writer.WriteAttributeString("xml", "space", "http://www.w3.org/XML/1998/namespace", "preserve");
+        writer.WriteString(CleanText(value));
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+    }
+
+    private static void WriteWorksheet(ZipArchive archive, IList<RimWorldTranslatorRmkHistoryRow> rows, string sourceLanguage)
+    {
+        ZipArchiveEntry entry = archive.CreateEntry("xl/worksheets/sheet1.xml", CompressionLevel.Optimal);
+        using (Stream stream = entry.Open())
+        using (XmlWriter writer = CreateXmlWriter(stream))
+        {
+            int lastRow = Math.Max(1, rows.Count + 1);
+            writer.WriteStartDocument(true);
+            writer.WriteStartElement("worksheet", SpreadsheetNamespace);
+            writer.WriteStartElement("dimension", SpreadsheetNamespace);
+            writer.WriteAttributeString("ref", "A1:F" + lastRow.ToString(CultureInfo.InvariantCulture));
+            writer.WriteEndElement();
+            writer.WriteStartElement("sheetViews", SpreadsheetNamespace);
+            writer.WriteStartElement("sheetView", SpreadsheetNamespace);
+            writer.WriteAttributeString("workbookViewId", "0");
+            writer.WriteStartElement("pane", SpreadsheetNamespace);
+            writer.WriteAttributeString("ySplit", "1");
+            writer.WriteAttributeString("topLeftCell", "A2");
+            writer.WriteAttributeString("activePane", "bottomLeft");
+            writer.WriteAttributeString("state", "frozen");
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteStartElement("cols", SpreadsheetNamespace);
+            double[] widths = new double[] { 42, 24, 52, 28, 72, 72 };
+            for (int column = 0; column < widths.Length; column++)
+            {
+                writer.WriteStartElement("col", SpreadsheetNamespace);
+                writer.WriteAttributeString("min", (column + 1).ToString(CultureInfo.InvariantCulture));
+                writer.WriteAttributeString("max", (column + 1).ToString(CultureInfo.InvariantCulture));
+                writer.WriteAttributeString("width", widths[column].ToString(CultureInfo.InvariantCulture));
+                writer.WriteAttributeString("customWidth", "1");
+                writer.WriteEndElement();
+            }
+            writer.WriteEndElement();
+            writer.WriteStartElement("sheetData", SpreadsheetNamespace);
+            writer.WriteStartElement("row", SpreadsheetNamespace);
+            writer.WriteAttributeString("r", "1");
+            string[] headers = new string[] {
+                "Class+Node [(Identifier (Key)]",
+                "Class [Not chosen]",
+                "Node [Not chosen]",
+                "Required Mods [Not chosen]",
+                CleanText(sourceLanguage) + " [Source string]",
+                "Korean (한국어) [Translation]"
+            };
+            for (int column = 0; column < headers.Length; column++)
+                WriteTextCell(writer, ((char)('A' + column)).ToString() + "1", headers[column]);
+            writer.WriteEndElement();
+
+            for (int index = 0; index < rows.Count; index++)
+            {
+                RimWorldTranslatorRmkHistoryRow row = rows[index];
+                int rowNumber = index + 2;
+                string suffix = rowNumber.ToString(CultureInfo.InvariantCulture);
+                writer.WriteStartElement("row", SpreadsheetNamespace);
+                writer.WriteAttributeString("r", suffix);
+                WriteTextCell(writer, "A" + suffix, row.Identifier);
+                WriteTextCell(writer, "B" + suffix, row.ClassName);
+                WriteTextCell(writer, "C" + suffix, row.Key);
+                WriteTextCell(writer, "D" + suffix, row.RequiredMods);
+                WriteTextCell(writer, "E" + suffix, row.Source);
+                WriteTextCell(writer, "F" + suffix, row.Translation);
+                writer.WriteEndElement();
+            }
+            writer.WriteEndElement();
+            writer.WriteStartElement("autoFilter", SpreadsheetNamespace);
+            writer.WriteAttributeString("ref", "A1:F" + lastRow.ToString(CultureInfo.InvariantCulture));
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndDocument();
+        }
+    }
+
+    private static void WriteWorkbookArchive(string outputPath, IList<RimWorldTranslatorRmkHistoryRow> rows, string sourceLanguage)
+    {
+        using (ZipArchive archive = ZipFile.Open(outputPath, ZipArchiveMode.Create))
+        {
+            WriteStaticEntry(archive, "[Content_Types].xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+                "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
+                "<Default Extension=\"xml\" ContentType=\"application/xml\"/>" +
+                "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>" +
+                "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>" +
+                "</Types>");
+            WriteStaticEntry(archive, "_rels/.rels",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" +
+                "</Relationships>");
+            WriteStaticEntry(archive, "xl/workbook.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                "<workbook xmlns=\"" + SpreadsheetNamespace + "\" xmlns:r=\"" + RelationshipsNamespace + "\">" +
+                "<sheets><sheet name=\"Translations\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>");
+            WriteStaticEntry(archive, "xl/_rels/workbook.xml.rels",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" +
+                "</Relationships>");
+            WriteWorksheet(archive, rows, sourceLanguage);
+        }
+    }
+
+    private static XDocument LoadWorksheetDocument(ZipArchiveEntry entry)
+    {
+        if (entry == null) throw new InvalidDataException("Workbook worksheet was not found.");
+        if (entry.Length > 536870912) throw new InvalidDataException("Workbook worksheet is too large.");
+        XmlReaderSettings settings = new XmlReaderSettings();
+        settings.DtdProcessing = DtdProcessing.Prohibit;
+        settings.XmlResolver = null;
+        settings.MaxCharactersFromEntities = 1024;
+        settings.MaxCharactersInDocument = 536870912;
+        using (Stream stream = entry.Open())
+        using (XmlReader reader = XmlReader.Create(stream, settings))
+        {
+            return XDocument.Load(reader, LoadOptions.PreserveWhitespace);
+        }
+    }
+
+    private static int GetColumnIndex(string reference)
+    {
+        if (String.IsNullOrWhiteSpace(reference)) return -1;
+        int result = 0;
+        int count = 0;
+        foreach (char character in reference)
+        {
+            if (!Char.IsLetter(character)) break;
+            result = checked(result * 26 + (Char.ToUpperInvariant(character) - 'A' + 1));
+            count++;
+        }
+        return count == 0 ? -1 : result - 1;
+    }
+
+    private static string GetColumnName(int columnIndex)
+    {
+        if (columnIndex < 0) throw new ArgumentOutOfRangeException("columnIndex");
+        StringBuilder builder = new StringBuilder();
+        int value = columnIndex + 1;
+        while (value > 0)
+        {
+            value--;
+            builder.Insert(0, (char)('A' + (value % 26)));
+            value /= 26;
+        }
+        return builder.ToString();
+    }
+
+    private static int GetRowNumber(XElement row, int fallback)
+    {
+        int result;
+        XAttribute value = row.Attribute("r");
+        return value != null && Int32.TryParse(value.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out result)
+            ? result
+            : fallback;
+    }
+
+    private static string GetCellValue(XElement cell, IList<string> sharedStrings)
+    {
+        string type = (string)cell.Attribute("t") ?? String.Empty;
+        if (type == "inlineStr")
+            return String.Concat(cell.Descendants().Where(delegate(XElement node) { return node.Name.LocalName == "t"; }).Select(delegate(XElement node) { return node.Value; }));
+        XElement valueNode = cell.Elements().FirstOrDefault(delegate(XElement node) { return node.Name.LocalName == "v"; });
+        string value = valueNode == null ? String.Empty : valueNode.Value;
+        if (type == "s")
+        {
+            int index;
+            if (Int32.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out index) && index >= 0 && index < sharedStrings.Count)
+                return sharedStrings[index];
+        }
+        return value;
+    }
+
+    private static Dictionary<int, string> GetRowValues(XElement row, IList<string> sharedStrings)
+    {
+        Dictionary<int, string> result = new Dictionary<int, string>();
+        int sequentialColumn = 0;
+        foreach (XElement cell in row.Elements().Where(delegate(XElement node) { return node.Name.LocalName == "c"; }))
+        {
+            int column = GetColumnIndex((string)cell.Attribute("r"));
+            if (column < 0) column = sequentialColumn;
+            result[column] = GetCellValue(cell, sharedStrings);
+            sequentialColumn = column + 1;
+        }
+        return result;
+    }
+
+    private static string GetValue(Dictionary<int, string> values, int column)
+    {
+        string value;
+        return column >= 0 && values.TryGetValue(column, out value) ? value ?? String.Empty : String.Empty;
+    }
+
+    private static void SetCellValue(XElement row, int column, int rowNumber, string value)
+    {
+        XNamespace ns = row.Name.Namespace;
+        XElement cell = row.Elements().FirstOrDefault(delegate(XElement candidate) {
+            return candidate.Name.LocalName == "c" && GetColumnIndex((string)candidate.Attribute("r")) == column;
+        });
+        if (cell == null)
+        {
+            cell = new XElement(ns + "c");
+            XElement next = row.Elements().FirstOrDefault(delegate(XElement candidate) {
+                return candidate.Name.LocalName == "c" && GetColumnIndex((string)candidate.Attribute("r")) > column;
+            });
+            if (next == null) row.Add(cell); else next.AddBeforeSelf(cell);
+        }
+        cell.SetAttributeValue("r", GetColumnName(column) + rowNumber.ToString(CultureInfo.InvariantCulture));
+        cell.SetAttributeValue("t", "inlineStr");
+        cell.RemoveNodes();
+        XElement text = new XElement(ns + "t", CleanText(value));
+        text.SetAttributeValue(XNamespace.Xml + "space", "preserve");
+        cell.Add(new XElement(ns + "is", text));
+    }
+
+    private static void MergeWorksheet(XDocument document, IList<string> sharedStrings, IList<RimWorldTranslatorRmkHistoryRow> rows, string sourceLanguage)
+    {
+        XElement worksheet = document.Root;
+        if (worksheet == null || worksheet.Name.LocalName != "worksheet") throw new InvalidDataException("Workbook worksheet XML is invalid.");
+        XNamespace ns = worksheet.Name.Namespace;
+        XElement sheetData = worksheet.Elements().FirstOrDefault(delegate(XElement node) { return node.Name.LocalName == "sheetData"; });
+        if (sheetData == null) throw new InvalidDataException("Workbook sheetData was not found.");
+
+        int identifierColumn = -1;
+        int classColumn = -1;
+        int nodeColumn = -1;
+        int requiredModsColumn = -1;
+        int sourceColumn = -1;
+        int translationColumn = -1;
+        XElement headerRow = null;
+        int headerRowNumber = 1;
+        foreach (XElement row in sheetData.Elements().Where(delegate(XElement node) { return node.Name.LocalName == "row"; }).Take(10))
+        {
+            Dictionary<int, string> values = GetRowValues(row, sharedStrings);
+            foreach (KeyValuePair<int, string> pair in values)
+            {
+                string header = (pair.Value ?? String.Empty).Trim();
+                string lower = header.ToLowerInvariant();
+                if (lower.StartsWith("class+node", StringComparison.Ordinal) || lower.IndexOf("identifier (key", StringComparison.Ordinal) >= 0) identifierColumn = pair.Key;
+                else if (lower.StartsWith("class ", StringComparison.Ordinal) || lower.StartsWith("class[", StringComparison.Ordinal)) classColumn = pair.Key;
+                else if (lower.StartsWith("node ", StringComparison.Ordinal) || lower.StartsWith("node[", StringComparison.Ordinal)) nodeColumn = pair.Key;
+                else if (lower.StartsWith("required mods", StringComparison.Ordinal)) requiredModsColumn = pair.Key;
+                if (lower.IndexOf("[source string]", StringComparison.Ordinal) >= 0) sourceColumn = pair.Key;
+                if (lower.IndexOf("[translation]", StringComparison.Ordinal) >= 0) translationColumn = pair.Key;
+            }
+            if (sourceColumn >= 0 && translationColumn >= 0 && identifierColumn >= 0 && classColumn >= 0 && nodeColumn >= 0 && requiredModsColumn >= 0)
+            {
+                headerRow = row;
+                headerRowNumber = GetRowNumber(row, 1);
+                break;
+            }
+        }
+        if (headerRow == null) throw new InvalidDataException("Workbook does not use the RMK translation columns.");
+
+        SetCellValue(headerRow, identifierColumn, headerRowNumber, "Class+Node [(Identifier (Key)]");
+        SetCellValue(headerRow, classColumn, headerRowNumber, "Class [Not chosen]");
+        SetCellValue(headerRow, nodeColumn, headerRowNumber, "Node [Not chosen]");
+        SetCellValue(headerRow, requiredModsColumn, headerRowNumber, "Required Mods [Not chosen]");
+        SetCellValue(headerRow, sourceColumn, headerRowNumber, CleanText(sourceLanguage) + " [Source string]");
+        SetCellValue(headerRow, translationColumn, headerRowNumber, "Korean (한국어) [Translation]");
+
+        Dictionary<string, XElement> existingRows = new Dictionary<string, XElement>(StringComparer.OrdinalIgnoreCase);
+        int maxRow = headerRowNumber;
+        foreach (XElement row in sheetData.Elements().Where(delegate(XElement node) { return node.Name.LocalName == "row"; }))
+        {
+            int rowNumber = GetRowNumber(row, maxRow + 1);
+            if (rowNumber > maxRow) maxRow = rowNumber;
+            if (Object.ReferenceEquals(row, headerRow)) continue;
+            Dictionary<int, string> values = GetRowValues(row, sharedStrings);
+            string identifier = GetValue(values, identifierColumn);
+            if (identifier.Length == 0)
+            {
+                string className = GetValue(values, classColumn);
+                string key = GetValue(values, nodeColumn);
+                if (className.Length > 0 && key.Length > 0) identifier = className + "+" + key;
+            }
+            if (identifier.Length > 0 && !existingRows.ContainsKey(identifier)) existingRows.Add(identifier, row);
+        }
+
+        foreach (RimWorldTranslatorRmkHistoryRow desired in rows)
+        {
+            XElement row;
+            int rowNumber;
+            if (existingRows.TryGetValue(desired.Identifier, out row))
+            {
+                rowNumber = GetRowNumber(row, maxRow + 1);
+                if (rowNumber > maxRow) maxRow = rowNumber;
+            }
+            else
+            {
+                rowNumber = ++maxRow;
+                row = new XElement(ns + "row", new XAttribute("r", rowNumber.ToString(CultureInfo.InvariantCulture)));
+                sheetData.Add(row);
+                existingRows[desired.Identifier] = row;
+            }
+            SetCellValue(row, identifierColumn, rowNumber, desired.Identifier);
+            SetCellValue(row, classColumn, rowNumber, desired.ClassName);
+            SetCellValue(row, nodeColumn, rowNumber, desired.Key);
+            SetCellValue(row, requiredModsColumn, rowNumber, desired.RequiredMods);
+            SetCellValue(row, sourceColumn, rowNumber, desired.Source);
+            SetCellValue(row, translationColumn, rowNumber, desired.Translation);
+        }
+
+        int maxColumn = Math.Max(translationColumn, Math.Max(sourceColumn, Math.Max(requiredModsColumn, Math.Max(nodeColumn, Math.Max(classColumn, identifierColumn)))));
+        foreach (XElement cell in sheetData.Descendants().Where(delegate(XElement node) { return node.Name.LocalName == "c"; }))
+        {
+            int column = GetColumnIndex((string)cell.Attribute("r"));
+            if (column > maxColumn) maxColumn = column;
+        }
+        XElement dimension = worksheet.Elements().FirstOrDefault(delegate(XElement node) { return node.Name.LocalName == "dimension"; });
+        if (dimension == null)
+        {
+            dimension = new XElement(ns + "dimension");
+            worksheet.AddFirst(dimension);
+        }
+        dimension.SetAttributeValue("ref", "A1:" + GetColumnName(maxColumn) + maxRow.ToString(CultureInfo.InvariantCulture));
+        XElement autoFilter = worksheet.Elements().FirstOrDefault(delegate(XElement node) { return node.Name.LocalName == "autoFilter"; });
+        if (autoFilter != null)
+        {
+            int filterStartColumn = identifierColumn;
+            int filterEndColumn = translationColumn;
+            string filterReference = (string)autoFilter.Attribute("ref") ?? String.Empty;
+            string[] filterParts = filterReference.Split(':');
+            if (filterParts.Length > 0)
+            {
+                int parsedStart = GetColumnIndex(filterParts[0]);
+                if (parsedStart >= 0) filterStartColumn = parsedStart;
+                int parsedEnd = GetColumnIndex(filterParts[filterParts.Length - 1]);
+                if (parsedEnd > filterEndColumn) filterEndColumn = parsedEnd;
+            }
+            autoFilter.SetAttributeValue("ref", GetColumnName(filterStartColumn) + headerRowNumber.ToString(CultureInfo.InvariantCulture) + ":" + GetColumnName(filterEndColumn) + maxRow.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    private static void UpdateWorkbookArchive(string existingPath, string outputPath, IList<RimWorldTranslatorRmkHistoryRow> rows, string sourceLanguage)
+    {
+        File.Copy(existingPath, outputPath, true);
+        using (ZipArchive archive = ZipFile.Open(outputPath, ZipArchiveMode.Update))
+        {
+            List<string> sharedStrings = RimWorldTranslatorRmkXlsxReader.ReadSharedStrings(archive);
+            string worksheetName = RimWorldTranslatorRmkXlsxReader.FindWorksheetEntry(archive);
+            if (String.IsNullOrWhiteSpace(worksheetName)) throw new InvalidDataException("Workbook worksheet was not found.");
+            ZipArchiveEntry oldEntry = archive.GetEntry(worksheetName);
+            XDocument document = LoadWorksheetDocument(oldEntry);
+            MergeWorksheet(document, sharedStrings, rows, sourceLanguage);
+            oldEntry.Delete();
+            ZipArchiveEntry newEntry = archive.CreateEntry(worksheetName, CompressionLevel.Optimal);
+            using (Stream stream = newEntry.Open())
+            using (XmlWriter writer = CreateXmlWriter(stream))
+            {
+                document.Save(writer);
+            }
+        }
+    }
+
+    public static void Write(string workbookPath, IEnumerable<RimWorldTranslatorRmkHistoryRow> sourceRows, string sourceLanguage)
+    {
+        if (String.IsNullOrWhiteSpace(workbookPath)) throw new ArgumentException("Workbook path is required.", "workbookPath");
+        string fullPath = Path.GetFullPath(workbookPath);
+        if (!String.Equals(Path.GetExtension(fullPath), ".xlsx", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Workbook path must use the .xlsx extension.", "workbookPath");
+        string directory = Path.GetDirectoryName(fullPath);
+        if (String.IsNullOrWhiteSpace(directory)) throw new InvalidDataException("Workbook directory is invalid.");
+        Directory.CreateDirectory(directory);
+        string effectiveSourceLanguage = String.IsNullOrWhiteSpace(sourceLanguage) ? "English" : CleanText(sourceLanguage.Trim());
+        List<RimWorldTranslatorRmkHistoryRow> rows = sourceRows == null
+            ? new List<RimWorldTranslatorRmkHistoryRow>()
+            : sourceRows.Where(delegate(RimWorldTranslatorRmkHistoryRow row) { return row != null && !String.IsNullOrWhiteSpace(row.Identifier); }).ToList();
+        string temporaryPath = fullPath + ".tmp-" + Guid.NewGuid().ToString("N");
+        string backupPath = temporaryPath + ".bak";
+        try
+        {
+            if (File.Exists(fullPath)) UpdateWorkbookArchive(fullPath, temporaryPath, rows, effectiveSourceLanguage);
+            else WriteWorkbookArchive(temporaryPath, rows, effectiveSourceLanguage);
+            if (File.Exists(fullPath))
+            {
+                File.Replace(temporaryPath, fullPath, backupPath, true);
+                if (File.Exists(backupPath)) File.Delete(backupPath);
+            }
+            else
+            {
+                File.Move(temporaryPath, fullPath);
+            }
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+            if (File.Exists(backupPath)) File.Delete(backupPath);
+        }
     }
 }
