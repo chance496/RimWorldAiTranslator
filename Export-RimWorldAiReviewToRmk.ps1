@@ -16,6 +16,9 @@
 )
 
 $ErrorActionPreference = "Stop"
+$validationScriptPath = Join-Path $PSScriptRoot "RimWorldAiTranslator.Validation.ps1"
+if (-not (Test-Path -LiteralPath $validationScriptPath -PathType Leaf)) { throw "Translation validation component was not found: $validationScriptPath" }
+. $validationScriptPath
 try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -23,7 +26,14 @@ try {
 }
 
 $script:DisplayLocalizationFieldPattern = '^(label|labelshort|description|jobstring|reportstring|deathmessage|deathmessagefemale|deathmessagemale|letterlabel|lettertext|header|headertip|summary|formatstring|formatstringunfinalized|fixedname|reason|text|slateref)$'
-$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
+$script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|nodeclass|debuglabel|tagdef|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
+$script:DeniedLocalizationFields = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+$defFieldRulePath = Join-Path $PSScriptRoot "rimworld-def-field-rules.txt"
+if (Test-Path -LiteralPath $defFieldRulePath -PathType Leaf) {
+    foreach ($line in [System.IO.File]::ReadAllLines($defFieldRulePath, [System.Text.Encoding]::UTF8)) {
+        if ($line -match '^\s*deny\t([A-Za-z_][A-Za-z0-9_]*)\s*$') { [void]$script:DeniedLocalizationFields.Add($matches[1]) }
+    }
+}
 
 function Resolve-FullPath([string]$Path) {
     return [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path)
@@ -80,13 +90,31 @@ function Get-TextFingerprint([string]$Text) {
     }
 }
 
-function Get-ProtectedTokens([string]$Text) {
-    $tokens = New-Object "System.Collections.Generic.HashSet[string]"
-    $pattern = '(\{[^}]+\}|\[[A-Za-z0-9_.:;''" -]+\]|<[^>]+>|\$[A-Za-z_][A-Za-z0-9_]*|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
-    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
-        [void]$tokens.Add($match.Value)
+function Get-ProtectedTokenCounts([string]$Text) {
+    return Get-RimWorldProtectedTokenCounts $Text
+}
+
+function Test-JsonWithBackupExists([string]$Path) {
+    return (Test-Path -LiteralPath $Path -PathType Leaf) -or (Test-Path -LiteralPath "$Path.bak" -PathType Leaf)
+}
+
+function Read-JsonWithBackup([string]$Path) {
+    $errors = New-Object "System.Collections.Generic.List[string]"
+    foreach ($candidate in @($Path, "$Path.bak")) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        try {
+            $raw = [System.IO.File]::ReadAllText($candidate, [System.Text.Encoding]::UTF8)
+            if ([string]::IsNullOrWhiteSpace($raw)) { throw "JSON file is empty." }
+            return $raw | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            [void]$errors.Add("$candidate : $($_.Exception.Message)")
+        }
     }
-    return @($tokens)
+    throw "Review decisions and backup could not be read. $([string]::Join(' | ', $errors))"
+}
+
+function Test-ProtectedTokenStructure([string]$Source, [string]$Translation) {
+    return Test-RimWorldProtectedTokenStructure -Source $Source -Translation $Translation
 }
 
 function Test-InternalLocalizationIdentifierRow([object]$Row) {
@@ -95,16 +123,17 @@ function Test-InternalLocalizationIdentifierRow([object]$Row) {
     $typeLower = if ($Row.PSObject.Properties["defClass"] -and $Row.defClass) { ([string]$Row.defClass).Trim().ToLowerInvariant() } else { "" }
     $fieldLower = if ($Row.PSObject.Properties["field"] -and $Row.field) { ([string]$Row.field).Trim().ToLowerInvariant() } else { ($keyLower -replace "^.*\.", "") }
     $isDisplayField = $fieldLower -match $script:DisplayLocalizationFieldPattern
+    if ($script:DeniedLocalizationFields.Contains($fieldLower)) { return $true }
     if ($fieldLower -match $script:TechnicalLocalizationFieldPattern) { return $true }
     if ($keyLower -match "\.alienrace\.generalsettings\.alienpartgenerator\.colorchannels\.") { return $true }
     if ($fieldLower -eq "name" -and $keyLower -match "\.alienrace\.") { return $true }
+    if ($fieldLower -eq "name" -and $keyLower -match "\.(colorchannels|bodyaddons|powermodes)\.") { return $true }
     if ($keyLower -match "\.(graphicpaths?|rendernodes?|rendertree)\." -and -not $isDisplayField) { return $true }
     return $typeLower -match "pawnrendertreedef" -and -not $isDisplayField
 }
 
 function Test-InvalidKoreanParticleNotation([string]$Text) {
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
-    return $Text -match '(은\(는\)|는\(은\)|이\(가\)|가\(이\)|을\(를\)|를\(을\)|과\(와\)|와\(과\)|으로\(로\)|로\(으로\)|(?:\[[^\]\r\n]+\]|\{[^}\r\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:으로|은|는|이|가|을|를|과|와|로)(?=$|[\s.,!?…:;，。！？、]))'
+    return @(Get-RimWorldInvalidKoreanParticleNotations $Text).Count -gt 0
 }
 
 function Test-ValidXmlElementName([string]$Name) {
@@ -123,14 +152,8 @@ function Test-TranslationStructureSafe([object]$Row, [string]$Translation) {
     if (Test-InternalLocalizationIdentifierRow $Row) { return $false }
     if ([string]::IsNullOrWhiteSpace($translationText)) { return $false }
     if (Test-InvalidKoreanParticleNotation $translationText) { return $false }
-    if ($translationText -match "(\r?\n\s*){8,}" -or $translationText -match "(\\u000a\s*){8,}") { return $false }
-    $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($translationText, "\r?\n").Count
-    if ($newlineCount -ge 20 -and $translationText.Length -lt 4000) { return $false }
-    foreach ($token in (Get-ProtectedTokens $source)) {
-        if (-not $translationText.Contains($token)) { return $false }
-    }
-    $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
-    if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($translationText, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) { return $false }
+    if (Test-RimWorldPathologicalTranslation $translationText) { return $false }
+    if (-not (Test-ProtectedTokenStructure -Source $source -Translation $translationText)) { return $false }
     return $true
 }
 
@@ -291,9 +314,81 @@ function Write-FileState([object]$State) {
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         New-Item -ItemType Directory -Force -Path $directory | Out-Null
     }
-    [System.IO.File]::WriteAllLines($State.Path, $lines, [System.Text.UTF8Encoding]::new($false))
+    $temporaryPath = Join-Path $directory (".{0}.{1}.tmp" -f [System.IO.Path]::GetFileName([string]$State.Path), [System.Guid]::NewGuid().ToString("N"))
+    try {
+        $text = [string]::Join([Environment]::NewLine, @($lines)) + [Environment]::NewLine
+        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($text)
+        $stream = [System.IO.FileStream]::new($temporaryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        } finally {
+            $stream.Dispose()
+        }
+        if (Test-Path -LiteralPath $State.Path -PathType Leaf) {
+            [System.IO.File]::Replace($temporaryPath, [string]$State.Path, "$($State.Path).bak", $true)
+        } else {
+            [System.IO.File]::Move($temporaryPath, [string]$State.Path)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
+function Copy-FileFlushed([string]$SourcePath, [string]$DestinationPath) {
+    $bytes = [System.IO.File]::ReadAllBytes($SourcePath)
+    $stream = [System.IO.FileStream]::new($DestinationPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function New-TransactionFileEntry([string]$Path) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $existed = Test-Path -LiteralPath $fullPath -PathType Leaf
+    $snapshotPath = ""
+    if ($existed) {
+        $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+        $snapshotPath = Join-Path $directory (".{0}.{1}.transaction.bak" -f [System.IO.Path]::GetFileName($fullPath), [System.Guid]::NewGuid().ToString("N"))
+        Copy-FileFlushed -SourcePath $fullPath -DestinationPath $snapshotPath
+    }
+    return [pscustomobject]@{ Path = $fullPath; Existed = $existed; SnapshotPath = $snapshotPath }
+}
+
+function Restore-TransactionFile([object]$Entry) {
+    $path = [string]$Entry.Path
+    if (-not [bool]$Entry.Existed) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        return
+    }
+
+    $directory = [System.IO.Path]::GetDirectoryName($path)
+    $restorePath = Join-Path $directory (".{0}.{1}.restore.tmp" -f [System.IO.Path]::GetFileName($path), [System.Guid]::NewGuid().ToString("N"))
+    $discardPath = Join-Path $directory (".{0}.{1}.failed.tmp" -f [System.IO.Path]::GetFileName($path), [System.Guid]::NewGuid().ToString("N"))
+    try {
+        Copy-FileFlushed -SourcePath ([string]$Entry.SnapshotPath) -DestinationPath $restorePath
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            [System.IO.File]::Replace($restorePath, $path, $discardPath, $true)
+        } else {
+            [System.IO.File]::Move($restorePath, $path)
+        }
+    } finally {
+        foreach ($temporaryPath in @($restorePath, $discardPath)) {
+            if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+Initialize-RmkXlsxSupport
 $rmkEntryFull = Resolve-FullPath $RmkEntryRoot
 $reviewFull = Resolve-FullPath $ReviewRoot
 Assert-SafePathSegment -Value $ReviewLanguageFolderName -Name "ReviewLanguageFolderName"
@@ -304,7 +399,7 @@ $auditRoot = Join-Path $reviewFull "_TranslationAudit"
 $decisionPath = Join-Path $reviewFull "review-decisions.json"
 
 if (-not (Test-Path -LiteralPath $auditRoot -PathType Container)) { throw "Review audit folder not found: $auditRoot" }
-if (-not (Test-Path -LiteralPath $decisionPath -PathType Leaf)) { throw "Review decisions not found: $decisionPath" }
+if (-not (Test-JsonWithBackupExists $decisionPath)) { throw "Review decisions not found: $decisionPath" }
 
 $comparisonFile = Get-ChildItem -LiteralPath $auditRoot -File -Filter "*-comparison.json" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
@@ -312,8 +407,8 @@ $comparisonFile = Get-ChildItem -LiteralPath $auditRoot -File -Filter "*-compari
 if (-not $comparisonFile) { throw "Comparison JSON not found in: $auditRoot" }
 
 $parsedRows = [System.IO.File]::ReadAllText($comparisonFile.FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-$rows = @($parsedRows)
-$decisionData = [System.IO.File]::ReadAllText($decisionPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+$rows = @($parsedRows | Where-Object { -not (Test-InternalLocalizationIdentifierRow $_) })
+$decisionData = Read-JsonWithBackup $decisionPath
 $rowByTargetKey = @{}
 $rowById = @{}
 $uniqueKeyRows = @{}
@@ -444,7 +539,6 @@ foreach ($item in @($decisionData.items)) {
     if ($historyIdentifier) { $exportedTranslationByIdentifier[$historyIdentifier] = $translation }
 }
 
-Initialize-RmkXlsxSupport
 $workbookFull = Get-RmkWorkbookOutputPath -RequestedPath $WorkbookPath -EntryRoot $rmkEntryFull
 $workbookExists = Test-Path -LiteralPath $workbookFull -PathType Leaf
 $workbookData = if ($workbookExists) { [RimWorldTranslatorRmkXlsxReader]::Read($workbookFull) } else { $null }
@@ -537,14 +631,41 @@ $historyRows = New-Object "System.Collections.Generic.List[RimWorldTranslatorRmk
 foreach ($identifier in $historyOrder) {
     if ($historyRowsByIdentifier.ContainsKey($identifier)) { [void]$historyRows.Add($historyRowsByIdentifier[$identifier]) }
 }
-if (-not $DryRun) {
-    [RimWorldTranslatorRmkXlsxWriter]::Write($workbookFull, $historyRows, $effectiveSourceLanguage)
-}
-
+$dirtyStates = @($fileStates.Values | Where-Object { $_.Dirty } | Sort-Object Path)
 $writtenFiles = 0
-foreach ($state in @($fileStates.Values | Where-Object { $_.Dirty } | Sort-Object Path)) {
-    Write-FileState $state
-    $writtenFiles++
+$writeJournal = New-Object "System.Collections.Generic.List[object]"
+try {
+    if (-not $DryRun) {
+        [void]$writeJournal.Add((New-TransactionFileEntry $workbookFull))
+        foreach ($state in $dirtyStates) {
+            [void]$writeJournal.Add((New-TransactionFileEntry ([string]$state.Path)))
+        }
+        [RimWorldTranslatorRmkXlsxWriter]::Write($workbookFull, $historyRows, $effectiveSourceLanguage)
+    }
+    foreach ($state in $dirtyStates) {
+        Write-FileState $state
+        $writtenFiles++
+    }
+} catch {
+    $exportError = $_.Exception
+    $rollbackErrors = New-Object "System.Collections.Generic.List[string]"
+    for ($index = $writeJournal.Count - 1; $index -ge 0; $index--) {
+        try {
+            Restore-TransactionFile $writeJournal[$index]
+        } catch {
+            [void]$rollbackErrors.Add("$($writeJournal[$index].Path): $($_.Exception.Message)")
+        }
+    }
+    if ($rollbackErrors.Count -gt 0) {
+        throw "RMK export failed and rollback was incomplete. Export error: $($exportError.Message) Rollback errors: $([string]::Join(' | ', $rollbackErrors))"
+    }
+    throw "RMK export failed; the workbook and XML files written by this run were rolled back. $($exportError.Message)"
+} finally {
+    foreach ($entry in $writeJournal) {
+        if ($entry.SnapshotPath -and (Test-Path -LiteralPath ([string]$entry.SnapshotPath) -PathType Leaf)) {
+            Remove-Item -LiteralPath ([string]$entry.SnapshotPath) -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Write-Host "RMK entry root: $rmkEntryFull"

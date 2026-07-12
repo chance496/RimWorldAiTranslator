@@ -4,16 +4,81 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
 
+[assembly: AssemblyTitle("RimWorld AI Translator Native")]
+[assembly: AssemblyProduct("RimWorld AI Translator")]
+[assembly: AssemblyCompany("chance496")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyInformationalVersion("1.0.0")]
+
 public static class RimWorldTranslatorNativeMethods
 {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct RimWorldTranslatorCaptureRect
+{
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+}
+
+public static class RimWorldTranslatorCaptureMethods
+{
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RimWorldTranslatorCaptureRect value, int valueSize);
+}
+
+public sealed class RimWorldTranslatorRowRuntimeCache
+{
+    public string Identity { get; set; }
+    public string RelativeTarget { get; set; }
+    public string SourceFingerprint { get; set; }
+    public object Decision { get; set; }
+    public object DefContext { get; set; }
+    public string SearchKey { get; set; }
+    public string SearchText { get; set; }
+    public string SearchDefClass { get; set; }
+    public string SearchNode { get; set; }
+    public string SearchAll { get; set; }
+    public string SourcePreview { get; set; }
+    public string DefaultPreview { get; set; }
+
+    public RimWorldTranslatorRowRuntimeCache()
+    {
+        Identity = String.Empty;
+        RelativeTarget = String.Empty;
+        SourceFingerprint = String.Empty;
+    }
+}
+
+public sealed class RimWorldTranslatorRowRuntimeCacheStore
+{
+    private ConditionalWeakTable<object, RimWorldTranslatorRowRuntimeCache> entries =
+        new ConditionalWeakTable<object, RimWorldTranslatorRowRuntimeCache>();
+
+    public RimWorldTranslatorRowRuntimeCache Get(object row)
+    {
+        if (row == null) throw new ArgumentNullException("row");
+        return entries.GetValue(row, delegate(object key) { return new RimWorldTranslatorRowRuntimeCache(); });
+    }
+
+    public void Reset()
+    {
+        entries = new ConditionalWeakTable<object, RimWorldTranslatorRowRuntimeCache>();
+    }
 }
 
 public sealed class RimWorldTranslatorRmkHistoryRow
@@ -48,12 +113,162 @@ public sealed class RimWorldTranslatorRawSourceEntry
     public string Field { get; set; }
 }
 
+public sealed class RimWorldTranslatorDefReadResult
+{
+    public List<RimWorldTranslatorRawSourceEntry> Entries { get; private set; }
+    public List<RimWorldTranslatorRawSourceEntry> Excluded { get; private set; }
+
+    public RimWorldTranslatorDefReadResult()
+    {
+        Entries = new List<RimWorldTranslatorRawSourceEntry>();
+        Excluded = new List<RimWorldTranslatorRawSourceEntry>();
+    }
+}
+
+public sealed class RimWorldTranslatorValidationIssues
+{
+    public string[] MissingTokens { get; set; }
+    public string[] UnexpectedTokens { get; set; }
+    public string[] TokenCountMismatches { get; set; }
+    public bool GrammarPrefixMoved { get; set; }
+}
+
+public static class RimWorldTranslatorValidation
+{
+    private static readonly Regex ProtectedTokenRegex = new Regex(
+        @"(\\r\\n|\\[nrt]|\{[^}\r\n]+\}|\[[A-Za-z0-9_.:;'"" -]+\]|</?[A-Za-z][^>\r\n]*>|\$[A-Za-z_][A-Za-z0-9_]*\$?|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex GrammarPrefixRegex = new Regex(
+        @"^\s*([A-Za-z][A-Za-z0-9_]*->)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex InvalidParticleRegex = new Regex(
+        "(\\uC740\\(\\uB294\\)|\\uB294\\(\\uC740\\)|\\uC774\\(\\uAC00\\)|\\uAC00\\(\\uC774\\)|\\uC744\\(\\uB97C\\)|\\uB97C\\(\\uC744\\)|\\uACFC\\(\\uC640\\)|\\uC640\\(\\uACFC\\)|\\uC73C\\uB85C\\(\\uB85C\\)|\\uB85C\\(\\uC73C\\uB85C\\))|(?:\\[[^\\]\\r\\n]+\\]|\\{[^}\\r\\n]+\\}|\\$[A-Za-z_][A-Za-z0-9_]*\\$?)(?:\\uC73C\\uB85C|\\uC740|\\uB294|\\uC774|\\uAC00|\\uC744|\\uB97C|\\uACFC|\\uC640|\\uB85C)(?=$|[\\s.,!?\\u2026:;\\uFF0C\\u3002\\uFF01\\uFF1F\\u3001])",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex PathologicalNewlinesRegex = new Regex(
+        @"(\r?\n\s*){8,}|(\\u000a\s*){8,}",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex NewlineRegex = new Regex(
+        @"\r?\n",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static Dictionary<string, int> GetProtectedTokenCounts(string text)
+    {
+        Dictionary<string, int> counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (Match match in ProtectedTokenRegex.Matches(text ?? String.Empty))
+        {
+            int count;
+            if (counts.TryGetValue(match.Value, out count)) counts[match.Value] = count + 1;
+            else counts[match.Value] = 1;
+        }
+        return counts;
+    }
+
+    public static RimWorldTranslatorValidationIssues GetTokenPreservationIssues(string source, string target)
+    {
+        Dictionary<string, int> sourceCounts = GetProtectedTokenCounts(source);
+        Dictionary<string, int> targetCounts = GetProtectedTokenCounts(target);
+        List<string> missing = new List<string>();
+        List<string> unexpected = new List<string>();
+        List<string> countMismatches = new List<string>();
+        foreach (KeyValuePair<string, int> pair in sourceCounts)
+        {
+            int targetCount;
+            if (!targetCounts.TryGetValue(pair.Key, out targetCount)) targetCount = 0;
+            if (targetCount < pair.Value) missing.Add(pair.Key);
+            if (targetCount != pair.Value) countMismatches.Add(pair.Key + " (" + pair.Value.ToString(CultureInfo.InvariantCulture) + "->" + targetCount.ToString(CultureInfo.InvariantCulture) + ")");
+        }
+        foreach (KeyValuePair<string, int> pair in targetCounts)
+        {
+            int sourceCount;
+            if (!sourceCounts.TryGetValue(pair.Key, out sourceCount)) sourceCount = 0;
+            if (pair.Value > sourceCount) unexpected.Add(pair.Key);
+        }
+        bool grammarPrefixMoved = false;
+        Match grammarPrefix = GrammarPrefixRegex.Match(source ?? String.Empty);
+        if (grammarPrefix.Success && !Regex.IsMatch(target ?? String.Empty, @"^\s*" + Regex.Escape(grammarPrefix.Groups[1].Value), RegexOptions.CultureInvariant))
+        {
+            grammarPrefixMoved = true;
+            if (!missing.Contains(grammarPrefix.Groups[1].Value)) missing.Add(grammarPrefix.Groups[1].Value);
+        }
+        return new RimWorldTranslatorValidationIssues {
+            MissingTokens = missing.ToArray(),
+            UnexpectedTokens = unexpected.ToArray(),
+            TokenCountMismatches = countMismatches.ToArray(),
+            GrammarPrefixMoved = grammarPrefixMoved
+        };
+    }
+
+    public static string[] GetInvalidKoreanParticleNotations(string text)
+    {
+        if (String.IsNullOrWhiteSpace(text)) return new string[0];
+        HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+        List<string> result = new List<string>();
+        foreach (Match match in InvalidParticleRegex.Matches(text))
+        {
+            if (seen.Add(match.Value)) result.Add(match.Value);
+        }
+        return result.ToArray();
+    }
+
+    public static bool IsPathologicalTranslation(string text)
+    {
+        if (String.IsNullOrEmpty(text)) return false;
+        if (PathologicalNewlinesRegex.IsMatch(text)) return true;
+        return NewlineRegex.Matches(text).Count >= 20 && text.Length < 4000;
+    }
+}
+
 public static class RimWorldTranslatorRmkXlsxReader
 {
     private const long XmlFileLimit = 134217728;
     private const long WorkbookXmlLimit = 16777216;
     private const long SharedStringsLimit = 268435456;
     private const long WorksheetLimit = 536870912;
+    private static readonly object DefFieldRulesLock = new object();
+    private static HashSet<string> TranslatableDefFields = new HashSet<string>(new string[] {
+        "label", "labelshort", "description", "jobstring", "reportstring",
+        "deathmessage", "deathmessagefemale", "deathmessagemale",
+        "pawnsplural", "leadertitle", "arrivedletter", "customlabel",
+        "gizmolabel", "gizmodescription", "commandlabel", "commanddescription",
+        "letterlabel", "lettertext", "header", "headertip", "summary",
+        "formatstring", "formatstringunfinalized", "fixedname", "reason"
+    }, StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> ExcludedDefSegments = new HashSet<string>(new string[] {
+        "defname", "parentname", "classname", "class", "thingclass", "workerclass",
+        "compclass", "hediffclass", "thoughtclass", "abilityclass", "worldobjectclass",
+        "nodeclass", "texpath", "texname", "graphicpath", "shader", "sound", "sounddef",
+        "iconpath", "packageid", "xpath", "operation", "colorchannel", "rendernode",
+        "rendertree", "rendertreedef", "bodypart", "bodypartdef", "bodytype", "headtype",
+        "racedef", "thingdef", "pawnkinddef", "jobdef", "statdef", "skilldef", "hediffdef",
+        "genedef", "tagdef", "debuglabel"
+    }, StringComparer.OrdinalIgnoreCase);
+
+    public static void LoadDefFieldRules(string path)
+    {
+        if (String.IsNullOrWhiteSpace(path) || !File.Exists(path)) return;
+        FileInfo info = new FileInfo(path);
+        if (info.Length > 1048576) throw new InvalidDataException("Def field rule file is too large: " + path);
+
+        HashSet<string> allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> denied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string rawLine in File.ReadAllLines(path, Encoding.UTF8))
+        {
+            string line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
+            string[] columns = line.Split(new char[] { '\t' }, 2);
+            if (columns.Length != 2) continue;
+            string field = columns[1].Trim();
+            if (!Regex.IsMatch(field, "^[A-Za-z_][A-Za-z0-9_]*$")) continue;
+            if (columns[0].Equals("allow", StringComparison.OrdinalIgnoreCase)) allowed.Add(field);
+            else if (columns[0].Equals("deny", StringComparison.OrdinalIgnoreCase)) denied.Add(field);
+        }
+        if (allowed.Count == 0) throw new InvalidDataException("Def field rule file did not contain any allow rules: " + path);
+        lock (DefFieldRulesLock)
+        {
+            TranslatableDefFields = allowed;
+            foreach (string field in denied) ExcludedDefSegments.Add(field);
+        }
+    }
 
     private static XmlReaderSettings CreateReaderSettings(long maximumLength)
     {
@@ -115,34 +330,53 @@ public static class RimWorldTranslatorRmkXlsxReader
         return String.Empty;
     }
 
-    private static string ListItemSegment(XElement node, int index)
+    private static string NormalizeTranslationHandle(string value, bool useSimpleTypeName)
     {
-        string[] names = new string[] { "id", "defName", "key", "name" };
-        foreach (string name in names)
+        if (String.IsNullOrWhiteSpace(value)) return String.Empty;
+        string handle = value.Trim();
+        if (useSimpleTypeName)
         {
-            string value = DirectChildText(node, name);
-            if (ValidKeySegment(value)) return value.Trim();
+            int separator = Math.Max(handle.LastIndexOf('.'), handle.LastIndexOf('+'));
+            if (separator >= 0 && separator + 1 < handle.Length) handle = handle.Substring(separator + 1);
         }
-        return index.ToString(CultureInfo.InvariantCulture);
+        handle = Regex.Replace(handle, "\\{.*?\\}", String.Empty);
+        handle = handle.Replace(' ', '_').Replace('\n', '_').Replace("\r", String.Empty).Replace('\t', '_');
+        handle = handle.Replace(".", String.Empty).Replace("-", String.Empty);
+        handle = Regex.Replace(handle, "[^A-Za-z0-9_-]", String.Empty);
+        handle = Regex.Replace(handle, "_+", "_").Trim('_');
+        if (handle.Length > 0 && handle.All(Char.IsDigit)) handle = "_" + handle;
+        return handle;
+    }
+
+    private static string ListItemHandle(XElement node, string parentPath)
+    {
+        string parent = (parentPath ?? String.Empty).ToLowerInvariant();
+        string field = String.Empty;
+        bool typeValue = false;
+        if (parent == "comps")
+        {
+            field = DirectChildText(node, "compClass");
+            typeValue = true;
+        }
+        else if (parent == "verbs")
+        {
+            field = DirectChildText(node, "verbClass");
+            typeValue = true;
+        }
+        else if (parent == "hediffgivers") field = DirectChildText(node, "hediff");
+        else if (parent == "scenparts" || parent == "parts") field = DirectChildText(node, "def");
+        else if (parent == "stages" || parent == "lifestages" || parent == "tools")
+        {
+            field = DirectChildText(node, "label");
+            if (field.Length == 0) field = DirectChildText(node, "customLabel");
+        }
+        return NormalizeTranslationHandle(field, typeValue);
     }
 
     private static bool ExcludedDefPath(IList<string> path)
     {
-        string full = String.Join(".", path.ToArray()).ToLowerInvariant();
-        string[] excluded = new string[] {
-            "defname", "parentname", "classname", "thingclass", "workerclass",
-            "compclass", "hediffclass", "thoughtclass", "abilityclass",
-            "texpath", "texname", "graphicpath", "shader", "sound", "iconpath",
-            "modextension", "li.class", "packageid", "xpath", "operation"
-        };
-        foreach (string item in excluded)
-        {
-            if (full == item ||
-                full.StartsWith(item + ".", StringComparison.Ordinal) ||
-                full.EndsWith("." + item, StringComparison.Ordinal) ||
-                full.IndexOf("." + item + ".", StringComparison.Ordinal) >= 0)
-                return true;
-        }
+        foreach (string segment in path)
+            if (ExcludedDefSegments.Contains(segment)) return true;
         return false;
     }
 
@@ -151,18 +385,25 @@ public static class RimWorldTranslatorRmkXlsxReader
         if (path.Count == 0) return false;
         string leaf = path[path.Count - 1].ToLowerInvariant();
         string full = String.Join(".", path.ToArray()).ToLowerInvariant();
-        string[] exact = new string[] {
-            "label", "labelshort", "description", "jobstring", "reportstring",
-            "deathmessage", "deathmessagefemale", "deathmessagemale",
-            "pawnsplural", "leadertitle", "arrivedletter", "customlabel",
-            "gizmolabel", "gizmodescription", "commandlabel", "commanddescription",
-            "letterlabel", "lettertext", "header", "headertip", "summary",
-            "formatstring", "formatstringunfinalized", "fixedname", "reason"
-        };
-        if (Array.IndexOf(exact, leaf) >= 0) return true;
+        if (TranslatableDefFields.Contains(leaf)) return true;
         if (leaf == "text" && Regex.IsMatch(full, "(letter|message|scenario|quest|dialog|help|tip|inspect)")) return true;
         if (leaf == "slateref" && Regex.IsMatch(full, "(letter|text|label|description|inspect|string)")) return true;
         if (leaf == "li" && Regex.IsMatch(full, "(rulesstrings|tagsstrings)")) return true;
+        return false;
+    }
+
+    private static bool ContextuallyExcludedDefPath(IList<string> path, string typeName)
+    {
+        if (path.Count == 0) return false;
+        string leaf = path[path.Count - 1].ToLowerInvariant();
+        string full = String.Join(".", path.ToArray()).ToLowerInvariant();
+        if (!String.IsNullOrWhiteSpace(typeName) && typeName.IndexOf("PawnRenderTreeDef", StringComparison.OrdinalIgnoreCase) >= 0)
+            return true;
+        if (leaf == "name" && (full.IndexOf("alienrace.", StringComparison.Ordinal) >= 0 ||
+            Regex.IsMatch(full, "(^|\\.)(colorchannels|bodyaddons|powermodes)(\\.|$)")))
+            return true;
+        if (Regex.IsMatch(full, "(^|\\.)(graphicpaths?|rendernodes?|rendertree)(\\.|$)"))
+            return true;
         return false;
     }
 
@@ -171,37 +412,65 @@ public static class RimWorldTranslatorRmkXlsxReader
         List<string> path,
         string defName,
         string typeName,
-        List<RimWorldTranslatorRawSourceEntry> entries)
+        List<RimWorldTranslatorRawSourceEntry> entries,
+        List<RimWorldTranslatorRawSourceEntry> excluded)
     {
         List<XElement> children = node.Elements().ToList();
         if (children.Count == 0)
         {
-            if (ExcludedDefPath(path) || !TranslatableDefPath(path)) return;
-            entries.Add(new RimWorldTranslatorRawSourceEntry {
+            RimWorldTranslatorRawSourceEntry entry = new RimWorldTranslatorRawSourceEntry {
                 Key = defName + "." + String.Join(".", path.ToArray()),
                 Text = node.Value,
                 TypeName = typeName,
                 Field = path[path.Count - 1]
-            });
+            };
+            if (ExcludedDefPath(path))
+            {
+                excluded.Add(entry);
+                return;
+            }
+            if (TranslatableDefPath(path))
+            {
+                entries.Add(entry);
+                return;
+            }
+            if (ContextuallyExcludedDefPath(path, typeName)) excluded.Add(entry);
             return;
         }
 
-        Dictionary<string, int> listIndexes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        string parentPath = path.Count > 0 ? path[path.Count - 1] : "li";
+        Dictionary<string, int> handleTotals = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (XElement child in children.Where(c => c.Name.LocalName == "li"))
+        {
+            string handle = ListItemHandle(child, parentPath);
+            if (handle.Length == 0) continue;
+            if (!handleTotals.ContainsKey(handle)) handleTotals[handle] = 0;
+            handleTotals[handle]++;
+        }
+        Dictionary<string, int> handleIndexes = new Dictionary<string, int>(StringComparer.Ordinal);
+        int listIndex = 0;
         foreach (XElement child in children)
         {
             string name = child.Name.LocalName;
             string segment = name;
             if (name == "li")
             {
-                string parent = path.Count > 0 ? path[path.Count - 1] : "li";
-                int index;
-                if (!listIndexes.TryGetValue(parent, out index)) index = 0;
-                segment = ListItemSegment(child, index);
-                listIndexes[parent] = index + 1;
+                string handle = ListItemHandle(child, parentPath);
+                if (handle.Length == 0)
+                    segment = listIndex.ToString(CultureInfo.InvariantCulture);
+                else if (handleTotals[handle] > 1)
+                {
+                    int handleIndex;
+                    if (!handleIndexes.TryGetValue(handle, out handleIndex)) handleIndex = 0;
+                    segment = handle + "-" + handleIndex.ToString(CultureInfo.InvariantCulture);
+                    handleIndexes[handle] = handleIndex + 1;
+                }
+                else segment = handle;
+                listIndex++;
             }
             List<string> childPath = new List<string>(path);
             childPath.Add(segment);
-            AddDefLeaves(child, childPath, defName, typeName, entries);
+            AddDefLeaves(child, childPath, defName, typeName, entries, excluded);
         }
     }
 
@@ -225,12 +494,12 @@ public static class RimWorldTranslatorRmkXlsxReader
         return entries;
     }
 
-    public static List<RimWorldTranslatorRawSourceEntry> ReadDefs(string path)
+    public static RimWorldTranslatorDefReadResult ReadDefsDetailed(string path)
     {
-        List<RimWorldTranslatorRawSourceEntry> entries = new List<RimWorldTranslatorRawSourceEntry>();
+        RimWorldTranslatorDefReadResult result = new RimWorldTranslatorDefReadResult();
         XDocument document = LoadXmlFile(path, XmlFileLimit);
         XElement root = document.Root;
-        if (root == null || root.Name.LocalName != "Defs") return entries;
+        if (root == null || root.Name.LocalName != "Defs") return result;
         foreach (XElement def in root.Elements())
         {
             string defName = DirectChildText(def, "defName");
@@ -241,10 +510,15 @@ public static class RimWorldTranslatorRmkXlsxReader
                 if (child.Name.LocalName == "defName") continue;
                 List<string> pathSegments = new List<string>();
                 pathSegments.Add(child.Name.LocalName);
-                AddDefLeaves(child, pathSegments, defName.Trim(), typeName, entries);
+                AddDefLeaves(child, pathSegments, defName.Trim(), typeName, result.Entries, result.Excluded);
             }
         }
-        return entries;
+        return result;
+    }
+
+    public static List<RimWorldTranslatorRawSourceEntry> ReadDefs(string path)
+    {
+        return ReadDefsDetailed(path).Entries;
     }
 
     private static int ColumnIndex(string reference)
@@ -900,7 +1174,7 @@ public static class RimWorldTranslatorRmkXlsxWriter
             ? new List<RimWorldTranslatorRmkHistoryRow>()
             : sourceRows.Where(delegate(RimWorldTranslatorRmkHistoryRow row) { return row != null && !String.IsNullOrWhiteSpace(row.Identifier); }).ToList();
         string temporaryPath = fullPath + ".tmp-" + Guid.NewGuid().ToString("N");
-        string backupPath = temporaryPath + ".bak";
+        string backupPath = fullPath + ".bak";
         try
         {
             if (File.Exists(fullPath)) UpdateWorkbookArchive(fullPath, temporaryPath, rows, effectiveSourceLanguage);
@@ -908,7 +1182,6 @@ public static class RimWorldTranslatorRmkXlsxWriter
             if (File.Exists(fullPath))
             {
                 File.Replace(temporaryPath, fullPath, backupPath, true);
-                if (File.Exists(backupPath)) File.Delete(backupPath);
             }
             else
             {
@@ -918,7 +1191,6 @@ public static class RimWorldTranslatorRmkXlsxWriter
         finally
         {
             if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
-            if (File.Exists(backupPath)) File.Delete(backupPath);
         }
     }
 }

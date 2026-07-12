@@ -17,6 +17,14 @@ $projectLauncherExe = Join-Path $projectRoot "RimWorldAiTranslator.exe"
 $nativeSource = Join-Path $projectRoot "native\RimWorldTranslatorNative.cs"
 $nativeDll = Join-Path $launcherBuildRoot "RimWorldAiTranslator.Native.dll"
 $projectNativeDll = Join-Path $projectRoot "RimWorldAiTranslator.Native.dll"
+$versionPath = Join-Path $projectRoot "VERSION"
+$powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$regressionScript = Join-Path $projectRoot "tests\Run-RegressionTests.ps1"
+
+if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) { throw "VERSION file was not found: $versionPath" }
+$productVersion = [System.IO.File]::ReadAllText($versionPath, [System.Text.Encoding]::ASCII).Trim()
+if ($productVersion -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION must use major.minor.patch: $productVersion" }
+$fileVersion = "$productVersion.0"
 
 function Assert-SafeBuildPath([string]$Path) {
     $projectFull = [System.IO.Path]::GetFullPath($projectRoot).TrimEnd("\", "/")
@@ -36,6 +44,19 @@ function Assert-SafeBuildPath([string]$Path) {
 Assert-SafeBuildPath $distRoot
 Assert-SafeBuildPath $packageRoot
 Assert-SafeBuildPath $launcherBuildRoot
+
+if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+    throw "Windows PowerShell was not found: $powerShellExe"
+}
+if (-not (Test-Path -LiteralPath $regressionScript -PathType Leaf)) {
+    throw "Regression test runner was not found: $regressionScript"
+}
+
+Write-Host "Running offline regression gates..."
+& $powerShellExe -NoProfile -ExecutionPolicy Bypass -File $regressionScript -Suite All
+if ($LASTEXITCODE -ne 0) {
+    throw "Offline regression gates failed with exit code $LASTEXITCODE. Existing package output was not replaced."
+}
 
 if (Test-Path -LiteralPath $launcherBuildRoot) {
     Get-ChildItem -LiteralPath $launcherBuildRoot -Force | Remove-Item -Recurse -Force
@@ -86,6 +107,45 @@ if ($LASTEXITCODE -ne 0) {
     throw "Native reader build failed with exit code $LASTEXITCODE."
 }
 
+foreach ($binary in @($launcherExe, $nativeDll)) {
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
+    if ([string]$versionInfo.FileVersion -ne $fileVersion -or [string]$versionInfo.ProductVersion -ne $productVersion) {
+        throw "Built binary version mismatch: $binary (file=$($versionInfo.FileVersion), product=$($versionInfo.ProductVersion), expected=$fileVersion/$productVersion)"
+    }
+}
+
+$cacheSmokeJob = Start-Job -ArgumentList $nativeDll -ScriptBlock {
+    param([string]$AssemblyPath)
+    $ErrorActionPreference = "Stop"
+    Add-Type -LiteralPath $AssemblyPath -ErrorAction Stop
+    $cacheStore = [RimWorldTranslatorRowRuntimeCacheStore]::new()
+    $cacheRow = [pscustomobject]@{ id = "cache-smoke" }
+    $firstCache = $cacheStore.Get($cacheRow)
+    $secondCache = $cacheStore.Get($cacheRow)
+    if (-not [object]::ReferenceEquals($firstCache, $secondCache)) {
+        throw "Native row cache did not return a stable entry."
+    }
+    if ($cacheRow.PSObject.Properties["_runtimeCache"]) {
+        throw "Native row cache mutated the source row."
+    }
+    $cacheStore.Reset()
+    $resetCache = $cacheStore.Get($cacheRow)
+    if ([object]::ReferenceEquals($firstCache, $resetCache)) {
+        throw "Native row cache reset did not discard the previous entry."
+    }
+}
+try {
+    $cacheSmokeJob | Wait-Job | Out-Null
+    if ($cacheSmokeJob.State -ne "Completed") {
+        $reason = $cacheSmokeJob.ChildJobs[0].JobStateInfo.Reason
+        throw "Native row cache smoke failed: $reason"
+    }
+    $cacheSmokeJob | Receive-Job -ErrorAction Stop | Out-Null
+} finally {
+    if ($cacheSmokeJob.State -eq "Running") { $cacheSmokeJob | Stop-Job | Out-Null }
+    $cacheSmokeJob | Remove-Job -Force -ErrorAction SilentlyContinue
+}
+
 try {
     Copy-Item -LiteralPath $launcherExe -Destination $projectLauncherExe -Force -ErrorAction Stop
 } catch {
@@ -109,15 +169,28 @@ $packageFiles = @(
     "Start-RimWorldAiTranslatorGui.ps1",
     "Start-RimWorldAiTranslatorGui.cmd",
     "Start-RimWorldAiReviewGui.ps1",
+    "RimWorldAiTranslator.Storage.ps1",
+    "RimWorldAiTranslator.Validation.ps1",
+    "RimWorldAiTranslator.ProviderValidation.ps1",
+    "RimWorldAiTranslator.TranslationMemory.ps1",
+    "RimWorldAiTranslator.Diagnostics.ps1",
+    "RimWorldAiTranslator.ProjectCleanup.ps1",
+    "RimWorldAiTranslator.UiSystem.ps1",
+    "RimWorldAiTranslator.UiAudit.ps1",
+    "RimWorldAiTranslator.Quality.ps1",
     "Invoke-RimWorldAiTranslation.ps1",
     "Run-RimWorldAiTranslation.ps1",
     "Apply-RimWorldAiReviewResults.ps1",
     "Export-RimWorldAiReviewToRmk.ps1",
+    "Export-RimWorldAiTranslatorDiagnostics.ps1",
     "Build-RimWorldGlossary.ps1",
     "glossary.generated.ko.json",
     "sample-glossary.txt",
+    "rimworld-def-field-rules.txt",
     "README.md",
     "PACKAGE_README.txt",
+    "RELEASE_NOTES.md",
+    "VERSION",
     "LICENSE"
 )
 
@@ -135,10 +208,74 @@ foreach ($file in $packageFiles) {
     Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $file) -Force
 }
 
+Write-Host "Validating packaged PowerShell syntax..."
+foreach ($scriptFile in Get-ChildItem -LiteralPath $packageRoot -File -Filter "*.ps1" | Sort-Object Name) {
+    $tokens = $null
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($scriptFile.FullName, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) {
+        $detail = [string]::Join(" | ", @($parseErrors | ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Message)" }))
+        throw "Packaged PowerShell syntax validation failed for $($scriptFile.Name): $detail"
+    }
+}
+
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
-Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -Force
+$archiveCreated = $false
+for ($attempt = 1; $attempt -le 4; $attempt++) {
+    try {
+        Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -Force -ErrorAction Stop
+        $archiveCreated = $true
+        break
+    } catch {
+        if ($attempt -ge 4) { throw }
+        if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds (300 * $attempt)
+    }
+}
+if (-not $archiveCreated) { throw "Package archive was not created." }
+
+$smokeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("RimWorldAiTranslator-package-smoke-" + [System.Guid]::NewGuid().ToString("N"))
+$smokePrefix = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
+$smokeFull = [System.IO.Path]::GetFullPath($smokeRoot)
+if (-not $smokeFull.StartsWith($smokePrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+    -not ([System.IO.Path]::GetFileName($smokeFull)).StartsWith("RimWorldAiTranslator-package-smoke-", [System.StringComparison]::Ordinal)) {
+    throw "Refusing to use an unverified package smoke-test path: $smokeFull"
+}
+try {
+    $extractedRoot = Join-Path $smokeFull "package"
+    $sampleRoot = Join-Path $smokeFull "SampleMod"
+    $reviewRoot = Join-Path $smokeFull "reviews"
+    [System.IO.Directory]::CreateDirectory($smokeFull) | Out-Null
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractedRoot -Force
+    Copy-Item -LiteralPath (Join-Path $projectRoot "testdata\SampleMod") -Destination $sampleRoot -Recurse
+    $packagedTranslator = Join-Path $extractedRoot "Invoke-RimWorldAiTranslation.ps1"
+    & $powerShellExe -NoProfile -ExecutionPolicy Bypass -File $packagedTranslator `
+        -ModRoot $sampleRoot `
+        -SourceLanguageFolder "English" `
+        -SourceOnly `
+        -ReviewOnly `
+        -ReviewRoot $reviewRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "Extracted package smoke test failed with exit code $LASTEXITCODE."
+    }
+    $comparisonFiles = @(Get-ChildItem -LiteralPath $reviewRoot -Recurse -File -Filter "*-comparison.json" -ErrorAction Stop)
+    if ($comparisonFiles.Count -ne 1) {
+        throw "Extracted package smoke test expected one comparison JSON, found $($comparisonFiles.Count)."
+    }
+    $parsedSmokeRows = [System.IO.File]::ReadAllText($comparisonFiles[0].FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    $smokeRows = @(foreach ($row in $parsedSmokeRows) { $row })
+    if ($smokeRows.Count -ne 7) {
+        throw "Extracted package smoke test expected 7 source rows, found $($smokeRows.Count)."
+    }
+} finally {
+    if (Test-Path -LiteralPath $smokeFull) {
+        Remove-Item -LiteralPath $smokeFull -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Get-ChildItem -LiteralPath $launcherBuildRoot -Force | Remove-Item -Recurse -Force
 Remove-Item -LiteralPath $launcherBuildRoot -Force

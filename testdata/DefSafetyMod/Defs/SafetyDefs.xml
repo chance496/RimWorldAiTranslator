@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Defs>
+  <PawnRenderTreeDef>
+    <defName>Codex_RenderTree</defName>
+    <label>fixture render tree</label>
+    <renderTree>Body Render Tree Internal</renderTree>
+    <name>Wing Anchor Internal</name>
+    <nodes>
+      <li>
+        <label>visible wing node</label>
+        <tagDef>Wing Anchor Runtime Tag</tagDef>
+        <texPath>Things/Pawn/Humanlike/Bodies/Naked</texPath>
+      </li>
+    </nodes>
+  </PawnRenderTreeDef>
+  <AlienRace.ThingDef_AlienRace>
+    <defName>Codex_AlienRace</defName>
+    <label>fixture alien race</label>
+    <alienRace>
+      <generalSettings>
+        <alienPartGenerator>
+          <colorChannels>
+            <li>
+              <name>skin primary runtime channel</name>
+            </li>
+          </colorChannels>
+          <bodyAddons>
+            <li>
+              <name>wing runtime anchor</name>
+              <label>visible wing addon</label>
+              <path>Things/Pawn/BodyAddons/Wing</path>
+            </li>
+          </bodyAddons>
+        </alienPartGenerator>
+      </generalSettings>
+    </alienRace>
+  </AlienRace.ThingDef_AlienRace>
+</Defs>
