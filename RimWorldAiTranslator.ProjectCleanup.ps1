@@ -50,6 +50,7 @@ function Get-RimWorldAppOwnedReviewDirectory([string]$Path, [string[]]$ReviewRoo
 function Get-RimWorldProjectCleanupPlan([object]$Project, [string[]]$ReviewRoots) {
     $safePaths = New-Object "System.Collections.Generic.List[string]"
     $unsafePaths = New-Object "System.Collections.Generic.List[string]"
+    $markerErrors = New-Object "System.Collections.Generic.List[string]"
     $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
     $recorded = New-Object "System.Collections.Generic.List[string]"
     if ($Project -and $Project.latestReviewRoot) { [void]$recorded.Add([string]$Project.latestReviewRoot) }
@@ -75,10 +76,11 @@ function Get-RimWorldProjectCleanupPlan([object]$Project, [string[]]$ReviewRoots
                 $safe = Get-RimWorldAppOwnedReviewDirectory -Path $directory.FullName -ReviewRoots $ReviewRoots -ModRoot $modRoot
                 if ($safe -and $seen.Add($safe)) { [void]$safePaths.Add($safe) }
             } catch {
+                [void]$markerErrors.Add("$($directory.FullName) : $($_.Exception.GetType().Name)")
             }
         }
     }
-    return [pscustomobject]@{ SafePaths = $safePaths.ToArray(); UnsafePaths = $unsafePaths.ToArray() }
+    return [pscustomobject]@{ SafePaths = $safePaths.ToArray(); UnsafePaths = $unsafePaths.ToArray(); MarkerErrors = $markerErrors.ToArray() }
 }
 
 function Remove-RimWorldAppOwnedReviewDirectories([object]$Project, [string[]]$ReviewRoots, [string[]]$Paths) {

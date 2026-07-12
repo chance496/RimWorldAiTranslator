@@ -1008,6 +1008,9 @@ function Remove-TranslationProject([object]$Project) {
 
     $name = if ($Project.name) { [string]$Project.name } else { "이름 없는 프로젝트" }
     $message = "'$name' 프로젝트를 삭제합니다.`r`n`r`n삭제 항목:`r`n- 프로젝트 등록 정보`r`n- 로컬 검수 작업 폴더 $(@($plan.SafePaths).Count)개`r`n`r`n보존 항목:`r`n- 원본 모드 폴더 전체`r`n- 모드의 Languages\Korean 번역`r`n`r`n계속할까요?"
+    if (@($plan.MarkerErrors).Count -gt 0) {
+        $message = $message.Replace("`r`n`r`n계속할까요?", "`r`n- 소유권 표식을 읽지 못한 검수 폴더 $(@($plan.MarkerErrors).Count)개`r`n`r`n계속할까요?")
+    }
     $answer = [System.Windows.Forms.MessageBox]::Show($message, "프로젝트 삭제", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
     if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 

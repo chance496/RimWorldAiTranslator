@@ -167,7 +167,7 @@ try {
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         [void]$process.Start()
         if (-not $process.WaitForExit(60000)) {
-            try { $process.Kill() } catch {}
+            try { $process.Kill() } catch { Write-Verbose "Timed-out UI process could not be killed: $($_.Exception.GetType().Name)" }
             throw "UI audit timed out: $($scenario.Name)"
         }
         $watch.Stop()

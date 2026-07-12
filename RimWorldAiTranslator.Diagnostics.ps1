@@ -199,7 +199,7 @@ function New-RimWorldDiagnosticBundle {
             $info = Get-Item -LiteralPath $path
             $hash = Get-FileHash -LiteralPath $path -Algorithm SHA256
             $fileVersion = ""
-            try { $fileVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path).FileVersion } catch {}
+            try { $fileVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path).FileVersion } catch { $fileVersion = "unavailable" }
             [void]$integrity.Add([pscustomobject]@{ name = $name; present = $true; bytes = [int64]$info.Length; sha256 = [string]$hash.Hash.ToLowerInvariant(); fileVersion = [string]$fileVersion })
         }
 

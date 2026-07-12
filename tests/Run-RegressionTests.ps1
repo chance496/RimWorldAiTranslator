@@ -283,6 +283,7 @@ function Stop-TestProcess([System.Diagnostics.Process]$Process) {
         if (-not $Process.HasExited) { $Process.Kill() }
         [void]$Process.WaitForExit(3000)
     } catch {
+        Write-Verbose "Loopback test process cleanup did not complete: $($_.Exception.GetType().Name)"
     } finally {
         $Process.Dispose()
     }
@@ -463,13 +464,15 @@ function Test-ProjectCleanupBoundary {
         $reviewRoot = Join-Path $workspaceRoot "app-reviews"
         $safeRun = Join-Path $reviewRoot "safe-run"
         $markedRun = Join-Path $reviewRoot "marked-run"
+        $brokenMarkerRun = Join-Path $reviewRoot "broken-marker-run"
         $outside = Join-Path $workspaceRoot "outside-user-data"
         $modRoot = Join-Path $workspaceRoot "WorkshopMod"
         $koreanFile = Join-Path $modRoot "Languages\Korean\Keyed\Keep.xml"
-        foreach ($directory in @($safeRun, $markedRun, $outside)) { [System.IO.Directory]::CreateDirectory($directory) | Out-Null }
+        foreach ($directory in @($safeRun, $markedRun, $brokenMarkerRun, $outside)) { [System.IO.Directory]::CreateDirectory($directory) | Out-Null }
         Write-Utf8Text $koreanFile '<LanguageData><Keep.Value>KEEP</Keep.Value></LanguageData>'
         Write-Utf8Text (Join-Path $safeRun "review-decisions.json") '{}'
         Write-Utf8Text (Join-Path $markedRun ".rimworld-ai-project.json") ([ordered]@{ version = 1; projectId = "project-1" } | ConvertTo-Json -Compress)
+        Write-Utf8Text (Join-Path $brokenMarkerRun ".rimworld-ai-project.json") "{broken-marker"
         Write-Utf8Text (Join-Path $outside "keep.txt") "KEEP_OUTSIDE"
         $project = [pscustomobject]@{
             id = "project-1"
@@ -488,11 +491,14 @@ function Test-ProjectCleanupBoundary {
         Assert-Contains @($plan.SafePaths) ([System.IO.Path]::GetFullPath($markedRun)) "Marker-owned review run was not in the cleanup plan."
         Assert-Contains @($plan.UnsafePaths) ([System.IO.Path]::GetFullPath($outside)) "Outside user data was not flagged as unsafe."
         Assert-Contains @($plan.UnsafePaths) ([System.IO.Path]::GetFullPath($modRoot)) "Source mod was not flagged as unsafe."
+        Assert-Equal 1 @($plan.MarkerErrors).Count "Unreadable ownership marker was silently ignored."
+        Assert-True ([string]$plan.MarkerErrors[0] -match [regex]::Escape([System.IO.Path]::GetFullPath($brokenMarkerRun))) "Unreadable ownership marker did not identify its preserved folder."
 
         $failures = @(Remove-RimWorldAppOwnedReviewDirectories -Project $project -ReviewRoots @($reviewRoot) -Paths @($plan.SafePaths))
         Assert-Equal 0 $failures.Count "App-owned review cleanup failed."
         Assert-True (-not (Test-Path -LiteralPath $safeRun)) "Recorded review run was not removed."
         Assert-True (-not (Test-Path -LiteralPath $markedRun)) "Marker-owned review run was not removed."
+        Assert-True (Test-Path -LiteralPath $brokenMarkerRun -PathType Container) "Cleanup removed a folder with an unreadable ownership marker."
         Assert-True (Test-Path -LiteralPath $outside -PathType Container) "Cleanup removed outside user data."
         Assert-True (Test-Path -LiteralPath $modRoot -PathType Container) "Cleanup removed the source mod."
         Assert-Equal "KEEP" ([string](Select-Xml -Path $koreanFile -XPath "/LanguageData/Keep.Value").Node.InnerText) "Cleanup changed the Korean translation folder."

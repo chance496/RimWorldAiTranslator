@@ -61,12 +61,12 @@ function Invoke-MeasuredProcess([string[]]$Arguments) {
             try {
                 $process.Refresh()
                 $peakBytes = [Math]::Max($peakBytes, [long]$process.WorkingSet64)
-            } catch {}
+            } catch { Write-Verbose "Working-set sample unavailable: $($_.Exception.GetType().Name)" }
         }
         try {
             $process.Refresh()
             $peakBytes = [Math]::Max($peakBytes, [long]$process.PeakWorkingSet64)
-        } catch {}
+        } catch { Write-Verbose "Peak working-set sample unavailable: $($_.Exception.GetType().Name)" }
         $standardOutput = $process.StandardOutput.ReadToEnd()
         $standardError = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
