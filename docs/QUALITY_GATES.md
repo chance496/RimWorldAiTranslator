@@ -10,7 +10,7 @@
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-RegressionTests.ps1 -Suite All
 ```
 
-테스트는 합성 fixture를 고유한 `%TEMP%` 폴더에 복제하며 실제 사용자 프로젝트와 외부 네트워크를 사용하지 않는다. API 회귀는 루프백 TCP 가짜 서버를 쓴다. 작업 중에는 `-Suite Harness`, `Syntax`, `StateStore`, `SecretHandling`, `ProviderValidation`, `TranslationMemory`, `Diagnostics`, `ProjectCleanup`, `DryRun`, `DefSafety`, `DuplicateIdentity`, `TokenSafety`, `ApiResilience`, `DirectOutput`, `LocalApply`, `LocalRollback`, `RmkExport`, `RmkHistory`처럼 가장 좁은 suite부터 실행한다.
+테스트는 합성 fixture를 고유한 `%TEMP%` 폴더에 복제하며 실제 사용자 프로젝트와 외부 네트워크를 사용하지 않는다. API 회귀는 루프백 TCP 가짜 서버를 쓴다. 작업 중에는 `-Suite Harness`, `Syntax`, `StateStore`, `SecretHandling`, `ProviderValidation`, `TranslationMemory`, `Diagnostics`, `UiTools`, `ProjectCleanup`, `DryRun`, `DefSafety`, `DuplicateIdentity`, `TokenSafety`, `ApiResilience`, `DirectOutput`, `LocalApply`, `LocalRollback`, `RmkExport`, `RmkHistory`처럼 가장 좁은 suite부터 실행한다.
 
 ### 실행
 
@@ -40,7 +40,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-package.ps1
 
 ### PowerShell 정적 구문 검사
 
-운영 지침에 요구되어 있고 이번 최종 점검에서 실제 실행해 소스·테스트 18개 스크립트 모두 통과한 명령:
+운영 지침에 요구되어 있고 이번 최종 점검에서 실제 실행해 소스·테스트 20개 스크립트 모두 통과한 명령:
 
 ```powershell
 $failed = $false
@@ -62,7 +62,7 @@ if ($failed) { exit 1 }
 
 ### UI·성능·접근성 감사
 
-5,000행 합성 검수 프로젝트를 고유한 `%TEMP%` 작업공간과 격리 앱 데이터에서 실행한다. 밝음·어두움·고대비, 최소/일반/대형 창, 글자 크기 10/12의 PNG·접근성 JSON과 성능 JSON을 남기며 실제 사용자 프로젝트나 네트워크를 사용하지 않는다.
+5,000행 합성 검수 프로젝트를 고유한 `%TEMP%` 작업공간과 격리 앱 데이터에서 실행한다. 시작 빈 상태·프로젝트·설정·검수·사전 점검·명령 팔레트·로딩·오류·취소·완료·품질·번역 메모리를 포함한 15개 상태, 밝음·어두움·고대비, 최소/일반/대형 창, 글자 크기 10/12의 PNG·접근성 JSON과 성능 JSON을 남기며 실제 사용자 프로젝트나 네트워크를 사용하지 않는다.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-UiPerformanceAudit.ps1 `
@@ -72,6 +72,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-UiPerformanc
 ```
 
 검색 결과와 `미번역`/`번역됨` 필터 개수, 비어 있지 않은 화면, 보이는 상호작용 컨트롤의 접근성 이름, 부모 영역 잘림을 함께 단언한다. 실제 DPI는 보고서의 `dpiX`/`dpiY`로 기록한다.
+
+한 상태만 재현할 때는 저장소가 제공하는 `-ScenarioName`을 사용한다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-UiPerformanceAudit.ps1 `
+  -Rows 5000 -Iterations 1 -ScenarioName quality-center-light `
+  -OutputRoot "$env:TEMP\RimWorldAiTranslator-quality-audit"
+```
 
 ### RMK XLSX 성능 benchmark
 
@@ -154,9 +162,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 
 ## 이번 점검 실행 결과
 
-- 오프라인 회귀: 19/19 PASS(독립 실행 41.618초, 최종 패키지 게이트 40.870초). 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했고 제공자 설정·번역 메모리·진단 privacy도 포함한다.
-- 패키지 빌드: PASS. native 검증 컴파일, 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS. 패키지 스크립트 14개의 소스 SHA-256 일치, 필수 EXE·DLL과 ZIP 23개 항목을 확인했다.
-- UI 감사: 5/5 PASS. 5,000행 검색 결과 295/5,000개 및 상태 필터 2,667/2,333개 일치, 동일 원문 메모리 화면 포함, 잘림 0건, 접근성 이름 누락 0건. 로드 1,088.478ms, 검색 중앙 1,164.046ms, 다음 36.549ms, 저장 582.474ms, 무변경 저장 0.155ms, working set 228.19MB다.
+- 오프라인 회귀: 20/20 PASS(최종 패키지 게이트 39.780초). 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했고 제공자 설정·번역 메모리·진단 privacy·UI/품질 순수 도구도 포함한다.
+- 패키지 빌드: PASS. native 검증 컴파일, 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS. 패키지 PowerShell 16개, 전체 25개 파일, 필수 EXE·DLL과 349,557바이트 ZIP을 확인하고 README 두 파일의 소스/패키지 SHA-256 일치를 확인했다.
+- UI 감사: 15/15 PASS. 5,000행 검색 결과 295/5,000개 및 상태 필터 2,667/2,333개 일치, 모든 작업 상태와 도구 화면 포함, 잘림 0건, 접근성 이름 누락 0건. 로드 965.0ms, 검색 중앙 1,024.1ms, 다음 36.0ms, 저장 442.8ms, 무변경 저장 0.16ms, working set 258.79MB다.
+- 품질 센터: 5,000행 첫 상태 화면 21,566.6→12,729.7ms, 내부 계산 5.6초. 희소 결정을 만들지 않고 필터는 캐시·가상 목록을 사용한다.
 - RMK benchmark: 5,000행 생성 7,089.816ms, 갱신 중앙 8,983.882ms/최악 9,429.046ms, 최대 working set 323.02MB.
-- 패키지 실행: 격리 앱 데이터로 패키지 스크립트와 EXE 설정 화면을 각각 1280×720에서 렌더링했다. EXE `ExitCode=0`, 보이는 상호작용 컨트롤 29개, 잘림·접근성 이름 누락 0건이다.
+- 패키지 실행: 격리 앱 데이터로 패키지 EXE 시작 화면을 900×600에서 렌더링했다. EXE `ExitCode=0`, 잘림·접근성 이름 누락 0건이다.
 - 네트워크, 실제 API, Workshop, RMK 구독본과 `%LOCALAPPDATA%\RimWorldAiTranslator` 쓰기: 실행하지 않음.

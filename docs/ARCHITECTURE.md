@@ -8,6 +8,7 @@ RimWorldAiTranslator.exe
      -> Start-RimWorldAiReviewGui.ps1
         -> 프로젝트/설정/검수 상태 (%LOCALAPPDATA%)
         -> Storage / Validation / ProviderValidation / TranslationMemory / Diagnostics 모듈
+        -> UiSystem / Quality 모듈
         -> Run-RimWorldAiTranslation.ps1
            -> Invoke-RimWorldAiTranslation.ps1
               -> Google 또는 OpenAI 호환 번역 API
@@ -23,6 +24,7 @@ RimWorldAiTranslator.exe
 - `Start-RimWorldAiTranslatorGui.cmd`와 `Start-RimWorldAiTranslatorGui.ps1`는 소스 실행 경로다.
 - `Start-RimWorldAiReviewGui.ps1`가 대시보드, 프로젝트, 모드 탐색, 제공자 설정, 검수 편집기, 저장, RMK와 자식 프로세스 제어를 모두 담당한다.
 - 저장·검증·프로젝트 정리·제공자 설정 점검·동일 원문 번역 메모리·진단 집계는 독립 PowerShell 모듈로 분리되어 GUI와 CLI에서 공유한다.
+- `RimWorldAiTranslator.UiSystem.ps1`는 테마 토큰, 번역 범위 추정, 단순 Diff와 실제 로그 단계 해석을 제공한다. `RimWorldAiTranslator.Quality.ps1`는 품질 문제 모델과 본문 없는 HTML 보고서를 제공한다.
 
 ## 데이터 흐름
 
@@ -33,6 +35,7 @@ RimWorldAiTranslator.exe
 5. UI는 `review-decisions.json`에 희소 결정, 상태, 출처, 시각, 원문 해시와 이전 원문을 저장한다.
 6. 적용 시 별도 스크립트가 검수 상태와 안전 조건을 다시 검사해 로컬 Korean 또는 RMK 작업 클론에 병합한다.
 7. 진단 번들은 원문·번역문·키·API 키·절대 경로·원시 로그를 전달하지 않고 설정/상태 개수와 오류 분류만 로컬 ZIP에 쓴다.
+8. 품질 센터는 현재 검수 행과 희소 결정을 읽어 문제를 계산하고 가상 목록으로 표시한다. 번역 사전 점검과 작업 오버레이는 원본 모드 쓰기 전의 검수 단계에만 연결된다.
 
 ## 저장 경계
 

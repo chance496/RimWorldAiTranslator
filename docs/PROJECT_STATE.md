@@ -6,7 +6,7 @@
 
 - 제품 Git 루트: `C:\Users\wjdck\Documents\Rimworld\tools\RimWorldAiTranslator`
 - 원격: `https://github.com/chance496/RimWorldAiTranslator.git`
-- 현재 작업 브랜치: `codex/autonomous/20260712-073630`. 기준 백업 `aff52cc`, P0 `2ef9488`, P1 `7e49808`, P2 `e63c404`, P3 제공자 `db01309`, 번역 메모리 `d2e0429`, 진단 `844955e`, 통합 리뷰 수정 `88b1a4b` 체크포인트를 보존한다.
+- 현재 작업 브랜치: `codex/autonomous/20260712-073630`. 기준 백업 `aff52cc`, P0 `2ef9488`, P1 `7e49808`, P2 성능 `e63c404`, P3 제공자 `db01309`, 번역 메모리 `d2e0429`, 진단 `844955e`, 통합 리뷰 `88b1a4b`, P2/P3 재개방 `2068b1f`, UI 도구 기반 `751b791`, 개척지 작업실 `c1008dd` 체크포인트를 보존한다.
 - 시작 당시 수정 파일: `Apply-RimWorldAiReviewResults.ps1`, `Export-RimWorldAiReviewToRmk.ps1`, `Invoke-RimWorldAiTranslation.ps1`, `PACKAGE_README.txt`, `README.md`, `Start-RimWorldAiReviewGui.ps1`, `build-package.ps1`, `native/RimWorldTranslatorNative.cs`
 - 시작 당시 새 파일: `rimworld-def-field-rules.txt`
 - 시작 당시 제품 변경 규모는 8개 추적 파일에서 +752/-199줄이었다. 사용자 선행 작업으로 취급해 기준 백업 `aff52cc`에 보존한 뒤 현재 게이트로 검증했다.
@@ -36,6 +36,9 @@
 | 로컬/RMK 적용 | 상태, 원문 해시, 토큰, 경로와 중복 키를 검사해 로컬 Korean XML 또는 RMK 작업 경로에 쓴다. 기존 XML/XLSX는 `.bak`을 남기고 다중 파일 실패 시 전체를 롤백한다. | `Apply-RimWorldAiReviewResults.ps1`, `Export-RimWorldAiReviewToRmk.ps1`, `native/RimWorldTranslatorNative.cs` |
 | 패키징 | Windows .NET Framework `csc.exe`로 실행기와 native DLL을 빌드하고 전체 오프라인 회귀, 패키지 Parser, ZIP 압축 해제 원문 추출 smoke를 통과한 파일만 `dist`에 묶는다. | `build-package.ps1`, `tests/Run-RegressionTests.ps1` |
 | UI 감사·성능 | 격리된 5,000행 합성 프로젝트에서 창 크기·테마·글자 크기·접근성·검색/필터 결과와 로드·검색·이동·저장·메모리를 재현 측정한다. RMK XML/XLSX 생성·갱신 benchmark도 별도로 제공한다. | `tests/Run-UiPerformanceAudit.ps1`, `tests/Run-RmkPerformanceBenchmark.ps1` |
+| 디자인·시작 흐름 | 중앙 테마 토큰을 밝음·어두움·고대비에 적용하고, 빈 상태·최근 프로젝트·제공자 준비 상태·네 단계 작업 흐름을 실제 프로젝트 데이터로 표시한다. | `RimWorldAiTranslator.UiSystem.ps1`, `Start-RimWorldAiReviewGui.ps1`의 `Apply-AppTheme`, `Refresh-DashboardProjects` |
+| 번역 사전 점검·작업 상태 | 번역 전 실제 제공자·모델·언어·대상·배치·토큰 추정을 확인하고, 실제 프로세스 로그 단계와 배치 수를 개척지 스캔 오버레이에 연결한다. 오류 재시도, 협조 취소, 완료분 복구와 검수 복귀를 제공한다. | `Select-AiTranslationMode`, `Show-OperationOverlay`, `Update-OperationOverlay`, `Complete-OperationOverlay` |
+| 검수 품질 도구 | 실제 행에서 미번역·원문 변경·안전·토큰/태그·길이·중복을 검사하고 가상 목록·필터·문제 이동을 제공한다. Diff, 범위 추정, 본문 없는 HTML 보고서, 명령 팔레트와 단축키가 현재 프로젝트 동작에 연결된다. | `RimWorldAiTranslator.Quality.ps1`, `RimWorldAiTranslator.UiSystem.ps1`, `Start-RimWorldAiReviewGui.ps1` |
 | 검증 성능 | PowerShell 검증 규칙을 기준 구현으로 유지하면서 native DLL이 있을 때 같은 토큰·조사·개행 판정을 컴파일된 정규식으로 실행한다. | `RimWorldAiTranslator.Validation.ps1`, `native/RimWorldTranslatorNative.cs` |
 | 제공자 설정 점검 | 키 값이나 네트워크 호출 없이 URL 보안, 모델/Temperature 입력, 키 개수와 내장 프로필 일치를 확인한다. 수동 모델은 유지하고 온라인 미확인을 표시한다. | `RimWorldAiTranslator.ProviderValidation.ps1`, `Settings.ProviderValidation` |
 | 로컬 번역 메모리 | 동일 원문의 안전한 기존 번역만 상태·출처·파일과 함께 용어 탭에 제안하며 현재 번역을 자동 변경하지 않는다. | `RimWorldAiTranslator.TranslationMemory.ps1`, `Review.TranslationMemory` |
@@ -43,24 +46,27 @@
 
 ## 미완성 또는 미검증
 
-- P0/P1 저장·적용·Def 안전·원문 변경·토큰·취소·재시도·재개 경로는 19개 오프라인 회귀와 패키지 smoke를 통과했다.
+- P0/P1 저장·적용·Def 안전·원문 변경·토큰·취소·재시도·재개 경로는 20개 오프라인 회귀와 패키지 smoke를 통과했다.
 - 실제 125/150/200% DPI는 Windows 디스플레이 배율 변경 없이 자동 재현할 수 없어 96 DPI 감사만 완료했다. 900×600/1280×720/1920×1080, 밝음/어두움/고대비와 글자 10/12에서는 잘림과 접근성 이름 누락이 0건이다.
 - 제공자 모델의 실제 온라인 가용성과 최신 제한은 API 호출 없이 검증하지 않는다. 내장 프로필 또는 사용자가 입력한 값을 표시하되 온라인 미확인 상태를 유지한다.
 - UI, 프로젝트 상태, RMK, 번역 프로세스 오케스트레이션이 큰 `Start-RimWorldAiReviewGui.ps1`에 남아 있다. 저장·검증·삭제 경계와 성능 runner는 독립 파일로 분리했으며, 무리한 전면 재작성은 하지 않는다.
+- 5,000행 품질 센터의 첫 전체 검사는 최종 합성 fixture에서 내부 계산 5.6초, 화면 프로세스 12.7초가 걸린다. 이후 필터는 캐시와 가상 목록을 사용한다. 더 큰 프로젝트에서의 비동기 분할 검사는 후속 성능 과제다.
 
 ## 알려진 오류와 위험
 
 | 우선도 | 문제 | 영향과 근거 |
 |---|---|---|
 | 해결됨 | 손상 프로젝트 저장소의 조용한 빈 목록 대체, 로컬/RMK 부분 적용, 복구 백업 부재와 자식 로그 API 키 노출 가능성은 P0 회귀로 차단했다. | `StateStore.Recovery`, `Security.ApiKeyHandling`, `Apply.LocalRollback`, `Export.RmkTransaction` |
-| 해결됨 | 자동 오프라인 회귀 부재, 직접 실행기 인코딩, 내부 식별자·중복 namespace, 토큰·원문 변경·RMK XLSX 보존, 취소·재시도·직접 출력 롤백을 P1 게이트로 고정했다. | `tests/Run-RegressionTests.ps1` 19개 사례 |
+| 해결됨 | 자동 오프라인 회귀 부재, 직접 실행기 인코딩, 내부 식별자·중복 namespace, 토큰·원문 변경·RMK XLSX 보존, 취소·재시도·직접 출력 롤백을 P1 게이트로 고정했다. | `tests/Run-RegressionTests.ps1` 20개 사례 |
+| 해결됨 | 첫 행동·작업 상태·오류 복구·비교·품질 탐색이 분산되던 P2/P3 UI를 공통 디자인 토큰, 사전 점검, 실제 상태 오버레이와 통합 도구로 재구성했다. | 15개 상태 UI 감사, `Ui.QualityTools`, `c1008dd` |
 | 명시적 차단 | 실제 125/150/200% DPI 자동 감사가 없다. | Windows 디스플레이 설정 변경은 현재 자율 작업의 시스템 변경 금지 범위다. runner는 실제 DPI를 기록해 다른 환경에서 같은 명령으로 보완할 수 있다. |
 | 잔여 부채 | 큰 WinForms 스크립트에 여러 책임이 남아 있다. | 저장·검증·정리·benchmark는 분리됐지만 추가 분리는 동작 보존 회귀를 동반한 작은 단계로만 진행해야 한다. |
 
 ## 이번 점검에서 확인한 결과
 
-- 전체 오프라인 회귀 19/19(독립 실행 41.618초, 최종 패키지 게이트 40.870초), 소스 PowerShell 18개 Parser, C# 빌드, 패키지 Parser와 ZIP 새 폴더 원문 추출 7행 smoke가 통과했다.
-- UI 5,000행 최종 기준: 로드 1,558.896→1,088.478ms, 검색 중앙 3,071.292→1,164.046ms, 다음 항목 50.234→36.549ms, 실제 저장 1,925.418→582.474ms, working set 259.48→228.19MB. 변경 없는 저장은 중앙 0.155ms다. 5개 화면에서 잘림·접근성 이름 누락은 0건이다.
+- 전체 오프라인 회귀 20/20(최종 패키지 게이트 39.780초), 소스 PowerShell 20개 Parser, C# 빌드, 패키지 Parser와 ZIP 새 폴더 원문 추출 7행 smoke가 통과했다.
+- UI 5,000행 P2/P3 재작업 전후: 로드 925.4→965.0ms, 검색 중앙 1,074.9→1,024.1ms, 다음 항목 34.9→36.0ms, 실제 저장 558.2→442.8ms, 변경 없는 저장 0.26→0.16ms, working set 254.12→258.79MB. 15개 화면에서 잘림·접근성 이름 누락은 0건이다.
+- 새 품질 센터는 동일 구현의 초기 5,000행 상태 화면 21,566.6ms에서 12,729.7ms로 줄였고 최종 내부 품질 계산은 5.6초다. 품질 계산은 희소 결정을 생성하지 않으며 목록은 가상화한다.
 - RMK 5,000행 최종 기준: 생성 13,144.655→7,089.816ms, 갱신 중앙 14,919.371→8,983.882ms(최악 9,429.046ms), 최대 working set 323.02MB다.
-- 패키지의 14개 PowerShell 파일은 소스와 SHA-256이 일치하고 필수 EXE·DLL을 포함한다. 격리 앱 데이터로 EXE 실행기를 시작해 설정 화면을 렌더링하고 `ExitCode=0`, 잘림·접근성 누락 0건을 확인했다.
+- 패키지의 PowerShell 16개와 전체 25개 파일, 필수 EXE·DLL 및 349,557바이트 ZIP을 확인했다. README와 패키지 사본의 SHA-256도 일치한다. 격리 앱 데이터로 EXE 시작 화면을 900×600에서 렌더링하고 `ExitCode=0`, 잘림·접근성 누락 0건을 확인했다.
 - 외부 네트워크와 실제 API, Workshop/RMK 구독본, `%LOCALAPPDATA%` 사용자 데이터는 사용하지 않았다. API 동작은 로컬 TCP 가짜 서버로 검증했다.
