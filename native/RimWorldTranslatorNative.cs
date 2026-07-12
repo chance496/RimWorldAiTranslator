@@ -60,6 +60,99 @@ public sealed class RimWorldTranslatorDefReadResult
     }
 }
 
+public sealed class RimWorldTranslatorValidationIssues
+{
+    public string[] MissingTokens { get; set; }
+    public string[] UnexpectedTokens { get; set; }
+    public string[] TokenCountMismatches { get; set; }
+    public bool GrammarPrefixMoved { get; set; }
+}
+
+public static class RimWorldTranslatorValidation
+{
+    private static readonly Regex ProtectedTokenRegex = new Regex(
+        @"(\\r\\n|\\[nrt]|\{[^}\r\n]+\}|\[[A-Za-z0-9_.:;'"" -]+\]|</?[A-Za-z][^>\r\n]*>|\$[A-Za-z_][A-Za-z0-9_]*\$?|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex GrammarPrefixRegex = new Regex(
+        @"^\s*([A-Za-z][A-Za-z0-9_]*->)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex InvalidParticleRegex = new Regex(
+        "(\\uC740\\(\\uB294\\)|\\uB294\\(\\uC740\\)|\\uC774\\(\\uAC00\\)|\\uAC00\\(\\uC774\\)|\\uC744\\(\\uB97C\\)|\\uB97C\\(\\uC744\\)|\\uACFC\\(\\uC640\\)|\\uC640\\(\\uACFC\\)|\\uC73C\\uB85C\\(\\uB85C\\)|\\uB85C\\(\\uC73C\\uB85C\\))|(?:\\[[^\\]\\r\\n]+\\]|\\{[^}\\r\\n]+\\}|\\$[A-Za-z_][A-Za-z0-9_]*\\$?)(?:\\uC73C\\uB85C|\\uC740|\\uB294|\\uC774|\\uAC00|\\uC744|\\uB97C|\\uACFC|\\uC640|\\uB85C)(?=$|[\\s.,!?\\u2026:;\\uFF0C\\u3002\\uFF01\\uFF1F\\u3001])",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex PathologicalNewlinesRegex = new Regex(
+        @"(\r?\n\s*){8,}|(\\u000a\s*){8,}",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex NewlineRegex = new Regex(
+        @"\r?\n",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static Dictionary<string, int> GetProtectedTokenCounts(string text)
+    {
+        Dictionary<string, int> counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (Match match in ProtectedTokenRegex.Matches(text ?? String.Empty))
+        {
+            int count;
+            if (counts.TryGetValue(match.Value, out count)) counts[match.Value] = count + 1;
+            else counts[match.Value] = 1;
+        }
+        return counts;
+    }
+
+    public static RimWorldTranslatorValidationIssues GetTokenPreservationIssues(string source, string target)
+    {
+        Dictionary<string, int> sourceCounts = GetProtectedTokenCounts(source);
+        Dictionary<string, int> targetCounts = GetProtectedTokenCounts(target);
+        List<string> missing = new List<string>();
+        List<string> unexpected = new List<string>();
+        List<string> countMismatches = new List<string>();
+        foreach (KeyValuePair<string, int> pair in sourceCounts)
+        {
+            int targetCount;
+            if (!targetCounts.TryGetValue(pair.Key, out targetCount)) targetCount = 0;
+            if (targetCount < pair.Value) missing.Add(pair.Key);
+            if (targetCount != pair.Value) countMismatches.Add(pair.Key + " (" + pair.Value.ToString(CultureInfo.InvariantCulture) + "->" + targetCount.ToString(CultureInfo.InvariantCulture) + ")");
+        }
+        foreach (KeyValuePair<string, int> pair in targetCounts)
+        {
+            int sourceCount;
+            if (!sourceCounts.TryGetValue(pair.Key, out sourceCount)) sourceCount = 0;
+            if (pair.Value > sourceCount) unexpected.Add(pair.Key);
+        }
+        bool grammarPrefixMoved = false;
+        Match grammarPrefix = GrammarPrefixRegex.Match(source ?? String.Empty);
+        if (grammarPrefix.Success && !Regex.IsMatch(target ?? String.Empty, @"^\s*" + Regex.Escape(grammarPrefix.Groups[1].Value), RegexOptions.CultureInvariant))
+        {
+            grammarPrefixMoved = true;
+            if (!missing.Contains(grammarPrefix.Groups[1].Value)) missing.Add(grammarPrefix.Groups[1].Value);
+        }
+        return new RimWorldTranslatorValidationIssues {
+            MissingTokens = missing.ToArray(),
+            UnexpectedTokens = unexpected.ToArray(),
+            TokenCountMismatches = countMismatches.ToArray(),
+            GrammarPrefixMoved = grammarPrefixMoved
+        };
+    }
+
+    public static string[] GetInvalidKoreanParticleNotations(string text)
+    {
+        if (String.IsNullOrWhiteSpace(text)) return new string[0];
+        HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+        List<string> result = new List<string>();
+        foreach (Match match in InvalidParticleRegex.Matches(text))
+        {
+            if (seen.Add(match.Value)) result.Add(match.Value);
+        }
+        return result.ToArray();
+    }
+
+    public static bool IsPathologicalTranslation(string text)
+    {
+        if (String.IsNullOrEmpty(text)) return false;
+        if (PathologicalNewlinesRegex.IsMatch(text)) return true;
+        return NewlineRegex.Matches(text).Count >= 20 && text.Length < 4000;
+    }
+}
+
 public static class RimWorldTranslatorRmkXlsxReader
 {
     private const long XmlFileLimit = 134217728;

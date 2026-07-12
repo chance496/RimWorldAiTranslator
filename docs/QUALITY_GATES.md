@@ -58,6 +58,30 @@ if ($failed) { exit 1 }
 
 동일 Parser 검사는 오프라인 회귀와 `build-package.ps1`의 패키지 복사 후 단계에 연결되어 있다.
 
+### UI·성능·접근성 감사
+
+5,000행 합성 검수 프로젝트를 고유한 `%TEMP%` 작업공간과 격리 앱 데이터에서 실행한다. 밝음·어두움·고대비, 최소/일반/대형 창, 글자 크기 10/12의 PNG·접근성 JSON과 성능 JSON을 남기며 실제 사용자 프로젝트나 네트워크를 사용하지 않는다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-UiPerformanceAudit.ps1 `
+  -Rows 5000 `
+  -Iterations 5 `
+  -OutputRoot "$env:TEMP\RimWorldAiTranslator-ui-audit"
+```
+
+검색 결과와 `미번역`/`번역됨` 필터 개수, 비어 있지 않은 화면, 보이는 상호작용 컨트롤의 접근성 이름, 부모 영역 잘림을 함께 단언한다. 실제 DPI는 보고서의 `dpiX`/`dpiY`로 기록한다.
+
+### RMK XLSX 성능 benchmark
+
+고유한 `%TEMP%` 안에서만 5,000행 RMK XML/XLSX를 생성하고 같은 workbook 갱신을 반복한다. 생성·갱신 시간, 최악값, 자식 프로세스 최대 working set과 workbook 크기를 JSON으로 기록하고 XLSX ZIP 구조를 검증한다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-RmkPerformanceBenchmark.ps1 `
+  -Rows 5000 `
+  -Iterations 3 `
+  -OutputPath "$env:TEMP\RimWorldAiTranslator-rmk-performance.json"
+```
+
 ### CLI 번역/원문 로드
 
 README에 기록된 네트워크 키가 필요 없는 검수 출력 명령:
@@ -103,9 +127,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 - Pester 또는 다른 단위/통합 테스트: 없음
 - 린터/formatter: 없음
 - CI workflow: 없음
-- benchmark runner: 없음
 - 패키지 ZIP 압축 해제 후 GUI smoke test: 없음. CLI 원문 추출 smoke는 빌드에 연결됨.
-- UI 스냅샷/DPI/접근성 자동 감사: 없음
+- 125/150/200% 실제 DPI 자동 감사: 없음. 현재 runner는 실행 환경의 실제 DPI를 기록하지만 Windows 디스플레이 배율을 바꾸지 않는다.
 
 `testdata/SampleMod`의 기대 원문 7개, 내부 식별자 제외 1개, 로컬/RMK 적용과 롤백 기대값이 회귀 runner에 정의되어 있다.
 
@@ -129,6 +152,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 
 ## 이번 점검 실행 결과
 
-- 오프라인 회귀: 16/16 PASS. 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했다.
-- 패키지 빌드: PASS. 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS.
+- 오프라인 회귀: 16/16 PASS(40.648초 최종 대상 실행, 패키지 게이트 51.992초). 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했다.
+- 패키지 빌드: PASS. native 검증 컴파일, 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS.
+- UI 감사: 4/4 PASS. 5,000행, 검색 결과 295/5,000개 및 상태 필터 2,667/2,333개 일치, 잘림 0건, 접근성 이름 누락 0건.
+- RMK benchmark: 5,000행 생성 7,289.464ms, 갱신 중앙 8,640.982ms/최악 9,039.086ms, 최대 working set 323.01MB.
 - 네트워크, 실제 API, Workshop, RMK 구독본과 `%LOCALAPPDATA%\RimWorldAiTranslator` 쓰기: 실행하지 않음.

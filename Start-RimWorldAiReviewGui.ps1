@@ -6,7 +6,12 @@
     [string]$InitialDashboardTab = "",
     [string]$PreviewTheme = "",
     [int]$PreviewTextSize = 0,
-    [switch]$PreviewHighContrast
+    [switch]$PreviewHighContrast,
+    [string]$AppDataRoot = "",
+    [switch]$DisableBackgroundDiscovery,
+    [string]$PerformanceReportPath = "",
+    [ValidateRange(1, 20)]
+    [int]$PerformanceIterations = 5
 )
 
 $systemPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -26,6 +31,10 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
     if ($PreviewTheme) { $relaunchArguments += @("-PreviewTheme", "`"$PreviewTheme`"") }
     if ($PreviewTextSize -gt 0) { $relaunchArguments += @("-PreviewTextSize", [string]$PreviewTextSize) }
     if ($PreviewHighContrast) { $relaunchArguments += "-PreviewHighContrast" }
+    if ($AppDataRoot) { $relaunchArguments += @("-AppDataRoot", "`"$AppDataRoot`"") }
+    if ($DisableBackgroundDiscovery) { $relaunchArguments += "-DisableBackgroundDiscovery" }
+    if ($PerformanceReportPath) { $relaunchArguments += @("-PerformanceReportPath", "`"$PerformanceReportPath`"") }
+    if ($PerformanceIterations -ne 5) { $relaunchArguments += @("-PerformanceIterations", [string]$PerformanceIterations) }
     Start-Process -FilePath $systemPowerShell -ArgumentList $relaunchArguments -WindowStyle Hidden
     return
 }
@@ -40,11 +49,6 @@ if (-not (Test-Path -LiteralPath $storageScriptPath -PathType Leaf)) {
     throw "State storage component was not found: $storageScriptPath"
 }
 . $storageScriptPath
-$validationScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.Validation.ps1"
-if (-not (Test-Path -LiteralPath $validationScriptPath -PathType Leaf)) {
-    throw "Translation validation component was not found: $validationScriptPath"
-}
-. $validationScriptPath
 $projectCleanupScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.ProjectCleanup.ps1"
 if (-not (Test-Path -LiteralPath $projectCleanupScriptPath -PathType Leaf)) {
     throw "Project cleanup component was not found: $projectCleanupScriptPath"
@@ -66,6 +70,11 @@ public static class RimWorldTranslatorNativeMethods
 }
 "@
 }
+$validationScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.Validation.ps1"
+if (-not (Test-Path -LiteralPath $validationScriptPath -PathType Leaf)) {
+    throw "Translation validation component was not found: $validationScriptPath"
+}
+. $validationScriptPath
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $script:powershellExe = $systemPowerShell
@@ -78,6 +87,9 @@ foreach ($systemExecutable in @($script:powershellExe, $script:explorerExe)) {
 $script:initialReviewRoot = $ReviewRoot
 $script:layoutSnapshotPath = $LayoutSnapshotPath
 $script:layoutSnapshotTimer = $null
+$script:performanceReportPath = $PerformanceReportPath
+$script:performanceIterations = $PerformanceIterations
+$script:lastReviewLoadMetrics = $null
 $script:startupCatalogTimer = $null
 $script:reviewRoot = ""
 $script:comparisonFile = ""
@@ -103,6 +115,7 @@ $script:startupSettingsError = ""
 $script:visibleRowIndexes = @()
 $script:visibleRowPositionMap = [int[]]@()
 $script:syncingItemSelection = $false
+$script:lastRenderedSelectionPosition = -1
 $script:currentRowIndex = -1
 $script:currentFile = "__ALL__"
 $script:loading = $false
@@ -128,7 +141,7 @@ if (Test-Path -LiteralPath $defFieldRulePath -PathType Leaf) {
         if ($line -match '^\s*deny\t([A-Za-z_][A-Za-z0-9_]*)\s*$') { [void]$script:DeniedLocalizationFields.Add($matches[1]) }
     }
 }
-$script:appDataRoot = Join-Path $env:LOCALAPPDATA "RimWorldAiTranslator"
+$script:appDataRoot = if ($AppDataRoot) { [System.IO.Path]::GetFullPath($AppDataRoot) } else { Join-Path $env:LOCALAPPDATA "RimWorldAiTranslator" }
 $script:projectStorePath = Join-Path $script:appDataRoot "projects.json"
 $script:settingsPath = Join-Path $script:appDataRoot "settings.json"
 $script:modCatalogCachePath = Join-Path $script:appDataRoot "mod-catalog.json"
@@ -290,6 +303,10 @@ function Get-AccessibilityAuditRows([System.Windows.Forms.Control]$Parent, [stri
         if ($control -is [System.Windows.Forms.TabControl]) {
             $layoutDetail = "client=$($control.ClientSize.Width)x$($control.ClientSize.Height);item=$($control.ItemSize.Width)x$($control.ItemSize.Height);pages=$($control.TabPages.Count)"
         }
+        $clipped = $false
+        if ($control.Visible -and -not $Parent.AutoScroll -and $Parent.ClientSize.Width -gt 0 -and $Parent.ClientSize.Height -gt 0) {
+            $clipped = $control.Left -lt 0 -or $control.Top -lt 0 -or $control.Right -gt $Parent.ClientSize.Width -or $control.Bottom -gt $Parent.ClientSize.Height
+        }
         [void]$rows.Add([pscustomobject]@{
             path = $controlPath
             type = $typeName
@@ -301,6 +318,8 @@ function Get-AccessibilityAuditRows([System.Windows.Forms.Control]$Parent, [stri
             accessibleName = [string]$control.AccessibleName
             accessibleDescription = [string]$control.AccessibleDescription
             bounds = "$($control.Left),$($control.Top),$($control.Width),$($control.Height)"
+            parentClient = "$($Parent.ClientSize.Width),$($Parent.ClientSize.Height)"
+            clipped = [bool]$clipped
             layoutDetail = $layoutDetail
         })
         foreach ($child in @(Get-AccessibilityAuditRows -Parent $control -ParentPath $controlPath)) {
@@ -663,6 +682,13 @@ function Get-RowRuntimeCache([object]$Row) {
         SourceFingerprint = ""
         Decision = $null
         DefContext = $null
+        SearchKey = $null
+        SearchText = $null
+        SearchDefClass = $null
+        SearchNode = $null
+        SearchAll = $null
+        SourcePreview = $null
+        DefaultPreview = $null
     }
     $Row | Add-Member -NotePropertyName _runtimeCache -NotePropertyValue $cache
     return $cache
@@ -2641,6 +2667,16 @@ function Get-Decision([object]$Row) {
     return $cache.Decision
 }
 
+function Get-ExistingDecision([object]$Row) {
+    $identity = Get-RowIdentity $Row
+    if (-not $script:decisions.ContainsKey($identity)) { return $null }
+    $cache = Get-RowRuntimeCache $Row
+    if ($cache.Decision) { return $cache.Decision }
+    if ($script:validateLoadedDecisionSources) { return Get-Decision $Row }
+    $cache.Decision = $script:decisions[$identity]
+    return $cache.Decision
+}
+
 function Normalize-DecisionForRow([object]$Row, [object]$Decision) {
     $source = ConvertTo-FlatString $Row.source
     $sourceHash = Get-RowSourceFingerprint $Row
@@ -3023,6 +3059,7 @@ function Import-PreviousProjectDecisions {
 function Save-Decisions {
     if (-not $script:reviewRoot) { return }
     Save-CurrentEdit
+    if (-not $script:dirty) { return }
     $items = New-Object "System.Collections.Generic.List[object]"
     foreach ($row in $script:rows) {
         $identity = if ($row.id) { "id:$($row.id)" } else { "key:$($row.key)" }
@@ -3263,65 +3300,95 @@ function Save-ReviewWithDuplicatePrompt {
 }
 
 function Get-RowSearchBlob([object]$Row, [object]$Decision, [string]$Mode) {
-    switch ($Mode) {
-        "키" {
-            return @([string]$Row.id, [string]$Row.key, (Get-RelativeTarget $Row)) -join "`n"
+    $cache = Get-RowRuntimeCache $Row
+    $cacheProperty = switch ($Mode) {
+        "키" { "SearchKey" }
+        "텍스트" { "SearchText" }
+        "Def Class" { "SearchDefClass" }
+        "Node" { "SearchNode" }
+        default { "SearchAll" }
+    }
+    $staticBlob = $cache.$cacheProperty
+    if ($null -eq $staticBlob) {
+        $staticBlob = switch ($Mode) {
+            "키" {
+                @([string]$Row.id, [string]$Row.key, (Get-RelativeTarget $Row)) -join "`n"
+            }
+            "텍스트" {
+                @(
+                    (ConvertTo-FlatString $Row.source),
+                    (ConvertTo-FlatString $Row.existing),
+                    (ConvertTo-FlatString $Row.candidate)
+                ) -join "`n"
+            }
+            "Def Class" {
+                $context = Get-RowDefContext $Row
+                @(
+                    [string]$context.DefClass,
+                    [string]$context.DefName,
+                    (Get-OptionalRowText -Row $Row -Names @("defClass", "defType", "typeName", "TypeName"))
+                ) -join "`n"
+            }
+            "Node" {
+                $context = Get-RowDefContext $Row
+                @(
+                    [string]$context.Node,
+                    [string]$context.Field,
+                    (Get-OptionalRowText -Row $Row -Names @("node", "field", "Field"))
+                ) -join "`n"
+            }
+            default {
+                @(
+                    [string]$Row.id,
+                    [string]$Row.key,
+                    (Get-RelativeTarget $Row),
+                    (ConvertTo-FlatString $Row.source),
+                    (ConvertTo-FlatString $Row.existing),
+                    (ConvertTo-FlatString $Row.candidate)
+                ) -join "`n"
+            }
         }
-        "텍스트" {
-            return @(
-                (ConvertTo-FlatString $Row.source),
-                (ConvertTo-FlatString $Row.existing),
-                (ConvertTo-FlatString $Row.candidate),
-                (ConvertTo-FlatString $Decision.text),
-                [string]$Decision.note
-            ) -join "`n"
-        }
-        "Def Class" {
-            $context = Get-RowDefContext $Row
-            return @(
-                [string]$context.DefClass,
-                [string]$context.DefName,
-                (Get-OptionalRowText -Row $Row -Names @("defClass", "defType", "typeName", "TypeName"))
-            ) -join "`n"
-        }
-        "Node" {
-            $context = Get-RowDefContext $Row
-            return @(
-                [string]$context.Node,
-                [string]$context.Field,
-                (Get-OptionalRowText -Row $Row -Names @("node", "field", "Field"))
-            ) -join "`n"
-        }
-        default {
-            return @(
-                [string]$Row.id,
-                [string]$Row.key,
-                (Get-RelativeTarget $Row),
-                (ConvertTo-FlatString $Row.source),
-                (ConvertTo-FlatString $Row.existing),
-                (ConvertTo-FlatString $Row.candidate),
-                (ConvertTo-FlatString $Decision.text),
-                [string]$Decision.note
-            ) -join "`n"
+        $staticBlob = ([string]$staticBlob).ToLowerInvariant()
+        $cache.$cacheProperty = $staticBlob
+    }
+    if ($Decision -and $Mode -in @("텍스트", "텍스트/키")) {
+        $dynamicBlob = @((ConvertTo-FlatString $Decision.text), [string]$Decision.note) -join "`n"
+        if (-not [string]::IsNullOrWhiteSpace($dynamicBlob)) {
+            return "$staticBlob`n$($dynamicBlob.ToLowerInvariant())"
         }
     }
+    return [string]$staticBlob
 }
 
 function Get-RowPassesFilter([object]$Row) {
-    $decision = Get-Decision $Row
-    $status = [string]$cmbStatus.SelectedItem
     if ($script:currentFile -ne "__ALL__" -and (Get-RelativeTarget $Row) -ne $script:currentFile) { return $false }
+    $status = [string]$cmbStatus.SelectedItem
+    $decision = $null
+    if ($status -notin @("", "전체", "후보 있음", "기존 있음")) {
+        $decision = Get-ExistingDecision $Row
+        if ($decision) {
+            $decisionStatus = [string]$decision.status
+            $decisionOrigin = [string]$decision.translationOrigin
+            $decisionText = ConvertTo-FlatString $decision.text
+            $sourceChanged = ConvertTo-BoolValue $decision.sourceChanged
+        } else {
+            $decisionText = Get-DefaultTranslationForRow $Row
+            $decisionOrigin = Get-DefaultTranslationOriginForRow $Row
+            $sourceChanged = $decisionOrigin -ne "ai" -and $Row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $Row.rmkSourceChanged)
+            $decisionStatus = if ([string]::IsNullOrWhiteSpace($decisionText) -or $sourceChanged) { "pending" } else { "translated" }
+        }
+    }
     switch ($status) {
-        "미번역" { if ($decision.status -ne "pending") { return $false } }
-        "번역됨" { if ($decision.status -ne "translated") { return $false } }
-        "검토됨" { if ($decision.status -ne "approved") { return $false } }
-        "업데이트로 변경됨" { if (-not (ConvertTo-BoolValue $decision.sourceChanged)) { return $false } }
-        "RMK 가져옴" { if ([string]$decision.translationOrigin -ne "rmk") { return $false } }
-        "내 번역" { if ([string]$decision.translationOrigin -ne "local") { return $false } }
-        "반려" { if ($decision.status -ne "rejected") { return $false } }
-        "보류" { if ($decision.status -ne "hold") { return $false } }
+        "미번역" { if ($decisionStatus -ne "pending") { return $false } }
+        "번역됨" { if ($decisionStatus -ne "translated") { return $false } }
+        "검토됨" { if ($decisionStatus -ne "approved") { return $false } }
+        "업데이트로 변경됨" { if (-not $sourceChanged) { return $false } }
+        "RMK 가져옴" { if ($decisionOrigin -ne "rmk") { return $false } }
+        "내 번역" { if ($decisionOrigin -ne "local") { return $false } }
+        "반려" { if ($decisionStatus -ne "rejected") { return $false } }
+        "보류" { if ($decisionStatus -ne "hold") { return $false } }
         "주의" {
-            $warnings = @(Get-RowWarnings -Row $Row -Translation (ConvertTo-FlatString $decision.text))
+            $warnings = @(Get-RowWarnings -Row $Row -Translation $decisionText)
             if ($warnings.Count -eq 0) { return $false }
         }
         "후보 있음" { if ([string]::IsNullOrWhiteSpace([string]$Row.candidate)) { return $false } }
@@ -3331,17 +3398,33 @@ function Get-RowPassesFilter([object]$Row) {
     $query = $txtSearch.Text.Trim().ToLowerInvariant()
     if ($query) {
         $mode = if ($cmbSearchField -and $cmbSearchField.SelectedItem) { [string]$cmbSearchField.SelectedItem } else { "텍스트/키" }
+        if (-not $decision -and $mode -in @("텍스트", "텍스트/키")) { $decision = Get-ExistingDecision $Row }
         $blob = Get-RowSearchBlob -Row $Row -Decision $decision -Mode $mode
-        if (-not $blob.ToLowerInvariant().Contains($query)) { return $false }
+        if (-not $blob.Contains($query)) { return $false }
     }
     return $true
 }
 
 function Get-ItemPreview([object]$Row) {
-    $source = ((ConvertTo-FlatString $Row.source) -replace "\s+", " ").Trim()
-    $candidate = ((ConvertTo-FlatString (Get-Decision $Row).text) -replace "\s+", " ").Trim()
-    if ($source.Length -gt 64) { $source = $source.Substring(0, 61) + "..." }
-    if ($candidate.Length -gt 64) { $candidate = $candidate.Substring(0, 61) + "..." }
+    $cache = Get-RowRuntimeCache $Row
+    if ($null -eq $cache.SourcePreview) {
+        $source = ((ConvertTo-FlatString $Row.source) -replace "\s+", " ").Trim()
+        if ($source.Length -gt 64) { $source = $source.Substring(0, 61) + "..." }
+        $cache.SourcePreview = $source
+    }
+    $decision = Get-ExistingDecision $Row
+    if ($decision) {
+        $candidate = ((ConvertTo-FlatString $decision.text) -replace "\s+", " ").Trim()
+        if ($candidate.Length -gt 64) { $candidate = $candidate.Substring(0, 61) + "..." }
+    } else {
+        if ($null -eq $cache.DefaultPreview) {
+            $candidate = ((Get-DefaultTranslationForRow $Row) -replace "\s+", " ").Trim()
+            if ($candidate.Length -gt 64) { $candidate = $candidate.Substring(0, 61) + "..." }
+            $cache.DefaultPreview = $candidate
+        }
+        $candidate = [string]$cache.DefaultPreview
+    }
+    $source = [string]$cache.SourcePreview
     return @($source, $candidate)
 }
 
@@ -3557,6 +3640,7 @@ function Refresh-ResultSelection {
     if ($positionValue -le 0) {
         $script:syncingItemSelection = $true
         try { $flowItems.ClearSelected() } finally { $script:syncingItemSelection = $false }
+        $script:lastRenderedSelectionPosition = -1
         return
     }
     $position = $positionValue - 1
@@ -3564,7 +3648,13 @@ function Refresh-ResultSelection {
         $script:syncingItemSelection = $true
         try { $flowItems.SelectedIndex = $position } finally { $script:syncingItemSelection = $false }
     }
-    $flowItems.Invalidate()
+    $positionsToRefresh = @($script:lastRenderedSelectionPosition, $position) |
+        Where-Object { $_ -ge 0 -and $_ -lt $flowItems.Items.Count } |
+        Select-Object -Unique
+    foreach ($refreshPosition in $positionsToRefresh) {
+        $flowItems.Invalidate($flowItems.GetItemRectangle([int]$refreshPosition))
+    }
+    $script:lastRenderedSelectionPosition = $position
 }
 
 function Clear-CurrentView {
@@ -3955,6 +4045,11 @@ function Load-ReviewRoot([string]$Root, [switch]$SkipPreviousDecisions) {
     if ($btnApplyTranslated) { $btnApplyTranslated.Enabled = $hasProjectMod }
     if ($tabs -and $tabRmk -and $tabs.SelectedTab -eq $tabRmk) { Refresh-RmkPanel }
     $loadStopwatch.Stop()
+    $script:lastReviewLoadMetrics = [pscustomobject]@{
+        totalMilliseconds = [Math]::Round($loadStopwatch.Elapsed.TotalMilliseconds, 3)
+        rows = $script:rows.Count
+        stages = $loadStages.ToArray()
+    }
     Add-Log ("검수 화면 로드: {0:n2}초 · {1}개 문자열" -f $loadStopwatch.Elapsed.TotalSeconds, $script:rows.Count)
     Add-Log ("로드 세부: " + [string]::Join(" · ", $loadStages))
 }
@@ -4462,6 +4557,114 @@ function Stop-Translation {
             Stop-ProcessTree $script:process.Id
         }
     }
+}
+
+function Get-PerformanceStatistics([double[]]$Values) {
+    $ordered = @($Values | Sort-Object)
+    if ($ordered.Count -eq 0) { return [pscustomobject]@{ medianMs = 0; maxMs = 0; samples = @() } }
+    $middle = [int][Math]::Floor($ordered.Count / 2)
+    $median = if (($ordered.Count % 2) -eq 0) { ($ordered[$middle - 1] + $ordered[$middle]) / 2.0 } else { $ordered[$middle] }
+    return [pscustomobject]@{
+        medianMs = [Math]::Round($median, 3)
+        maxMs = [Math]::Round([double]$ordered[-1], 3)
+        samples = @($Values | ForEach-Object { [Math]::Round($_, 3) })
+    }
+}
+
+function Write-WorkspacePerformanceReport([string]$Path, [int]$Iterations) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not $script:reviewRoot) { return }
+    $searchTimes = New-Object "System.Collections.Generic.List[double]"
+    $nextTimes = New-Object "System.Collections.Generic.List[double]"
+    $saveTimes = New-Object "System.Collections.Generic.List[double]"
+    $noChangeSaveTimes = New-Object "System.Collections.Generic.List[double]"
+    $searchCases = New-Object "System.Collections.Generic.List[object]"
+    $statusFilterMatches = [ordered]@{}
+    $originalSearch = [string]$txtSearch.Text
+    $originalStatus = $cmbStatus.SelectedIndex
+    $originalRow = $script:currentRowIndex
+    try {
+        for ($iteration = 0; $iteration -lt $Iterations; $iteration++) {
+            $txtSearch.Text = if (($iteration % 2) -eq 0) { "needle" } else { "Synthetic" }
+            if ($searchTimer) { $searchTimer.Stop() }
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            Refresh-ItemList -SelectRowIndex $script:currentRowIndex
+            $watch.Stop()
+            [void]$searchTimes.Add($watch.Elapsed.TotalMilliseconds)
+            [void]$searchCases.Add([pscustomobject]@{ query = [string]$txtSearch.Text; matches = [int]$flowItems.Items.Count })
+        }
+        $txtSearch.Text = ""
+        if ($searchTimer) { $searchTimer.Stop() }
+        Refresh-ItemList -SelectRowIndex $originalRow
+
+        foreach ($statusName in @("미번역", "번역됨")) {
+            $statusIndex = $cmbStatus.Items.IndexOf($statusName)
+            if ($statusIndex -lt 0) { continue }
+            $script:loading = $true
+            try { $cmbStatus.SelectedIndex = $statusIndex } finally { $script:loading = $false }
+            Refresh-ItemList -SelectRowIndex $originalRow
+            $statusFilterMatches[$statusName] = [int]$flowItems.Items.Count
+        }
+        $script:loading = $true
+        try { $cmbStatus.SelectedIndex = $originalStatus } finally { $script:loading = $false }
+        Refresh-ItemList -SelectRowIndex $originalRow
+
+        for ($iteration = 0; $iteration -lt $Iterations; $iteration++) {
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            for ($move = 0; $move -lt 25; $move++) { Move-Selection 1 }
+            $watch.Stop()
+            [void]$nextTimes.Add($watch.Elapsed.TotalMilliseconds / 25.0)
+        }
+
+        for ($iteration = 0; $iteration -lt $Iterations; $iteration++) {
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            Save-Decisions
+            $watch.Stop()
+            [void]$noChangeSaveTimes.Add($watch.Elapsed.TotalMilliseconds)
+        }
+
+        for ($iteration = 0; $iteration -lt $Iterations; $iteration++) {
+            $script:dirty = $true
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            Save-Decisions
+            $watch.Stop()
+            [void]$saveTimes.Add($watch.Elapsed.TotalMilliseconds)
+        }
+    } finally {
+        $txtSearch.Text = $originalSearch
+        $cmbStatus.SelectedIndex = $originalStatus
+        if ($searchTimer) { $searchTimer.Stop() }
+        Refresh-ItemList -SelectRowIndex $originalRow
+    }
+    $process = [System.Diagnostics.Process]::GetCurrentProcess()
+    $dpiX = 0.0
+    $dpiY = 0.0
+    $graphics = $null
+    try {
+        $graphics = $form.CreateGraphics()
+        $dpiX = [Math]::Round([double]$graphics.DpiX, 1)
+        $dpiY = [Math]::Round([double]$graphics.DpiY, 1)
+    } finally {
+        if ($graphics) { $graphics.Dispose() }
+    }
+    $report = [ordered]@{
+        version = 1
+        measuredAt = [DateTime]::UtcNow.ToString("o")
+        rows = $script:rows.Count
+        iterations = $Iterations
+        reviewLoad = $script:lastReviewLoadMetrics
+        search = Get-PerformanceStatistics -Values ($searchTimes.ToArray())
+        searchCases = $searchCases.ToArray()
+        statusFilterMatches = $statusFilterMatches
+        nextItem = Get-PerformanceStatistics -Values ($nextTimes.ToArray())
+        save = Get-PerformanceStatistics -Values ($saveTimes.ToArray())
+        saveNoChange = Get-PerformanceStatistics -Values ($noChangeSaveTimes.ToArray())
+        dpiX = $dpiX
+        dpiY = $dpiY
+        workingSetMb = [Math]::Round($process.WorkingSet64 / 1MB, 2)
+        privateMemoryMb = [Math]::Round($process.PrivateMemorySize64 / 1MB, 2)
+    }
+    Write-Utf8JsonFile -Path ([System.IO.Path]::GetFullPath($Path)) -Value $report -Depth 8
+    Add-Log ("성능 측정 완료: 검색 중앙 {0:n1}ms · 다음 항목 {1:n1}ms · 저장 {2:n1}ms" -f $report.search.medianMs, $report.nextItem.medianMs, $report.save.medianMs)
 }
 
 function Load-SourceOnlyForSelectedMod {
@@ -5674,7 +5877,7 @@ function Resize-ReviewEditorLayout {
     $lblTranslationTitle.SetBounds($pad, $translationLabelY, $contentWidth, 20)
     $pnlTranslationFrame.SetBounds($pad, $translationBoxY, $contentWidth, $translationHeight)
     $txtTranslation.SetBounds(11, 9, [Math]::Max(120, $contentWidth - 24), [Math]::Max(42, $translationHeight - 20))
-    $translationAccent.SetBounds(0, [Math]::Max(0, $translationHeight - 3), $contentWidth, 3)
+    $translationAccent.SetBounds(0, [Math]::Max(0, $pnlTranslationFrame.ClientSize.Height - 3), [Math]::Max(1, $pnlTranslationFrame.ClientSize.Width), 3)
 
     $metaY = $translationBoxY + $translationHeight + $(if ($ultraCompact) { 8 } else { 14 })
     $txtMeta.SetBounds($pad, $metaY, $contentWidth, $metaHeight)
@@ -7249,20 +7452,26 @@ $form.Add_Shown({
     Update-RmkControls
 
     # 첫 화면을 먼저 그린 다음 모드 캐시를 검증한다. 느린 Steam 드라이브가 초기 창 표시를 막지 않는다.
-    $script:startupCatalogTimer = [System.Windows.Forms.Timer]::new()
-    $script:startupCatalogTimer.Interval = 50
-    $script:startupCatalogTimer.Add_Tick({
-        $script:startupCatalogTimer.Stop()
-        try {
-            Refresh-ModCatalog -PreferCache
-        } catch {
-            Add-Log "모드 자동 검색 실패: $($_.Exception.Message)"
-        } finally {
-            $script:startupCatalogTimer.Dispose()
-            $script:startupCatalogTimer = $null
-        }
-    })
-    $script:startupCatalogTimer.Start()
+    if (-not $DisableBackgroundDiscovery) {
+        $script:startupCatalogTimer = [System.Windows.Forms.Timer]::new()
+        $script:startupCatalogTimer.Interval = 50
+        $script:startupCatalogTimer.Add_Tick({
+            $script:startupCatalogTimer.Stop()
+            try {
+                Refresh-ModCatalog -PreferCache
+            } catch {
+                Add-Log "모드 자동 검색 실패: $($_.Exception.Message)"
+            } finally {
+                $script:startupCatalogTimer.Dispose()
+                $script:startupCatalogTimer = $null
+            }
+        })
+        $script:startupCatalogTimer.Start()
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:performanceReportPath)) {
+        Write-WorkspacePerformanceReport -Path $script:performanceReportPath -Iterations $script:performanceIterations
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($script:layoutSnapshotPath)) {
         $script:layoutSnapshotTimer = [System.Windows.Forms.Timer]::new()

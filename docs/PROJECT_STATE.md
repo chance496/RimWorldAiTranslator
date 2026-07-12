@@ -6,7 +6,7 @@
 
 - 제품 Git 루트: `C:\Users\wjdck\Documents\Rimworld\tools\RimWorldAiTranslator`
 - 원격: `https://github.com/chance496/RimWorldAiTranslator.git`
-- 현재 작업 브랜치: `codex/autonomous/20260712-073630`. 기준 백업은 `aff52cc`, 첫 P0 체크포인트는 `2ef9488`이다.
+- 현재 작업 브랜치: `codex/autonomous/20260712-073630`. 기준 백업은 `aff52cc`, P0 체크포인트는 `2ef9488`, P1 체크포인트는 `7e49808`이다.
 - 기존 수정 파일: `Apply-RimWorldAiReviewResults.ps1`, `Export-RimWorldAiReviewToRmk.ps1`, `Invoke-RimWorldAiTranslation.ps1`, `PACKAGE_README.txt`, `README.md`, `Start-RimWorldAiReviewGui.ps1`, `build-package.ps1`, `native/RimWorldTranslatorNative.cs`
 - 기존 새 파일: `rimworld-def-field-rules.txt`
 - 기존 제품 변경 규모: 8개 추적 파일에서 +752/-199줄. 이번 운영 체계 정리 전부터 존재한 사용자 작업이며 검증·커밋되지 않았다.
@@ -35,12 +35,14 @@
 | 업데이트 승계 | 파일+키 또는 유일 키로 이전 결정을 연결하고 원문이 바뀌면 번역을 보존한 채 `pending/sourceChanged`로 내린다. | `Start-RimWorldAiReviewGui.ps1:3075-3197` |
 | 로컬/RMK 적용 | 상태, 원문 해시, 토큰, 경로와 중복 키를 검사해 로컬 Korean XML 또는 RMK 작업 경로에 쓴다. 기존 XML/XLSX는 `.bak`을 남기고 다중 파일 실패 시 전체를 롤백한다. | `Apply-RimWorldAiReviewResults.ps1`, `Export-RimWorldAiReviewToRmk.ps1`, `native/RimWorldTranslatorNative.cs` |
 | 패키징 | Windows .NET Framework `csc.exe`로 실행기와 native DLL을 빌드하고 전체 오프라인 회귀, 패키지 Parser, ZIP 압축 해제 원문 추출 smoke를 통과한 파일만 `dist`에 묶는다. | `build-package.ps1`, `tests/Run-RegressionTests.ps1` |
+| UI 감사·성능 | 격리된 5,000행 합성 프로젝트에서 창 크기·테마·글자 크기·접근성·검색/필터 결과와 로드·검색·이동·저장·메모리를 재현 측정한다. RMK XML/XLSX 생성·갱신 benchmark도 별도로 제공한다. | `tests/Run-UiPerformanceAudit.ps1`, `tests/Run-RmkPerformanceBenchmark.ps1` |
+| 검증 성능 | PowerShell 검증 규칙을 기준 구현으로 유지하면서 native DLL이 있을 때 같은 토큰·조사·개행 판정을 컴파일된 정규식으로 실행한다. | `RimWorldAiTranslator.Validation.ps1`, `native/RimWorldTranslatorNative.cs` |
 
 ## 미완성 또는 미검증
 
 - P0/P1 저장·적용·Def 안전·원문 변경·토큰·취소·재시도·재개 경로는 16개 오프라인 회귀와 패키지 smoke를 통과했다.
-- README의 성능 수치는 이전 로컬 측정 결과지만 재현 가능한 benchmark 명령과 원시 기준 데이터가 저장소에 없다.
-- UI, 프로젝트 상태, RMK, 번역 프로세스 오케스트레이션이 390KB가 넘는 `Start-RimWorldAiReviewGui.ps1` 한 파일에 결합되어 있다.
+- 실제 125/150/200% DPI는 Windows 디스플레이 배율 변경 없이 자동 재현할 수 없어 96 DPI 감사만 완료했다. 900×600/1280×720/1920×1080, 밝음/어두움/고대비와 글자 10/12에서는 잘림과 접근성 이름 누락이 0건이다.
+- UI, 프로젝트 상태, RMK, 번역 프로세스 오케스트레이션이 큰 `Start-RimWorldAiReviewGui.ps1`에 남아 있다. 저장·검증·삭제 경계와 성능 runner는 독립 파일로 분리했으며, 무리한 전면 재작성은 하지 않는다.
 
 ## 알려진 오류와 위험
 
@@ -48,10 +50,12 @@
 |---|---|---|
 | 해결됨 | 손상 프로젝트 저장소의 조용한 빈 목록 대체, 로컬/RMK 부분 적용, 복구 백업 부재와 자식 로그 API 키 노출 가능성은 P0 회귀로 차단했다. | `StateStore.Recovery`, `Security.ApiKeyHandling`, `Apply.LocalRollback`, `Export.RmkTransaction` |
 | 해결됨 | 자동 오프라인 회귀 부재, 직접 실행기 인코딩, 내부 식별자·중복 namespace, 토큰·원문 변경·RMK XLSX 보존, 취소·재시도·직접 출력 롤백을 P1 게이트로 고정했다. | `tests/Run-RegressionTests.ps1` 16개 suite 사례 |
-| P2 | `IncludePatches` UI/매개변수는 존재하지만 엔진은 Patches 번역을 항상 비활성화한다. | 사용자가 체크박스가 번역 범위를 넓힌다고 오해할 수 있다. `Invoke-RimWorldAiTranslation.ps1:540-546`. |
-| P2 | 7천 줄이 넘는 WinForms 스크립트에 책임이 집중되어 있다. | 변경 범위 파악, 단위 테스트, UI 회귀 격리와 성능 분석이 어렵다. |
+| 명시적 차단 | 실제 125/150/200% DPI 자동 감사가 없다. | Windows 디스플레이 설정 변경은 현재 자율 작업의 시스템 변경 금지 범위다. runner는 실제 DPI를 기록해 다른 환경에서 같은 명령으로 보완할 수 있다. |
+| 잔여 부채 | 큰 WinForms 스크립트에 여러 책임이 남아 있다. | 저장·검증·정리·benchmark는 분리됐지만 추가 분리는 동작 보존 회귀를 동반한 작은 단계로만 진행해야 한다. |
 
 ## 이번 점검에서 확인한 결과
 
 - 전체 오프라인 회귀 16/16, 패키지 C# 빌드, 패키지 PowerShell Parser와 ZIP 새 폴더 원문 추출 7행 smoke가 통과했다.
+- UI 5,000행 기준: 로드 1,558.896→993.706ms, 검색 중앙 3,071.292→1,191.644ms, 다음 항목 50.234→37.266ms, 실제 저장 1,925.418→546.736ms, working set 259.48→224.62MB. 변경 없는 저장은 중앙 0.111ms다.
+- RMK 5,000행 기준: 생성 13,144.655→7,289.464ms, 갱신 중앙 14,919.371→8,640.982ms(최악 9,039.086ms), 최종 최대 working set 323.01MB다.
 - 외부 네트워크와 실제 API, Workshop/RMK 구독본, `%LOCALAPPDATA%` 사용자 데이터는 사용하지 않았다. API 동작은 로컬 TCP 가짜 서버로 검증했다.

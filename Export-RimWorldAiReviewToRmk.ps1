@@ -388,6 +388,7 @@ function Restore-TransactionFile([object]$Entry) {
     }
 }
 
+Initialize-RmkXlsxSupport
 $rmkEntryFull = Resolve-FullPath $RmkEntryRoot
 $reviewFull = Resolve-FullPath $ReviewRoot
 Assert-SafePathSegment -Value $ReviewLanguageFolderName -Name "ReviewLanguageFolderName"
@@ -538,7 +539,6 @@ foreach ($item in @($decisionData.items)) {
     if ($historyIdentifier) { $exportedTranslationByIdentifier[$historyIdentifier] = $translation }
 }
 
-Initialize-RmkXlsxSupport
 $workbookFull = Get-RmkWorkbookOutputPath -RequestedPath $WorkbookPath -EntryRoot $rmkEntryFull
 $workbookExists = Test-Path -LiteralPath $workbookFull -PathType Leaf
 $workbookData = if ($workbookExists) { [RimWorldTranslatorRmkXlsxReader]::Read($workbookFull) } else { $null }

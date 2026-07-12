@@ -9,6 +9,9 @@ function Get-RimWorldProtectedTokenCounts([string]$Text) {
 }
 
 function Get-RimWorldTokenPreservationIssues([string]$Source, [string]$Target) {
+    if ("RimWorldTranslatorValidation" -as [type]) {
+        return [RimWorldTranslatorValidation]::GetTokenPreservationIssues([string]$Source, [string]$Target)
+    }
     $sourceCounts = Get-RimWorldProtectedTokenCounts $Source
     $targetCounts = Get-RimWorldProtectedTokenCounts $Target
     $missing = New-Object "System.Collections.Generic.List[string]"
@@ -48,6 +51,9 @@ function Test-RimWorldProtectedTokenStructure([string]$Source, [string]$Translat
 }
 
 function Get-RimWorldInvalidKoreanParticleNotations([string]$Text) {
+    if ("RimWorldTranslatorValidation" -as [type]) {
+        return [RimWorldTranslatorValidation]::GetInvalidKoreanParticleNotations([string]$Text)
+    }
     $result = New-Object "System.Collections.Generic.List[string]"
     if ([string]::IsNullOrWhiteSpace($Text)) { return $result.ToArray() }
     $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
@@ -62,6 +68,9 @@ function Get-RimWorldInvalidKoreanParticleNotations([string]$Text) {
 }
 
 function Test-RimWorldPathologicalTranslation([string]$Text) {
+    if ("RimWorldTranslatorValidation" -as [type]) {
+        return [RimWorldTranslatorValidation]::IsPathologicalTranslation([string]$Text)
+    }
     if ([string]::IsNullOrEmpty($Text)) { return $false }
     if ($Text -match "(\r?\n\s*){8,}" -or $Text -match "(\\u000a\s*){8,}") { return $true }
     $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($Text, "\r?\n").Count
