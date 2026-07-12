@@ -1,283 +1,37 @@
 # RimWorld AI Translator v1.0.0
 
-첫 안정화 릴리스입니다.
+## C# 네이티브 전환
 
-## 주요 기능
+- 메인 실행 파일, WinForms UI, 프로젝트·설정·검수 상태, 모드 탐색, XML 추출, 번역 API, 재시도·취소·체크포인트, 로컬 적용과 RMK 내보내기를 C#/.NET 8로 이전했습니다.
+- 사용자 실행 경로에서 `.ps1`, `powershell.exe`, `pwsh.exe`, 실행 정책과 콘솔 창 의존성을 제거했습니다.
+- Windows 10/11 x64에서 별도 .NET 설치 없이 실행되는 자체 포함 단일 EXE 패키지로 변경했습니다.
+- 기존 `projects.json`, `settings.json`, `review-decisions.json`과 RMK XLSX 형식을 유지합니다.
 
-- 모드 하나를 프로젝트 하나로 관리하며 AI 초벌 번역, 직접 번역, 항목별 검수, 메모와 작업 이력을 로컬에 보존합니다.
-- Cerebras, OpenAI, Gemini, DeepSeek, Qwen, Groq, Mistral, OpenRouter, Z.AI와 사용자 지정 OpenAI 호환 API를 지원합니다. API 키가 없으면 Google 번역을 사용할 수 있습니다.
-- 여러 API 키의 순환 사용, 무료 한도 기반 요청 제어, 배치 분할 재시도, 완료 배치 체크포인트, 중지와 부분 복구를 지원합니다.
-- Steam Workshop과 로컬 모드를 자동 검색하고 영어·중국어·일본어 등 프로젝트 기준 원문 언어를 선택할 수 있습니다.
-- `Keyed`, `DefInjected`, 검증된 Def 표시 필드를 추출하며 내부 식별자, 렌더 트리, 경로와 기술 필드는 번역 대상에서 제외합니다.
-- RimWorld 변수, 태그, 포맷 토큰, 문법 접두어와 한국어 자동 조사 문법을 번역·검수·적용 단계에서 보호합니다.
-- 원문이 바뀐 키는 기존 번역과 과거 원문을 보존하면서 `변경됨 + 미번역`으로 내려 재검토 전 적용을 차단합니다.
-- 검토됨만 적용하거나 안전한 번역됨까지 함께 `Languages\Korean`에 적용할 수 있으며 다중 파일 실패 시 전체를 롤백합니다.
-- RMK 구독본을 읽기 전용 번역 자료로 사용하고, 선택한 RMK 작업 클론에 XML과 림추출기 호환 XLSX를 안전하게 병합합니다.
+## 안정성
 
-## 안정성 및 사용성
+- 상태 파일은 UTF-8 원자 저장, 백업 복구와 이중 손상 시 쓰기 차단을 사용합니다.
+- 로컬 Korean과 RMK XML/XLSX 적용은 백업과 다중 파일 롤백을 사용합니다.
+- API 키는 메모리에만 유지하고 로그·설정·검수·진단 파일에 기록하지 않습니다.
+- 장시간 원문 분석과 번역은 비동기로 실행하고 검수 화면과 중지 버튼을 계속 사용할 수 있습니다.
+- 종료 요청 시 진행 중 작업을 먼저 취소한 뒤 저장·종료해 백그라운드 작업이 남지 않게 했습니다.
+- RMK XLSX의 과거 원문 언어가 현재 모드의 선택 언어와 다를 때 잘못된 전체 변경 판정이나 로드 실패를 방지합니다.
 
-- 프로젝트·설정·검수 상태를 원자적으로 저장하고 정상 백업에서 복구합니다. 손상된 상태를 조용히 빈 데이터로 덮지 않습니다.
-- 실행 준비 화면, 최대화 레이아웃 확정, 프로젝트 원자 공개를 통해 WinForms 컨트롤이 순서대로 나타나거나 화면이 흔들리는 현상을 줄였습니다.
-- 작업 상태 막대는 본문 크기를 바꾸지 않으며 원문 분석과 AI 번역은 별도 프로세스에서 실행되어 창과 중지 버튼이 응답합니다.
-- 가상 문자열 목록, 행 상태 캐시, 희소 검수 저장, 네이티브 XML/XLSX 판독기로 대형 프로젝트의 로드·검색·저장 비용을 줄였습니다.
-- 품질 센터, 기존/후보/현재 번역 비교, 로컬 번역 메모리, 전체 안전 검토, 검색·상태·출처·편집 시각 필터와 키보드 단축키를 제공합니다.
-- 프로페셔널, 사이파이, 비비드, 스튜디오, 프런티어 디자인과 밝음·어두움·고대비·글자 크기 설정을 제공합니다.
+## 검수와 RMK
+
+- 미번역·번역됨·검토됨·변경됨 상태, 출처·파일·Def Class·Node 검색과 편집 시각 정렬을 제공합니다.
+- 같은 원문 일괄 번역, 전체 안전 검토, 품질 보고서와 개인정보 보호 진단 ZIP을 제공합니다.
+- RMK 구독본과 로컬 Git 작업 클론을 자동 탐색하고, 구독본은 읽기 전용으로만 사용합니다.
+- RMK 번역과 번역 당시 XLSX 원문을 현재 원문과 비교하며 다른 언어끼리는 비교하지 않습니다.
+- 원본 RimWorld+DLC 용어집만 기본 포함하고, 로컬 추가 용어집은 설정에서 명시적으로 선택·해제합니다.
 
 ## 검증
 
-- 오프라인 회귀 테스트 20개, 패키지 PowerShell 구문 검사, SourceOnly 추출 smoke, 5,000행 UI 성능·접근성 감사와 실제 최대화 시작 화면 감사를 통과했습니다.
-- 실제 Defensive Network 모드의 원문 1,184개에서 검수 항목 846개를 읽기 전용으로 구성해 원본 모드 쓰기 없이 검증했습니다.
+- C# 회귀 테스트 30개가 임시 fixture에서 통과했습니다.
+- 5,000행 합성 fixture에서 원문 추출 중앙값 19.3ms, 검수 로드 88.6ms, 키 검색 9.2ms, 상태 필터 0.45ms를 기록했습니다.
+- 자체 포함 EXE는 격리 데이터에서 첫 창 2.24초, 재실행 0.52초, 정상 종료 0.31~0.40초였고 PowerShell 자식 프로세스는 0개였습니다.
+- 실제 Workshop 모드를 읽기 전용으로 열어 스페인어 원문, RMK 기존 번역, Def Class/Node 표시와 원문 갱신 중 중지 버튼 활성화를 확인했습니다.
+- 릴리스 빌드는 `dotnet build`, 회귀 테스트, 자체 포함 `dotnet publish`, ZIP 실행·정상 종료와 PowerShell 자식 프로세스 비호출 검사를 통과해야 생성됩니다.
 
 ## 설치
 
-`RimWorldAiTranslator-v1.0.0.zip`을 원하는 폴더에 압축 해제한 뒤 `RimWorldAiTranslator.exe`를 실행하세요. Windows 10/11과 Windows 기본 PowerShell이 필요하며 Python, Node.js, Git 같은 개발 도구는 필요하지 않습니다.
-
-# RimWorld AI Translator v0.2.1
-
-## Changes
-
-- Detect source changes from the previous full project snapshot when an RMK entry has no source-history XLSX, so imported RMK translations cannot hide an update.
-- Create or merge a RimworldExtractor-compatible source-history XLSX during RMK export while preserving existing workbook styles, comments, extra columns, required-mod data, and unreviewed historical source text.
-
-# RimWorld AI Translator v0.2.0
-
-## Changes
-
-- Added persistent translation provenance for RMK imports, existing mod translations, AI drafts, and manual local edits.
-- Added RMK XLSX source-history comparison by `Def Class + Node`; stale RMK translations become updated and untranslated on first import.
-- Compare RMK language-folder history only against a matching current language folder; direct Def values are compared as the mod's actual source so a Def source-language change is still flagged for review.
-- Added RMK/local-origin filters and newest/oldest sorting based only on the time a user actually edited a translation.
-- Added a bulk review-complete action that skips blank translations, changed sources, and safety warnings.
-- Fixed Windows PowerShell failing with `Argument types do not match` when an RMK workbook contains tens of thousands of rows.
-- Replaced cell-by-cell XLSX and recursive Def parsing with bounded, DTD-disabled .NET readers; Medieval 2 source refresh dropped from a 17.6-second failure to a successful roughly 3.0-second runner pass.
-- Precompiled the native XML/XLSX reader into the release package and retained source compilation only as a development fallback, removing repeated runtime C# compilation.
-- Streamed large RMK shared-string and worksheet XML instead of materializing the whole sheet, while preserving file-size, DTD, entity, and path-traversal limits.
-- Added `LoadFolders.xml` content-root support so shared languages, versioned Defs, and optional integration folders are scanned as one project.
-- Moved source refresh to the cancellable background runner so the main window remains responsive.
-- Reduced a measured 1,797-row review load from 8.19 seconds to about 1.0-1.2 seconds by avoiding repeat decision normalization, indexing repeated paths, caching row state, and replacing hundreds of nested card controls with a full owner-drawn virtual list.
-- Added sparse, compact review-state persistence so auto-save stores AI/local edits and changed statuses without rebuilding every default RMK or mod translation.
-- Deferred Steam mod-cache validation until after first paint and added an immediate native startup window; the packaged EXE showed visible feedback in roughly 0.1-0.22 seconds in local tests.
-- Reused fonts and direct .NET constructors across static and review controls, reducing startup allocations and GDI object churn.
-- Hardened launcher argument quoting and fixed its Korean startup error messages.
-
-# RimWorld AI Translator v0.1.18
-
-## Changes
-
-- Added provider-based translation settings for Cerebras, OpenAI, Gemini, DeepSeek, Qwen, Groq, Mistral, OpenRouter, BigModel / Z.AI, custom OpenAI-compatible endpoints, and keyless Google Translate.
-- Added editable per-provider API URLs, model presets, temperature settings, and in-memory multi-key rotation without persisting API keys.
-- Fixed versioned `LoadFolders.xml` mods such as Kiiro Race resolving to the Workshop root instead of the active `1.6` content folder.
-- Reworked project cards and compact review layouts to prevent progress bars, buttons, and reference tabs from overlapping at smaller resolutions.
-- Excluded definite internal `DefInjected` identifiers such as AlienRace color-channel names and non-display `PawnRenderTreeDef` fields from AI translation and review lists, with an audit record of every exclusion.
-- Protected RimWorld grammar-rule prefixes such as `r_logentry->` and require them to remain unchanged at the start of translated values before apply or RMK export.
-- Added RimWorld Korean automatic-particle guidance to AI prompts and block reversed forms such as `이(가)` or `은(는)` during review, direct apply, and RMK export; valid forms include `(이)가` and `(은)는`.
-- Added local RMK integration that discovers the Steam subscription and a `bus` branch working clone by Workshop or Package ID.
-- Reuses RMK translations as editable defaults and sends only missing strings to AI translation.
-- Added an `RMK에 적용` destination checkbox: unchecked writes to the original mod, while checked merges the same reviewed statuses into the RMK working clone.
-- Replaced the AI overwrite warning with explicit `Overwrite`, `Translate missing only`, and `Cancel` choices; missing-only mode also preserves manual review translations that have not been applied to the mod yet.
-- Added project-time source-language selection when a mod contains multiple language folders; the choice is stored per project and reused for refresh and AI translation.
-- Added dedicated `Def Class` and `Node` search scopes.
-- Added editing-focused keyboard shortcuts for navigation, candidate selection, status changes, source refresh, and AI translation control.
-- Debounced review search, replaced repeated array growth, limited initial card rendering, and deferred full warning checks to visible or explicitly filtered rows for faster large-project interaction.
-- Indexed glossary lookup without changing selected term order; repeated batch term selection is substantially faster while producing the same prompt terms.
-- Removed the `cmd.exe` translation launch hop. API keys remain environment-only, while a local runner accepts only an allowlisted parameter set from a bounded JSON file.
-- Improved low-resolution behavior with a 900x600 minimum layout, compact header controls, and scrollable editor/settings surfaces.
-- Existing RMK keys remain in their original XML files, new keys are added once, changed or unsafe strings are skipped, and `LoadFoldersBuilder` runs after export.
-- RMK Builder output is decoded with its native Korean code page and completion is verified from regenerated, valid output files instead of a localized log phrase.
-- RMK subscription files are read-only references; Git commits and pushes remain manual.
-
-# RimWorld AI Translator v0.1.17
-
-## Changes
-
-- Changed translated-entry safety checks to validate the reviewer's current edited text instead of stale AI-candidate metadata.
-- Added protected-token, Korean-text, source-copy, blank-text, and pathological-newline checks to both the review UI and final apply path.
-- Cached translation validation and warning results, with automatic invalidation whenever source or translation text changes.
-- Optimized `Complete and next` to update only the active card and affected counters instead of serializing every decision and rebuilding the full list on each click.
-- Batched routine status saves through the existing 1.2-second autosave timer while preserving immediate saves for explicit save, apply, project changes, and shutdown.
-- Measured a 91.9 ms median transition time on a 749-entry review project, and 66.6 ms while using the translated-status filter.
-
-# RimWorld AI Translator v0.1.16
-
-## Changes
-
-- Added an optional bulk action for manual translations: when identical source text appears elsewhere in the project, the reviewer can apply one translation to every matching string.
-- Preserved notes and already reviewed identical translations during bulk changes; changed translations return to the translated state for review.
-- Fixed source refresh discarding translations that had not yet been written into the mod's `Languages\Korean` folder.
-- Source refresh now searches project run history for the latest valid review state, even when the most recent run is incomplete or has no decision file.
-- Changed source values retain their translation but return to untranslated with a persistent updated marker; genuinely new keys remain new untranslated entries.
-- Replaced unstable sequential-ID fallback matching with file-and-key or unique-key matching so inserted keys cannot inherit another string's translation.
-- Rewrote the repository and packaged Korean documentation with correct UTF-8 text and current project workflow details.
-
-# RimWorld AI Translator v0.1.15
-
-## Changes
-
-- Fixed AI translation failing when a saved mod folder path ended with a directory separator.
-- Hardened Windows command-line argument quoting so trailing backslashes and embedded quotes cannot merge later translation options into a path.
-- Normalized project mod paths when projects are created, opened, or translated.
-
-# RimWorld AI Translator v0.1.14
-
-## Changes
-
-- Added a persistent `updated source` marker when a mod update changes the source text assigned to an existing key.
-- Updated strings remain untranslated and excluded from apply until they are translated or reviewed again; the previous source text is retained in history.
-- Added updated-string counts, list badges, editor badges, activity text, and a dedicated filter.
-- Added one-click `All`, `Untranslated`, `Translated`, `Reviewed`, and `Updated` filters above the string list while retaining detailed filters in the dropdown.
-- Refined the project dashboard and review workspace with a calmer RimWorld-inspired palette, clearer hierarchy, denser project cards, lighter borders, and responsive action groups.
-- Fixed project cards counting a JSON result array as one item instead of showing every review string.
-
-# RimWorld AI Translator v0.1.13
-
-## Changes
-
-- Translation editors now start with the AI candidate when available, otherwise the existing Korean translation, and remain blank only when neither exists.
-- Added explicit text status and warning labels so review state is not communicated by color alone.
-- Added persisted system/light/dark theme, text size, high-contrast, and edit auto-save settings without storing API keys.
-- Added accessible names, descriptions, focus cues, tooltips, and keyboard navigation for the dashboard and review workspace.
-- Added `Ctrl+F`, `F6`/`Shift+F6`, `Esc`, and expanded arrow-key navigation alongside the existing save and review shortcuts.
-- Added delayed automatic saving for translation and memo edits, plus a confirmation dialog before writing reviewed translations into a mod.
-- Fixed non-content splitters and progress indicators appearing as unnamed keyboard targets to accessibility tools.
-- Reduced startup work by loading the 2.1 MB official glossary only when the terms tab is first opened.
-- Added a validated local mod-catalog cache; unchanged Steam and local mod roots reuse the cached list while additions and removals invalidate it automatically.
-- Removed a duplicate project-card statistics refresh during initial display.
-- Hardened all mod XML readers by prohibiting DTDs and external entities and limiting parsed XML documents to 128 MB.
-- Added strict language-folder, output-path, HTTPS endpoint, and XML localization-key validation before translation or review application.
-- Fixed review-output containment checks to require a true directory boundary instead of a plain string prefix.
-- Pinned PowerShell, cmd, Explorer, and tar launches to their Windows system paths to avoid executable search-path hijacking.
-- Added reparse-point protection before the package builder clears its output folder.
-
-# RimWorld AI Translator v0.1.12
-
-## Changes
-
-- Rebuilt the review workspace around a compact project header, searchable string list, focused translation editor, and structured history side panel.
-- Added a restrained RimWorld-inspired light palette while preserving a dedicated dark theme for Windows dark mode.
-- Fixed the workspace being rendered underneath the top command bar.
-- Added responsive toolbar wrapping and compact editor sizing so restored windows do not clip review controls.
-- Reworked the main flow so mod work is managed directly by mod cards instead of separate project/mod selectors.
-- A local project now owns exactly one RimWorld mod; source loading, AI translation, and apply actions always use that project's saved mod folder.
-- Added a source-only load path for manual translation without API calls; existing Korean translations are available as editable starting text.
-- AI translation now fills previously untouched blank decisions with draft candidates while preserving manually edited translations.
-- Replaced the old item table with a search-first review list using text/key filters and result cards.
-- Reworked the whole GUI toward a bright three-column review app: mod/search list, source/translation editor, and history/terms/memo side panel.
-- Large review lists now render the first visible batch of cards instead of freezing while drawing every key at once.
-- Fixed several clipped dashboard and workspace controls by laying out top actions, project creation controls, and review panels from the current window size.
-
-# RimWorld AI Translator v0.1.11
-
-## Changes
-
-- Rebuilt the GUI around local project management: project cards, activity history, global settings, and a per-project review workspace.
-- Added file grouping, string list filtering, status filters, search, progress stats, edit history, related glossary terms, memo, and issue tabs.
-- Added two local apply modes: reviewed-only apply and translated-plus-reviewed apply.
-- When a mod update changes a key's source text, the saved decision is demoted to untranslated and excluded from apply until reviewed again.
-- Added keyboard shortcuts: `Ctrl+S` save, `Ctrl+Enter` review and advance, `Alt+Up/Down` navigation.
-- The review workbench still writes `review-decisions.json`, so the existing apply workflow remains compatible.
-
-# RimWorld AI Translator v0.1.10
-
-## Changes
-
-- API keys are now optional in the GUI. Empty API input automatically uses Google Translate fallback.
-- Removed the review-only and overwrite checkboxes from the GUI.
-- GUI runs now always create review output first and open the review workbench on completion.
-- GUI review application applies only approved reviewed rows, replacing existing keys for those approved rows.
-- The mod browser now prefers active LoadFolders version paths such as `1.6` when a workshop root uses versioned folders.
-
-# RimWorld AI Translator v0.1.9
-
-## Changes
-
-- Added a left-side mod browser that auto-detects RimWorld workshop and local mod folders.
-- Reads mod names from `About\About.xml` and fills the mod path field when a mod is selected.
-- Added a refresh button and search box for the detected mod list.
-
-# RimWorld AI Translator v0.1.8
-
-## Changes
-
-- Added a local item-by-item review workbench for review-only results.
-- Review decisions are saved to `review-decisions.json` with approved, rejected, hold, and pending states.
-- Review application now prefers approved reviewed text when decisions exist, while keeping the previous safe-candidate fallback.
-
-# RimWorld AI Translator v0.1.7
-
-## Changes
-
-- Removed the batch-size dropdown and fixed GUI runs at the stable batch size of 40.
-
-# RimWorld AI Translator v0.1.6
-
-## Changes
-
-- Review-only runs now open the generated review folder automatically when they finish successfully.
-- Added a `검토 폴더 열기` button to reopen the latest review folder from the GUI.
-- The GUI log now points users to `_TranslationAudit\*-comparison.csv` for side-by-side review.
-
-# RimWorld AI Translator v0.1.5
-
-## Changes
-
-- Added an `Apply review results` workflow in the GUI so review-only candidates can be applied without calling the API again.
-- Added `Apply-RimWorldAiReviewResults.ps1` for CLI application of `safeToApply=true` comparison rows.
-- Review application respects the existing overwrite checkbox: unchecked keeps existing Korean keys, checked replaces them.
-
-# RimWorld AI Translator v0.1.4
-
-## Fixes
-
-- Reduced the default batch size from 80 to 40 to lower malformed JSON risk on long description-heavy mods.
-- Added automatic split retry: if a batch keeps returning malformed JSON or missing ids, it is retried as smaller half-batches down to single entries.
-- The GUI now hides raw model JSON dumps and repeated `\u000a` escape spam from the debug log.
-- Added prompt guardrails against padding blank lines and repeated newline escapes without imposing a hard translation length limit.
-
-# RimWorld AI Translator v0.1.3
-
-## Fixes
-
-- Shortened malformed model-response warnings so broken JSON is not dumped into the GUI log.
-- Treats pathological newline-spam translation candidates as unsafe writes and records them in audit/comparison output.
-
-# RimWorld AI Translator v0.1.2
-
-## Fixes
-
-- Fixed GUI API key parsing so multiple keys entered on separate lines are counted and passed to the translator correctly.
-- Fixed the Stop button so it terminates the translator process tree instead of only killing the intermediate command wrapper.
-
-## Documentation
-
-- Clarified that normal users enter Cerebras API keys directly in the GUI, one key per line, and do not need key files.
-- Documented that DLL/C# hardcoded runtime inspect strings, gizmo labels, and status text may require source changes or Harmony patches when the mod does not use RimWorld translation keys.
-
-# RimWorld AI Translator v0.1.1
-
-## Changes
-
-- Removed the `-ApiKeyFile` option and key-file documentation.
-- The GUI now passes API keys to the translator process through an environment variable instead of writing a temporary key file.
-- Removed `api-keys.example.txt` from the release package.
-
-# RimWorld AI Translator v0.1.0
-
-Initial public release.
-
-## Highlights
-
-- Windows GUI launcher for RimWorld mod translation.
-- Cerebras `gemma-4-31b` chat completions integration.
-- Free-tier defaults: 5 requests/min/key, 30k input tokens/min/key, 1M daily tokens/key.
-- Multiple API keys can be entered one per line and are rotated automatically.
-- Automatic source language folder detection for English, Chinese, Japanese, and other non-Korean RimWorld language folders.
-- Writes translations into `Languages\Korean` inside the selected mod folder.
-- Official RimWorld Core+DLC Korean glossary included as `glossary.generated.ko.json`.
-- Optional user glossary support via TXT, TSV, CSV, or JSON.
-- Dry run and review-only modes for safer checks before writing files.
-
-## Package
-
-Download `RimWorldAiTranslator.zip`, extract it, and run `RimWorldAiTranslator.exe`.
-
-Windows PowerShell, internet access, and a Cerebras API key are required.
+`RimWorldAiTranslator-v1.0.0.zip`을 압축 해제한 뒤 `RimWorldAiTranslator.exe`를 실행합니다.

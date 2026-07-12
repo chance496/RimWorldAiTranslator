@@ -1,0 +1,64 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{44C4FD8C-C6C1-46D6-AF27-EAF787F78B16}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.Native", "src\RimWorldAiTranslator.Native\RimWorldAiTranslator.Native.csproj", "{3DB4A7E8-3580-4AC1-86A9-B020D06DC7F4}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.Core", "src\RimWorldAiTranslator.Core\RimWorldAiTranslator.Core.csproj", "{A9C3849C-64CE-469C-B480-147D03037806}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.App", "src\RimWorldAiTranslator.App\RimWorldAiTranslator.App.csproj", "{3C8FE647-FE61-4BA7-AF27-688B1FF14D6E}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{8131235E-A452-4878-8973-DBDF9B0E8096}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.Tests", "tests\RimWorldAiTranslator.Tests\RimWorldAiTranslator.Tests.csproj", "{281F7E8F-C01B-49F4-908B-1CEDE0167384}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.UiHarness", "tests\RimWorldAiTranslator.UiHarness\RimWorldAiTranslator.UiHarness.csproj", "{6E2B46BB-D9AE-4DED-99F0-5AD1518DF1BA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.Benchmarks", "tests\RimWorldAiTranslator.Benchmarks\RimWorldAiTranslator.Benchmarks.csproj", "{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{3DB4A7E8-3580-4AC1-86A9-B020D06DC7F4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3DB4A7E8-3580-4AC1-86A9-B020D06DC7F4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3DB4A7E8-3580-4AC1-86A9-B020D06DC7F4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3DB4A7E8-3580-4AC1-86A9-B020D06DC7F4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A9C3849C-64CE-469C-B480-147D03037806}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A9C3849C-64CE-469C-B480-147D03037806}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A9C3849C-64CE-469C-B480-147D03037806}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A9C3849C-64CE-469C-B480-147D03037806}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3C8FE647-FE61-4BA7-AF27-688B1FF14D6E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3C8FE647-FE61-4BA7-AF27-688B1FF14D6E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3C8FE647-FE61-4BA7-AF27-688B1FF14D6E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3C8FE647-FE61-4BA7-AF27-688B1FF14D6E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{281F7E8F-C01B-49F4-908B-1CEDE0167384}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{281F7E8F-C01B-49F4-908B-1CEDE0167384}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{281F7E8F-C01B-49F4-908B-1CEDE0167384}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{281F7E8F-C01B-49F4-908B-1CEDE0167384}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6E2B46BB-D9AE-4DED-99F0-5AD1518DF1BA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6E2B46BB-D9AE-4DED-99F0-5AD1518DF1BA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6E2B46BB-D9AE-4DED-99F0-5AD1518DF1BA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6E2B46BB-D9AE-4DED-99F0-5AD1518DF1BA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{3DB4A7E8-3580-4AC1-86A9-B020D06DC7F4} = {44C4FD8C-C6C1-46D6-AF27-EAF787F78B16}
+		{A9C3849C-64CE-469C-B480-147D03037806} = {44C4FD8C-C6C1-46D6-AF27-EAF787F78B16}
+		{3C8FE647-FE61-4BA7-AF27-688B1FF14D6E} = {44C4FD8C-C6C1-46D6-AF27-EAF787F78B16}
+		{281F7E8F-C01B-49F4-908B-1CEDE0167384} = {8131235E-A452-4878-8973-DBDF9B0E8096}
+		{6E2B46BB-D9AE-4DED-99F0-5AD1518DF1BA} = {8131235E-A452-4878-8973-DBDF9B0E8096}
+		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4} = {8131235E-A452-4878-8973-DBDF9B0E8096}
+	EndGlobalSection
+EndGlobal
