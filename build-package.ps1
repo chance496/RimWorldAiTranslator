@@ -130,6 +130,8 @@ $packageFiles = @(
     "RimWorldAiTranslator.TranslationMemory.ps1",
     "RimWorldAiTranslator.Diagnostics.ps1",
     "RimWorldAiTranslator.ProjectCleanup.ps1",
+    "RimWorldAiTranslator.UiSystem.ps1",
+    "RimWorldAiTranslator.Quality.ps1",
     "Invoke-RimWorldAiTranslation.ps1",
     "Run-RimWorldAiTranslation.ps1",
     "Apply-RimWorldAiReviewResults.ps1",

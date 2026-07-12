@@ -92,6 +92,16 @@ if (-not (Test-Path -LiteralPath $diagnosticsScriptPath -PathType Leaf)) {
     throw "Diagnostic component was not found: $diagnosticsScriptPath"
 }
 . $diagnosticsScriptPath
+$uiSystemScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.UiSystem.ps1"
+if (-not (Test-Path -LiteralPath $uiSystemScriptPath -PathType Leaf)) {
+    throw "UI design component was not found: $uiSystemScriptPath"
+}
+. $uiSystemScriptPath
+$qualityScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.Quality.ps1"
+if (-not (Test-Path -LiteralPath $qualityScriptPath -PathType Leaf)) {
+    throw "Translation quality component was not found: $qualityScriptPath"
+}
+. $qualityScriptPath
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $script:powershellExe = $systemPowerShell

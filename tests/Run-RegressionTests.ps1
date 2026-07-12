@@ -1,6 +1,6 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [ValidateSet("All", "Harness", "Syntax", "StateStore", "SecretHandling", "ProviderValidation", "TranslationMemory", "Diagnostics", "ProjectCleanup", "DryRun", "SourceExtraction", "DefSafety", "DuplicateIdentity", "TokenSafety", "ApiResilience", "DirectOutput", "LocalApply", "LocalRollback", "RmkExport", "RmkHistory")]
+    [ValidateSet("All", "Harness", "Syntax", "StateStore", "SecretHandling", "ProviderValidation", "TranslationMemory", "Diagnostics", "UiTools", "ProjectCleanup", "DryRun", "SourceExtraction", "DefSafety", "DuplicateIdentity", "TokenSafety", "ApiResilience", "DirectOutput", "LocalApply", "LocalRollback", "RmkExport", "RmkHistory")]
     [string]$Suite = "All"
 )
 
@@ -1562,6 +1562,79 @@ function Test-DiagnosticBundlePrivacy {
     }
 }
 
+function Test-UiAndQualityTools {
+    . (Join-Path $script:RepoRoot "RimWorldAiTranslator.Validation.ps1")
+    . (Join-Path $script:RepoRoot "RimWorldAiTranslator.UiSystem.ps1")
+    . (Join-Path $script:RepoRoot "RimWorldAiTranslator.Quality.ps1")
+
+    $light = Get-RimWorldUiTokens -Mode Light
+    $dark = Get-RimWorldUiTokens -Mode Dark
+    $contrast = Get-RimWorldUiTokens -Mode Light -HighContrast
+    Assert-Equal "#B78342" ([string]$light.Colors.Accent) "Light theme accent token changed."
+    Assert-True (-not [string]::Equals([string]$light.Colors.Canvas, [string]$dark.Colors.Canvas, [System.StringComparison]::OrdinalIgnoreCase)) "Light and dark theme canvases are identical."
+    Assert-Equal "#FFFFFF" ([string]$contrast.Colors.Border) "High-contrast borders are not explicit."
+
+    $estimate = Get-RimWorldTranslationEstimate -Entries @(
+        [pscustomobject]@{ source = "abcdefghij"; translation = "" },
+        [pscustomobject]@{ source = "1234567890"; translation = "번역" },
+        [pscustomobject]@{ source = "source"; translation = "" }
+    ) -BatchSize 2
+    Assert-Equal 3 ([int]$estimate.Entries) "Translation estimate entry count changed."
+    Assert-Equal 2 ([int]$estimate.Batches) "Translation estimate batch count changed."
+    Assert-Equal 1 ([int]$estimate.TranslatedEntries) "Translation estimate translated count changed."
+    Assert-True ([long]$estimate.EstimatedInputTokensHigh -gt [long]$estimate.EstimatedInputTokensLow) "Translation token estimate range is inverted."
+
+    $progress = Get-RimWorldOperationStateFromLine "Translating batch 3/12 (40 entries)..."
+    Assert-Equal "translate" ([string]$progress.Stage) "Batch progress stage was not recognized."
+    Assert-Equal 3 ([int]$progress.Current) "Batch progress current value changed."
+    Assert-Equal 12 ([int]$progress.Total) "Batch progress total value changed."
+    Assert-True ([bool]$progress.IsDeterminate) "Known batch progress became indeterminate."
+    $scan = Get-RimWorldOperationStateFromLine "Source entries: 480"
+    Assert-True (-not [bool]$scan.IsDeterminate) "A source count was presented as fake completion progress."
+    $retry = Get-RimWorldOperationStateFromLine "WARNING: Batch 7/19 failed on attempt 1; retrying. HTTP 429"
+    Assert-Equal "retry" ([string]$retry.Kind) "Retry state was not classified."
+    $complete = Get-RimWorldOperationStateFromLine "Done."
+    Assert-Equal "completed" ([string]$complete.Kind) "Completion state was not classified."
+
+    $diff = Get-RimWorldSimpleDiff -Before "The old translation." -After "The new translation."
+    Assert-True ([bool]$diff.Changed) "Changed text was reported as equal."
+    Assert-Equal "old" ([string]$diff.BeforeChanged) "Before diff segment changed."
+    Assert-Equal "new" ([string]$diff.AfterChanged) "After diff segment changed."
+
+    $root = New-TestWorkspace
+    try {
+        $secretSource = "PRIVATE_SOURCE_BODY_201"
+        $secretTranslation = "PRIVATE_TRANSLATION_BODY_202"
+        $entries = @(
+            [pscustomobject]@{ index = 0; target = "Keyed\A.xml"; key = "A"; source = "Hello {0}"; translation = "안녕"; status = "translated"; safeToApply = $true },
+            [pscustomobject]@{ index = 1; target = "Keyed\B.xml"; key = "B"; source = "A sufficiently long source sentence for ratio checks"; translation = "짧"; status = "translated"; sourceChanged = $true; safeToApply = $true },
+            [pscustomobject]@{ index = 2; target = "Keyed\C.xml"; key = "C"; source = $secretSource; translation = $secretTranslation; status = "approved"; safeToApply = $false },
+            [pscustomobject]@{ index = 3; target = "Keyed\D.xml"; key = "D"; source = "Missing"; translation = ""; status = "untranslated"; safeToApply = $true },
+            [pscustomobject]@{ index = 4; target = "Keyed\A.xml"; key = "A"; source = "Duplicate"; translation = "중복"; status = "translated"; safeToApply = $true },
+            [pscustomobject]@{ index = 5; target = "Keyed\Other.xml"; key = "A"; source = "Same key, other target"; translation = "다른 파일"; status = "translated"; safeToApply = $true }
+        )
+        $issues = @(Get-RimWorldQualityIssues -Entries $entries)
+        Assert-Contains @($issues.Category) "TokenOrTag" "Protected-token issue was not detected."
+        Assert-Contains @($issues.Category) "SourceChanged" "Source-change issue was not detected."
+        Assert-Contains @($issues.Category) "TooShort" "Suspicious length issue was not detected."
+        Assert-Contains @($issues.Category) "Unsafe" "Unsafe translation was not detected."
+        Assert-Contains @($issues.Category) "Missing" "Missing translation was not detected."
+        Assert-Equal 2 @($issues | Where-Object Category -eq "DuplicateIdentity").Count "Duplicate identity must use target plus key."
+
+        $reportPath = Join-Path $root "quality-report.html"
+        [void](Export-RimWorldQualityReport -Path $reportPath -Entries $entries -Issues $issues)
+        $html = [System.IO.File]::ReadAllText($reportPath, [System.Text.Encoding]::UTF8)
+        Assert-True ($html.Contains("번역 품질 보고서")) "Quality report is not human readable."
+        foreach ($privateValue in @($secretSource, $secretTranslation, "csk-secret", "C:\\Private")) {
+            Assert-True (-not $html.Contains($privateValue)) "Quality report leaked private content: $privateValue"
+        }
+        [void](Export-RimWorldQualityReport -Path $reportPath -Entries $entries -Issues $issues)
+        Assert-True (Test-Path -LiteralPath ($reportPath + ".bak") -PathType Leaf) "Quality report replacement did not preserve a backup."
+    } finally {
+        Remove-TestWorkspace $root
+    }
+}
+
 $tests = @(
     [pscustomobject]@{ Name = "Harness.Isolation"; Suite = "Harness"; Body = { Test-HarnessIsolation } },
     [pscustomobject]@{ Name = "Syntax.PowerShell"; Suite = "Syntax"; Body = { Test-PowerShellSyntax } },
@@ -1570,6 +1643,7 @@ $tests = @(
     [pscustomobject]@{ Name = "Settings.ProviderValidation"; Suite = "ProviderValidation"; Body = { Test-ProviderConfigurationValidation } },
     [pscustomobject]@{ Name = "Review.TranslationMemory"; Suite = "TranslationMemory"; Body = { Test-TranslationMemorySuggestions } },
     [pscustomobject]@{ Name = "Diagnostics.Privacy"; Suite = "Diagnostics"; Body = { Test-DiagnosticBundlePrivacy } },
+    [pscustomobject]@{ Name = "Ui.QualityTools"; Suite = "UiTools"; Body = { Test-UiAndQualityTools } },
     [pscustomobject]@{ Name = "Project.CleanupBoundary"; Suite = "ProjectCleanup"; Body = { Test-ProjectCleanupBoundary } },
     [pscustomobject]@{ Name = "Translation.DryRun"; Suite = "DryRun"; Body = { Test-TranslationDryRun } },
     [pscustomobject]@{ Name = "Source.Extraction"; Suite = "SourceExtraction"; Body = { Test-SourceExtraction } },
