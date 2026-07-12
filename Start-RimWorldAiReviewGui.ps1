@@ -5,6 +5,10 @@
     [int]$LayoutSnapshotHeight = 0,
     [string]$InitialDashboardTab = "",
     [string]$InitialWorkspaceSideTab = "",
+    [ValidateSet("", "loading", "error", "cancelled", "completed")]
+    [string]$PreviewOperationState = "",
+    [switch]$PreviewTranslationPreflight,
+    [switch]$PreviewCommandPalette,
     [string]$PreviewTheme = "",
     [int]$PreviewTextSize = 0,
     [switch]$PreviewHighContrast,
@@ -30,6 +34,9 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
     if ($LayoutSnapshotHeight -gt 0) { $relaunchArguments += @("-LayoutSnapshotHeight", [string]$LayoutSnapshotHeight) }
     if ($InitialDashboardTab) { $relaunchArguments += @("-InitialDashboardTab", "`"$InitialDashboardTab`"") }
     if ($InitialWorkspaceSideTab) { $relaunchArguments += @("-InitialWorkspaceSideTab", "`"$InitialWorkspaceSideTab`"") }
+    if ($PreviewOperationState) { $relaunchArguments += @("-PreviewOperationState", "`"$PreviewOperationState`"") }
+    if ($PreviewTranslationPreflight) { $relaunchArguments += "-PreviewTranslationPreflight" }
+    if ($PreviewCommandPalette) { $relaunchArguments += "-PreviewCommandPalette" }
     if ($PreviewTheme) { $relaunchArguments += @("-PreviewTheme", "`"$PreviewTheme`"") }
     if ($PreviewTextSize -gt 0) { $relaunchArguments += @("-PreviewTextSize", [string]$PreviewTextSize) }
     if ($PreviewHighContrast) { $relaunchArguments += "-PreviewHighContrast" }
@@ -69,6 +76,27 @@ public static class RimWorldTranslatorNativeMethods
 {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+}
+"@
+}
+if (-not ("RimWorldTranslatorCaptureMethods" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential)]
+public struct RimWorldTranslatorCaptureRect
+{
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+}
+
+public static class RimWorldTranslatorCaptureMethods
+{
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RimWorldTranslatorCaptureRect value, int valueSize);
 }
 "@
 }
@@ -206,6 +234,14 @@ $script:processExitHandled = $false
 $script:translationLogFile = ""
 $script:translationLogOffset = 0L
 $script:translationLogPartial = ""
+$script:qualityEntries = @()
+$script:qualityIssues = $null
+$script:visibleQualityIssues = @()
+$script:qualityDirty = $true
+$script:lastQualityElapsedMs = 0
+$script:lastOperationState = $null
+$script:lastOperationType = ""
+$script:operationPulse = 0
 $script:tempFiles = New-Object "System.Collections.Generic.List[string]"
 $script:startedAt = $null
 $script:stopRequested = $false
@@ -650,27 +686,122 @@ function Read-NewProcessLogLines {
 }
 
 function Update-ProgressFromLine([string]$Line) {
-    if ($Line -match "Translating batch\s+(\d+)/(\d+)\s+\((\d+)\s+entries\)") {
-        $current = [int]$matches[1]
-        $total = [int]$matches[2]
-        if ($total -gt 0) {
-            $progressRun.Maximum = $total
-            $progressRun.Value = [Math]::Min($current, $total)
-            $lblRunStatus.Text = "번역 배치 $current / $total"
-        }
-    } elseif ($Line -match "^Review output:\s+(.+)$") {
+    $operation = Get-RimWorldOperationStateFromLine $Line
+    if ($operation.IsDeterminate -and $operation.Total -gt 0) {
+        $progressRun.Maximum = [int]$operation.Total
+        $progressRun.Value = [Math]::Min([int]$operation.Current, [int]$operation.Total)
+        $lblRunStatus.Text = "$($operation.Label) $($operation.Current) / $($operation.Total)"
+    } elseif ($operation.Stage -ne "activity") {
+        $lblRunStatus.Text = [string]$operation.Label
+    }
+    Update-OperationOverlay -Operation $operation -Line $Line
+
+    if ($Line -match "^Review output:\s+(.+)$") {
         $script:lastReviewOutputPath = $matches[1].Trim()
-        $lblRunStatus.Text = "검수 결과 생성됨"
     } elseif ($Line -match "^Translation provider:\s+(.+)$") {
         $script:lastProvider = $matches[1].Trim()
-        $lblRunStatus.Text = "번역 엔진: $($matches[1])"
-    } elseif ($Line -match "^Detected source language:\s+(.+)$") {
-        $lblRunStatus.Text = "원문 언어: $($matches[1])"
-    } elseif ($Line -match "^Pending(?: translation)? entries:\s+(.+)$") {
-        $lblRunStatus.Text = "번역 대상: $($matches[1])개"
-    } elseif ($Line -match "^Done\.$") {
+    }
+    if ($Line -match "^Done\.$") {
         if ($progressRun.Maximum -gt 0) { $progressRun.Value = $progressRun.Maximum }
-        $lblRunStatus.Text = "완료"
+    }
+}
+
+function Add-OperationOverlayLog([string]$Line) {
+    if (-not $txtOperationLog -or [string]::IsNullOrWhiteSpace($Line)) { return }
+    $safeLine = ConvertTo-GuiLogLine $Line
+    if ([string]::IsNullOrWhiteSpace($safeLine)) { return }
+    $lines = New-Object "System.Collections.Generic.List[string]"
+    foreach ($existing in @($txtOperationLog.Lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) { [void]$lines.Add([string]$existing) }
+    [void]$lines.Add($safeLine)
+    while ($lines.Count -gt 7) { $lines.RemoveAt(0) }
+    $txtOperationLog.Lines = $lines.ToArray()
+    $txtOperationLog.SelectionStart = $txtOperationLog.TextLength
+    $txtOperationLog.ScrollToCaret()
+}
+
+function Update-OperationOverlay {
+    param([object]$Operation, [string]$Line = "")
+    if (-not $operationOverlay -or -not $Operation) { return }
+    if ($Line) { Add-OperationOverlayLog $Line }
+    $script:lastOperationState = $Operation
+    $lblOperationStage.Text = [string]$Operation.Label
+    if ($Operation.Detail) { $lblOperationDetail.Text = [string]$Operation.Detail }
+    if ($Operation.IsDeterminate -and [int]$Operation.Total -gt 0) {
+        $progressOperation.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+        $progressOperation.MarqueeAnimationSpeed = 0
+        $progressOperation.Maximum = [int]$Operation.Total
+        $progressOperation.Value = [Math]::Min([int]$Operation.Current, [int]$Operation.Total)
+        $percent = [int][Math]::Round(100 * ([int]$Operation.Current / [double][int]$Operation.Total))
+        $lblOperationCount.Text = "$($Operation.Current) / $($Operation.Total) 배치  ·  ${percent}%"
+    } else {
+        if ([string]$Operation.Kind -notin @("completed", "cancelled", "error")) {
+            $progressOperation.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+            $progressOperation.MarqueeAnimationSpeed = 28
+        }
+        $lblOperationCount.Text = if ([int]$Operation.Total -gt 0) { "$($Operation.Total.ToString('N0'))개 확인" } else { "실제 작업 상태를 기다리는 중" }
+    }
+    if ($pnlOperationScan) { $pnlOperationScan.Invalidate() }
+}
+
+function Show-OperationOverlay([string]$Title, [string]$Detail, [string]$OperationType = "Translation") {
+    if (-not $operationOverlay) { return }
+    $script:lastOperationType = $OperationType
+    $script:operationReturnToDashboard = [bool]($dashboardPanel -and $dashboardPanel.Visible)
+    $script:operationPulse = 0
+    $txtOperationLog.Clear()
+    $lblOperationTitle.Text = $Title
+    $lblOperationStage.Text = "작업공간 확인"
+    $lblOperationDetail.Text = $Detail
+    $lblOperationCount.Text = "실제 작업 상태를 기다리는 중"
+    $progressOperation.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+    $progressOperation.MarqueeAnimationSpeed = 28
+    $btnOperationCancel.Visible = $true
+    $btnOperationCancel.Enabled = $true
+    $btnOperationRetry.Visible = $false
+    $btnOperationReview.Visible = $false
+    $btnOperationClose.Visible = $false
+    if ($dashboardPanel) { $dashboardPanel.Visible = $false }
+    if ($top) { $top.Visible = $false }
+    if ($main) { $main.Visible = $false }
+    $operationOverlay.Visible = $true
+    $operationOverlay.BringToFront()
+    Resize-OperationOverlay
+    [void]$btnOperationCancel.Focus()
+}
+
+function Complete-OperationOverlay([string]$Kind, [string]$Title, [string]$Detail) {
+    if (-not $operationOverlay) { return }
+    $progressOperation.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+    $progressOperation.MarqueeAnimationSpeed = 0
+    $progressOperation.Maximum = 100
+    $progressOperation.Value = if ($Kind -eq "completed") { 100 } else { 0 }
+    $lblOperationStage.Text = $Title
+    $lblOperationDetail.Text = $Detail
+    $lblOperationCount.Text = switch ($Kind) {
+        "completed" { "작업 결과가 로컬 검수 프로젝트에 저장됨" }
+        "cancelled" { "완료된 배치는 가능한 경우 보존됨" }
+        default { "로그에서 원인을 확인한 뒤 실패한 작업만 다시 시도할 수 있음" }
+    }
+    $btnOperationCancel.Visible = $false
+    $btnOperationRetry.Visible = $Kind -eq "error"
+    $btnOperationReview.Visible = [bool]($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath -PathType Container))
+    $btnOperationClose.Visible = $true
+    Resize-OperationOverlay
+    if ($pnlOperationScan) { $pnlOperationScan.Invalidate() }
+}
+
+function Hide-OperationOverlay {
+    if (-not $operationOverlay) { return }
+    $operationOverlay.Visible = $false
+    $progressOperation.MarqueeAnimationSpeed = 0
+    if ($script:operationReturnToDashboard) {
+        $dashboardPanel.Visible = $true
+        $dashboardPanel.BringToFront()
+    } else {
+        $top.Visible = $true
+        $main.Visible = $true
+        $main.BringToFront()
+        $top.BringToFront()
     }
 }
 
@@ -3700,6 +3831,10 @@ function Clear-CurrentView {
     $txtMeta.Text = ""
     $txtWarnings.Text = ""
     $txtHistory.Text = ""
+    if ($txtDiffSource) { $txtDiffSource.Text = "" }
+    if ($txtDiffBefore) { $txtDiffBefore.Text = "" }
+    if ($txtDiffAfter) { $txtDiffAfter.Text = "" }
+    if ($lblDiffSummary) { $lblDiffSummary.Text = "비교할 문자열을 선택하세요" }
     $txtTerms.Text = ""
     $txtMemo.Text = ""
     $lblCurrent.Text = "항목 없음"
@@ -3740,6 +3875,255 @@ function Set-HistoryView([string]$Source, [string]$Existing, [string]$Candidate,
     }
     $txtHistory.SelectionStart = 0
     $txtHistory.ScrollToCaret()
+    Update-TranslationDiffView -Source $Source -Existing $Existing -Candidate $Candidate -Translation $Translation -SourceChanged $SourceChanged
+}
+
+function Set-RichTextDiffHighlight {
+    param([System.Windows.Forms.RichTextBox]$Box, [string]$Text, [int]$Start, [int]$Length)
+    if (-not $Box) { return }
+    $Box.Text = [string]$Text
+    $Box.SelectAll()
+    $Box.SelectionBackColor = $Box.BackColor
+    $Box.SelectionColor = $script:textColor
+    if ($Length -gt 0 -and $Start -ge 0 -and ($Start + $Length) -le $Box.TextLength) {
+        $Box.Select($Start, $Length)
+        $Box.SelectionBackColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(91, 69, 37) } else { [System.Drawing.Color]::FromArgb(255, 229, 168) }
+        $Box.SelectionColor = $script:textColor
+    }
+    $Box.Select(0, 0)
+}
+
+function Update-TranslationDiffView {
+    param([string]$Source, [string]$Existing, [string]$Candidate, [string]$Translation, [bool]$SourceChanged = $false)
+    if (-not $txtDiffSource) { return }
+    $before = [string]$Existing
+    $beforeLabel = "기존 번역"
+    if ([string]::IsNullOrWhiteSpace($before) -and -not [string]::IsNullOrWhiteSpace($Candidate)) {
+        $before = [string]$Candidate
+        $beforeLabel = "AI 후보"
+    }
+    $diff = Get-RimWorldSimpleDiff -Before $before -After ([string]$Translation)
+    $txtDiffSource.Text = [string]$Source
+    $lblDiffBefore.Text = $beforeLabel
+    Set-RichTextDiffHighlight -Box $txtDiffBefore -Text $before -Start ([int]$diff.PrefixLength) -Length ([string]$diff.BeforeChanged).Length
+    Set-RichTextDiffHighlight -Box $txtDiffAfter -Text ([string]$Translation) -Start ([int]$diff.PrefixLength) -Length ([string]$diff.AfterChanged).Length
+    if ([string]::IsNullOrWhiteSpace($before) -and [string]::IsNullOrWhiteSpace($Translation)) {
+        $lblDiffSummary.Text = "비교할 번역이 없습니다"
+    } elseif (-not $diff.Changed) {
+        $lblDiffSummary.Text = $(if ($SourceChanged) { "번역은 같지만 원문이 변경되었습니다" } else { "기존 번역과 현재 번역이 같습니다" })
+    } else {
+        $changedSize = ([string]$diff.BeforeChanged).Length + ([string]$diff.AfterChanged).Length
+        $lblDiffSummary.Text = $(if ($SourceChanged) { "원문 변경됨  ·  번역 차이 ${changedSize}자" } else { "번역 차이 ${changedSize}자" })
+    }
+    $lblDiffSummary.ForeColor = if ($SourceChanged) { Get-UpdateColor } elseif ($diff.Changed) { $script:accentColor } else { $script:mutedColor }
+}
+
+function Get-CurrentQualityEntries {
+    $entries = New-Object "System.Collections.Generic.List[object]"
+    $hasDecisions = $script:decisions.Count -gt 0
+    for ($i = 0; $i -lt $script:rows.Count; $i++) {
+        $row = $script:rows[$i]
+        $decision = if ($hasDecisions) { Get-ExistingDecision $row } else { $null }
+        if ($decision) {
+            $translation = ConvertTo-FlatString $decision.text
+            $status = [string]$decision.status
+            $sourceChanged = ConvertTo-BoolValue $decision.sourceChanged
+        } else {
+            $candidate = ConvertTo-FlatString $row.candidate
+            $existing = ConvertTo-FlatString $row.existing
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                $translation = $candidate
+                $origin = if ($row.PSObject.Properties["translationOrigin"] -and $row.translationOrigin) { [string]$row.translationOrigin } else { "ai" }
+            } elseif (-not [string]::IsNullOrWhiteSpace($existing)) {
+                $translation = $existing
+                $origin = if ($row.PSObject.Properties["existingOrigin"] -and $row.existingOrigin) { [string]$row.existingOrigin } else { "existing" }
+            } else {
+                $translation = ""
+                $origin = ""
+            }
+            $sourceChanged = $origin -ne "ai" -and $row.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $row.rmkSourceChanged)
+            $status = if ([string]::IsNullOrWhiteSpace($translation) -or $sourceChanged) { "pending" } else { "translated" }
+        }
+        $safeToApply = $false
+        $tokenOrTagIssue = $false
+        if (-not [string]::IsNullOrWhiteSpace($translation)) {
+            $rowValidationStillApplies = -not $decision -and
+                $row.PSObject.Properties["safeToApply"] -and
+                [bool]$row.safeToApply
+            if ($rowValidationStillApplies) {
+                $safeToApply = $true
+            } else {
+                $validation = Get-CachedTranslationValidation -Row $row -Translation $translation
+                $safeToApply = [bool]$validation.SafeToApply
+                $tokenOrTagIssue = $validation.MissingTokens.Count -gt 0 -or
+                    $validation.UnexpectedTokens.Count -gt 0 -or
+                    $validation.TokenCountMismatches.Count -gt 0 -or
+                    [bool]$validation.GrammarPrefixMoved
+            }
+        }
+        $defClass = if ($row.PSObject.Properties["defClass"]) { [string]$row.defClass } else { "" }
+        if ([string]::IsNullOrWhiteSpace($defClass)) { $defClass = [string](Get-RowDefContext $row).DefClass }
+        [void]$entries.Add([pscustomobject]@{
+            index = $i
+            key = [string]$row.key
+            target = Get-RelativeTarget $row
+            defClass = $defClass
+            source = ConvertTo-FlatString $row.source
+            translation = $translation
+            existing = ConvertTo-FlatString $row.existing
+            status = $status
+            sourceChanged = $sourceChanged
+            safeToApply = $safeToApply
+            tokenOrTagIssue = $tokenOrTagIssue
+        })
+    }
+    return $entries.ToArray()
+}
+
+function Get-QualityCategoryText([string]$Category) {
+    switch ($Category) {
+        "Missing" { "미번역" }
+        "SourceChanged" { "원문 변경" }
+        "Unsafe" { "안전 실패" }
+        "TokenOrTag" { "토큰/태그" }
+        "SameAsSource" { "원문 동일" }
+        "TooShort" { "너무 짧음" }
+        "TooLong" { "너무 김" }
+        "ExistingChanged" { "기존과 다름" }
+        "DuplicateIdentity" { "중복 식별자" }
+        default { $Category }
+    }
+}
+
+function Test-QualityIssueVisible([object]$Issue, [string]$Filter) {
+    switch ($Filter) {
+        "오류" { return [string]$Issue.Severity -eq "error" }
+        "경고" { return [string]$Issue.Severity -eq "warning" }
+        "미번역" { return [string]$Issue.Category -eq "Missing" }
+        "원문 변경" { return [string]$Issue.Category -eq "SourceChanged" }
+        "토큰/태그" { return [string]$Issue.Category -in @("TokenOrTag", "Unsafe") }
+        "길이 이상" { return [string]$Issue.Category -in @("TooShort", "TooLong") }
+        "원문과 동일" { return [string]$Issue.Category -eq "SameAsSource" }
+        "중복 식별자" { return [string]$Issue.Category -eq "DuplicateIdentity" }
+        default { return $true }
+    }
+}
+
+function New-QualityListViewItem([object]$Issue) {
+    $severityText = switch ([string]$Issue.Severity) { "error" { "오류" } "warning" { "경고" } default { "참고" } }
+    $item = [System.Windows.Forms.ListViewItem]::new($severityText)
+    [void]$item.SubItems.Add((Get-QualityCategoryText ([string]$Issue.Category)))
+    $key = if ($Issue.Key) { [string]$Issue.Key } elseif ([int]$Issue.Index -ge 0 -and [int]$Issue.Index -lt $script:rows.Count) { [string]$script:rows[[int]$Issue.Index].key } else { "-" }
+    [void]$item.SubItems.Add($key)
+    $item.Tag = $Issue
+    $item.ForeColor = switch ([string]$Issue.Severity) {
+        "error" { if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(240, 125, 118) } else { [System.Drawing.Color]::FromArgb(157, 55, 51) } }
+        "warning" { Get-UpdateColor }
+        default { $script:textColor }
+    }
+    return $item
+}
+
+function Get-SelectedQualityIssue {
+    if (-not $lvQualityIssues -or $lvQualityIssues.SelectedIndices.Count -eq 0) { return $null }
+    $index = [int]$lvQualityIssues.SelectedIndices[0]
+    if ($index -lt 0 -or $index -ge $script:visibleQualityIssues.Count) { return $null }
+    return $script:visibleQualityIssues[$index]
+}
+
+function Refresh-QualityCenter([switch]$Force) {
+    if (-not $lvQualityIssues) { return }
+    if ($Force -or $script:qualityDirty -or $null -eq $script:qualityIssues) {
+        $qualityTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $script:qualityEntries = @(Get-CurrentQualityEntries)
+        $script:qualityIssues = @(Get-RimWorldQualityIssues -Entries $script:qualityEntries)
+        $qualityTimer.Stop()
+        $script:lastQualityElapsedMs = [Math]::Round($qualityTimer.Elapsed.TotalMilliseconds, 1)
+        $script:qualityDirty = $false
+    }
+    $filter = if ($cmbQualityCategory.SelectedItem) { [string]$cmbQualityCategory.SelectedItem } else { "전체 문제" }
+    $visibleIssues = New-Object "System.Collections.Generic.List[object]"
+    $errorCount = 0
+    $warningCount = 0
+    foreach ($issue in $script:qualityIssues) {
+        if ([string]$issue.Severity -eq "error") { $errorCount++ }
+        elseif ([string]$issue.Severity -eq "warning") { $warningCount++ }
+        if (Test-QualityIssueVisible $issue $filter) { [void]$visibleIssues.Add($issue) }
+    }
+    $script:visibleQualityIssues = $visibleIssues.ToArray()
+    $elapsedText = if ($script:lastQualityElapsedMs -gt 0) { "  ·  검사 $([Math]::Round($script:lastQualityElapsedMs / 1000, 1))초" } else { "" }
+    $lblQualitySummary.Text = "전체 $($script:rows.Count.ToString('N0'))개  ·  오류 $errorCount  ·  경고 $warningCount  ·  표시 $($script:visibleQualityIssues.Count)$elapsedText"
+    $lvQualityIssues.BeginUpdate()
+    try {
+        $lvQualityIssues.SelectedIndices.Clear()
+        $lvQualityIssues.VirtualListSize = $script:visibleQualityIssues.Count
+        $lvQualityIssues.Invalidate()
+    } finally {
+        $lvQualityIssues.EndUpdate()
+    }
+    $btnQualityJump.Enabled = $false
+    $txtWarnings.Clear()
+}
+
+function Invoke-QualityCenterRefresh([switch]$Force) {
+    $needsAnalysis = $Force -or $script:qualityDirty -or $null -eq $script:qualityIssues
+    if (-not $needsAnalysis) {
+        Refresh-QualityCenter
+        return
+    }
+    $lblQualitySummary.Text = "$($script:rows.Count.ToString('N0'))개 문자열의 토큰·상태·길이를 검사하는 중"
+    $lvQualityIssues.VirtualListSize = 0
+    $btnQualityJump.Enabled = $false
+    $form.UseWaitCursor = $true
+    [System.Windows.Forms.Application]::DoEvents()
+    try {
+        Refresh-QualityCenter -Force:$Force
+    } finally {
+        $form.UseWaitCursor = $false
+    }
+}
+
+function Show-SelectedQualityIssue {
+    $issue = Get-SelectedQualityIssue
+    if (-not $issue) { return }
+    $txtWarnings.Text = "$(Get-QualityCategoryText ([string]$issue.Category))`r`n$([string]$issue.Detail)"
+    $btnQualityJump.Enabled = [int]$issue.Index -ge 0 -and [int]$issue.Index -lt $script:rows.Count
+}
+
+function Jump-ToSelectedQualityIssue {
+    $issue = Get-SelectedQualityIssue
+    if (-not $issue) { return }
+    $rowIndex = [int]$issue.Index
+    if ($rowIndex -lt 0 -or $rowIndex -ge $script:rows.Count) { return }
+    $cmbStatus.SelectedIndex = 0
+    $txtSearch.Text = ""
+    if ($searchTimer) { $searchTimer.Stop() }
+    Refresh-ItemList -SelectRowIndex $rowIndex
+    Select-RowIndex $rowIndex
+    [void]$txtTranslation.Focus()
+}
+
+function Export-QualityReport {
+    if (-not $script:reviewRoot -or $script:rows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("보고서를 만들 검수 프로젝트가 없습니다.", "품질 보고서") | Out-Null
+        return
+    }
+    Refresh-QualityCenter -Force
+    $dialog = [System.Windows.Forms.SaveFileDialog]::new()
+    $dialog.Title = "개인정보 보호 품질 보고서 저장"
+    $dialog.Filter = "HTML 보고서 (*.html)|*.html"
+    $dialog.DefaultExt = "html"
+    $dialog.AddExtension = $true
+    $dialog.OverwritePrompt = $true
+    $dialog.FileName = "translation-quality-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".html"
+    try {
+        if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $result = Export-RimWorldQualityReport -Path $dialog.FileName -Entries $script:qualityEntries -Issues $script:qualityIssues
+        Add-Log "품질 보고서를 저장했습니다. 집계 수치만 포함하며 원문·번역문·API 키·절대 경로는 제외했습니다."
+        [System.Windows.Forms.MessageBox]::Show("품질 보고서를 저장했습니다.`r`n`r`n$($result.Path)`r`n`r`n원문, 번역문, API 키와 절대 경로는 포함하지 않습니다.", "품질 보고서", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } finally {
+        $dialog.Dispose()
+    }
 }
 
 function Select-RowIndex([int]$Index) {
@@ -3855,6 +4239,7 @@ function Update-RenderedItemCard([int]$RowIndex) {
 
 function Invalidate-TranslationMemoryCache {
     $script:translationMemoryCache = @{}
+    $script:qualityDirty = $true
 }
 
 function Get-TranslationMemorySuggestionsForRow([object]$Row) {
@@ -4371,58 +4756,129 @@ function Get-ExistingProjectTranslationInfo([string]$ModRoot, [string]$RmkRefere
     }
 }
 
-function Select-AiTranslationMode([object]$ExistingInfo) {
-    if (-not $ExistingInfo -or -not $ExistingInfo.HasExistingTranslation) { return "Overwrite" }
-
+function Select-AiTranslationMode {
+    param([object]$ExistingInfo, [switch]$PreviewOnly)
     $dialog = [System.Windows.Forms.Form]::new()
-    $dialog.Text = "AI 번역 방식 선택"
+    $dialog.Text = "번역 작업 준비"
     $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
     $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $dialog.ClientSize = [System.Drawing.Size]::new(680, 278)
+    $dialog.ClientSize = [System.Drawing.Size]::new(760, 512)
     $dialog.MinimizeBox = $false
     $dialog.MaximizeBox = $false
     $dialog.ShowInTaskbar = $false
     $dialog.ShowIcon = $false
     $dialog.BackColor = $script:surfaceColor
     $dialog.Font = New-Font 9
-    $dialog.Tag = "Cancel"
+    $hasExisting = $ExistingInfo -and [bool]$ExistingInfo.HasExistingTranslation
+    $dialog.Tag = if ($hasExisting) { "MissingOnly" } else { "Overwrite" }
 
     $accent = [System.Windows.Forms.Panel]::new()
-    $accent.SetBounds(0, 0, 680, 4)
+    $accent.SetBounds(0, 0, 760, 4)
     $accent.BackColor = $script:accentColor
 
-    $title = New-Label "기존 번역을 어떻게 처리할까요?" 28 24 620 30 $script:textColor 13 ([System.Drawing.FontStyle]::Bold)
-    $bodyText = "검수 프로젝트 번역 $($ExistingInfo.ReviewTranslationCount)개 · 모드 Korean XML $($ExistingInfo.KoreanFileCount)개 · RMK XML $($ExistingInfo.RmkFileCount)개`r`n`r`n덮어씌우기는 모든 문자열의 후보를 다시 만들고, 미번역 부분만 번역하기는 기존 번역을 보존합니다."
-    $body = New-Label $bodyText 28 66 624 86 $script:mutedColor 9.5
-    $body.AutoEllipsis = $false
+    $title = New-Label "번역 작업 준비" 30 24 520 32 $script:textColor 14 ([System.Drawing.FontStyle]::Bold)
+    $subtitle = New-Label "외부 전송 범위와 저장 방식을 확인한 뒤 시작합니다." 30 58 620 22 $script:mutedColor 9
+
+    $summary = [System.Windows.Forms.Panel]::new()
+    $summary.SetBounds(30, 96, 700, 178)
+    $summary.BackColor = if ($script:uiTokens) { ConvertTo-RimWorldUiColor $script:uiTokens.Colors.SurfaceMuted } else { $script:surfaceColor }
+    $summary.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+    $project = Get-SelectedProject
+    $projectName = if ($project) { [string]$project.name } else { "선택한 프로젝트" }
+    $sourceLanguage = Get-SelectedProjectSourceLanguage
+    $profile = Get-ApiProviderProfile
+    $config = Get-SelectedApiProviderConfig
+    $keyCount = if ($profile -and [string]$profile.Provider -ne "Google") { @(Get-ApiKeyLines ([string]$script:apiProviderKeys[$script:selectedApiProviderId])).Count } else { 0 }
+    $usesFallback = $profile -and [string]$profile.Provider -ne "Google" -and $keyCount -eq 0
+    $providerText = if ($usesFallback) { "Google 번역 (키 없음 대체)" } elseif ($profile) { [string]$profile.Name } else { "설정 확인 필요" }
+    $modelText = if ($usesFallback -or ($profile -and [string]$profile.Provider -eq "Google")) { "Google Translate" } elseif ($config) { [string]$config.model } else { "-" }
+    $estimate = Get-RimWorldTranslationEstimate -Entries @($script:rows) -BatchSize 40
+    $targetText = if ($estimate.Entries -gt 0) { "$($estimate.Entries.ToString('N0'))개 · 최대 $($estimate.Batches.ToString('N0'))배치" } else { "원문 분석 후 확정" }
+    $tokenText = if ($estimate.Entries -eq 0) {
+        "원문 분석 후 계산"
+    } elseif ($usesFallback -or ($profile -and [string]$profile.Provider -eq "Google")) {
+        "Google 번역 · API 토큰 추정 해당 없음"
+    } else {
+        "약 $($estimate.EstimatedInputTokensLow.ToString('N0')) ~ $($estimate.EstimatedInputTokensHigh.ToString('N0')) 입력 토큰"
+    }
+    $summaryRows = @(
+        [pscustomobject]@{ Label = "프로젝트"; Value = $projectName },
+        [pscustomobject]@{ Label = "원문 기준"; Value = $sourceLanguage },
+        [pscustomobject]@{ Label = "번역 엔진"; Value = "$providerText · $modelText" },
+        [pscustomobject]@{ Label = "예상 범위"; Value = $targetText },
+        [pscustomobject]@{ Label = "사용량 추정"; Value = $tokenText }
+    )
+    $rowY = 14
+    foreach ($summaryRow in $summaryRows) {
+        $rowLabel = New-Label ([string]$summaryRow.Label) 16 $rowY 94 24 $script:mutedColor 8.5 ([System.Drawing.FontStyle]::Bold)
+        $rowValue = New-Label ([string]$summaryRow.Value) 112 $rowY 564 24 $script:textColor 9
+        $rowValue.AutoEllipsis = $true
+        $summary.Controls.AddRange(@($rowLabel, $rowValue))
+        $rowY += 31
+    }
+
+    $privacyBand = [System.Windows.Forms.Panel]::new()
+    $privacyBand.SetBounds(30, 286, 700, 52)
+    $privacyBand.BackColor = if ($script:uiTokens) { ConvertTo-RimWorldUiColor $script:uiTokens.Colors.Selection } else { $script:surfaceColor }
+    $privacyTitle = New-Label "검수 프로젝트에 먼저 저장" 16 7 220 20 $script:textColor 8.8 ([System.Drawing.FontStyle]::Bold)
+    $privacyBody = New-Label "번역 실행만으로 원본 모드나 Korean 폴더를 수정하지 않습니다. 적용은 검토 화면에서 별도로 실행합니다." 16 27 660 18 $script:mutedColor 8.2
+    $privacyBand.Controls.AddRange(@($privacyTitle, $privacyBody))
+
+    $modeTitle = New-Label "번역 범위" 30 354 180 22 $script:textColor 9 ([System.Drawing.FontStyle]::Bold)
+    $btnMissingOnly = New-Button "미번역 부분만" $script:surfaceColor
+    $btnMissingOnly.SetBounds(30, 382, 180, 42)
+    $btnOverwrite = New-Button "전체 다시 번역" $script:surfaceColor
+    $btnOverwrite.SetBounds(218, 382, 180, 42)
+    $modeHint = New-Label "" 414 382 316 44 $script:mutedColor 8.3
+
+    $refreshMode = {
+        $missingSelected = [string]$dialog.Tag -eq "MissingOnly"
+        foreach ($modeButton in @($btnMissingOnly, $btnOverwrite)) {
+            $selected = ($modeButton -eq $btnMissingOnly -and $missingSelected) -or ($modeButton -eq $btnOverwrite -and -not $missingSelected)
+            $modeButton.BackColor = if ($selected) { $script:accentColor } else { $script:surfaceColor }
+            $modeButton.ForeColor = if ($selected) { $script:accentTextColor } else { $script:textColor }
+            $modeButton.FlatAppearance.BorderColor = if ($selected) { $script:accentColor } else { $script:borderColor }
+            $modeButton.FlatAppearance.BorderSize = 1
+        }
+        $modeHint.Text = if ($missingSelected) {
+            if ($hasExisting) { "기존 번역과 직접 편집한 내용은 보존하고 빈 항목만 번역합니다." } else { "현재 보존할 번역이 없어 모든 미번역 항목이 대상입니다." }
+        } else {
+            if ($hasExisting) { "기존 후보를 새 결과로 교체합니다. 이전 작업 이력은 보존됩니다." } else { "현재 원문 전체의 초벌 번역 후보를 생성합니다." }
+        }
+    }
+    $btnMissingOnly.Add_Click({ $dialog.Tag = "MissingOnly"; & $refreshMode })
+    $btnOverwrite.Add_Click({ $dialog.Tag = "Overwrite"; & $refreshMode })
+    & $refreshMode
 
     $divider = [System.Windows.Forms.Panel]::new()
-    $divider.SetBounds(28, 164, 624, 1)
-    $divider.BackColor = [System.Drawing.Color]::FromArgb(120, $script:mutedColor)
+    $divider.SetBounds(30, 442, 700, 1)
+    $divider.BackColor = $script:borderColor
 
-    $btnOverwrite = New-Button "덮어씌우기" $script:accentColor
-    $btnOverwrite.ForeColor = [System.Drawing.Color]::White
-    $btnOverwrite.SetBounds(68, 192, 150, 46)
-    $btnMissingOnly = New-Button "미번역 부분만 번역하기" ([System.Drawing.Color]::FromArgb(42, 139, 86))
-    $btnMissingOnly.ForeColor = [System.Drawing.Color]::White
-    $btnMissingOnly.SetBounds(230, 192, 260, 46)
+    $btnStart = New-Button "번역 시작" $script:accentColor
+    $btnStart.ForeColor = $script:accentTextColor
+    $btnStart.SetBounds(486, 456, 132, 40)
     $btnCancel = New-Button "취소" $script:surfaceColor
     $btnCancel.ForeColor = $script:textColor
-    $btnCancel.FlatAppearance.BorderColor = $script:mutedColor
+    $btnCancel.FlatAppearance.BorderColor = $script:borderColor
     $btnCancel.FlatAppearance.BorderSize = 1
-    $btnCancel.SetBounds(502, 192, 110, 46)
+    $btnCancel.SetBounds(628, 456, 102, 40)
 
-    Set-AccessibleControl $btnOverwrite "기존 번역 덮어씌우기" "모든 문자열을 다시 번역하고 새 후보로 교체합니다." 0
-    Set-AccessibleControl $btnMissingOnly "미번역 부분만 번역하기" "기존 번역은 보존하고 번역이 없는 문자열만 번역합니다." 1
-    Set-AccessibleControl $btnCancel "AI 번역 취소" "번역을 시작하지 않고 창을 닫습니다." 2
+    Set-AccessibleControl $btnMissingOnly "미번역 부분만 번역" "기존 번역은 보존하고 번역이 없는 문자열만 번역 대상으로 선택합니다." 0
+    Set-AccessibleControl $btnOverwrite "전체 다시 번역" "모든 문자열을 다시 번역하고 새 후보로 교체합니다." 1
+    Set-AccessibleControl $btnStart "확인한 범위로 번역 시작" "표시된 제공자와 번역 범위로 초벌 번역을 시작합니다." 2
+    Set-AccessibleControl $btnCancel "번역 준비 취소" "외부 전송 없이 창을 닫습니다." 3
 
-    $btnOverwrite.Add_Click({ $dialog.Tag = "Overwrite"; $dialog.Close() })
-    $btnMissingOnly.Add_Click({ $dialog.Tag = "MissingOnly"; $dialog.Close() })
+    $btnStart.Add_Click({ $dialog.Close() })
     $btnCancel.Add_Click({ $dialog.Tag = "Cancel"; $dialog.Close() })
-    $dialog.AcceptButton = $btnMissingOnly
+    $dialog.AcceptButton = $btnStart
     $dialog.CancelButton = $btnCancel
-    $dialog.Controls.AddRange(@($accent, $title, $body, $divider, $btnOverwrite, $btnMissingOnly, $btnCancel))
+    $dialog.Controls.AddRange(@($accent, $title, $subtitle, $summary, $privacyBand, $modeTitle, $btnMissingOnly, $btnOverwrite, $modeHint, $divider, $btnStart, $btnCancel))
 
+    if ($PreviewOnly) {
+        $dialog.Show($form)
+        return $dialog
+    }
     try {
         if ($form -and -not $form.IsDisposed -and $form.Visible) {
             [void]$dialog.ShowDialog($form)
@@ -4628,13 +5084,18 @@ function Start-Translation {
     $progressRun.Maximum = 100
     $lblRunStatus.Text = "실행 준비 중"
     Set-TranslationRunning $true
+    Show-OperationOverlay -Title "초벌 번역 실행" -Detail "$($effectiveProviderConfig.name) · $sourceLanguage 원문 · 검수 프로젝트에만 저장" -OperationType "Translation"
     try {
         [void]$proc.Start()
         Add-Log "번역 프로세스 PID=$($proc.Id)"
     } catch {
         Add-Log "실행 실패: $($_.Exception.Message)"
+        try { $proc.Dispose() } catch {}
+        $script:process = $null
+        $script:processExitHandled = $true
         $script:activeAiTranslationMode = ""
         Set-TranslationRunning $false
+        Complete-OperationOverlay -Kind "error" -Title "번역 프로세스를 시작하지 못했습니다" -Detail $_.Exception.Message
     }
 }
 
@@ -4644,6 +5105,11 @@ function Stop-Translation {
         $script:stopRequestedAt = Get-Date
         $btnStop.Enabled = $false
         $lblRunStatus.Text = "중지 요청 중"
+        if ($operationOverlay -and $operationOverlay.Visible) {
+            $lblOperationStage.Text = "안전하게 중지하는 중"
+            $lblOperationDetail.Text = "완료된 배치를 검수 프로젝트에 남긴 뒤 프로세스를 종료합니다."
+            $btnOperationCancel.Enabled = $false
+        }
         Add-Log "사용자 요청으로 중지합니다. 완료된 배치는 보존합니다."
         try {
             if ([string]::IsNullOrWhiteSpace($script:cancellationFile)) { throw "Cancellation signal path is missing." }
@@ -4850,14 +5316,19 @@ function Load-SourceOnlyForSelectedMod {
     $progressRun.Maximum = 100
     $lblRunStatus.Text = "원문 로드 중"
     Set-TranslationRunning $true
+    Show-OperationOverlay -Title "모드 원문 분석" -Detail "$sourceLanguage 원문과 기존 번역 이력을 비교합니다." -OperationType "SourceOnly"
     try {
         [void]$proc.Start()
         Add-Log "원문 로드 프로세스 PID=$($proc.Id)"
     } catch {
         Add-Log "원문 로드 실행 실패: $($_.Exception.Message)"
+        try { $proc.Dispose() } catch {}
+        $script:process = $null
+        $script:processExitHandled = $true
         $script:activeAiTranslationMode = ""
         $lblRunStatus.Text = "원문 로드 실패"
         Set-TranslationRunning $false
+        Complete-OperationOverlay -Kind "error" -Title "원문 분석을 시작하지 못했습니다" -Detail $_.Exception.Message
     }
 }
 
@@ -5109,6 +5580,21 @@ function Open-ProjectWorkspace([object]$Project) {
 function Refresh-DashboardProjects {
     if (-not $flowDashboardProjects) { return }
     $filter = if ($txtDashboardSearch) { $txtDashboardSearch.Text.Trim().ToLowerInvariant() } else { "" }
+    $providerProfile = Get-ApiProviderProfile
+    $providerKeys = if ($script:apiProviderKeys.ContainsKey($script:selectedApiProviderId)) { Get-ApiProviderKeyCount ([string]$script:apiProviderKeys[$script:selectedApiProviderId]) } else { 0 }
+    if ($lblDashProviderStatus -and $providerProfile) {
+        if ([string]$providerProfile.Provider -eq "Google") {
+            $lblDashProviderStatus.Text = "번역 엔진  ·  Google 번역"
+            $lblDashProviderHint.Text = "API 키 없이 실행 · 용어집과 추가 프롬프트는 미지원"
+        } elseif ($providerKeys -gt 0) {
+            $config = Get-SelectedApiProviderConfig
+            $lblDashProviderStatus.Text = "번역 엔진  ·  $($providerProfile.Name)"
+            $lblDashProviderHint.Text = "키 $providerKeys개 · $([string]$config.model) · 키는 저장하지 않음"
+        } else {
+            $lblDashProviderStatus.Text = "번역 엔진  ·  Google 대체 사용"
+            $lblDashProviderHint.Text = "$($providerProfile.Name) 키 없음 · 설정에서 키 입력 가능"
+        }
+    }
     $projectRevision = [string]::Join(";", @($script:projects | ForEach-Object { "$($_.id):$($_.updatedAt):$($_.latestReviewRoot)" }))
     $availableWidth = [Math]::Max(320, $flowDashboardProjects.ClientSize.Width - 20)
     $columnCount = [Math]::Max(1, [Math]::Min(4, [int][Math]::Floor($availableWidth / 360)))
@@ -5116,11 +5602,7 @@ function Refresh-DashboardProjects {
     $cardInnerWidth = $cardWidth - 44
     $renderKey = "$filter|$($script:themeMode)|$(Get-IsWindowsDarkMode)|$($script:highContrast)|$($script:textSize)|$availableWidth|$projectRevision"
     if (-not $script:dashboardProjectsDirty -and $script:lastDashboardRenderKey -eq $renderKey) { return }
-    $projectAccent = if ($script:highContrast) {
-        if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(224, 177, 92) } else { [System.Drawing.Color]::FromArgb(119, 77, 22) }
-    } else {
-        if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(190, 150, 92) } else { [System.Drawing.Color]::FromArgb(166, 124, 70) }
-    }
+    $projectAccent = if ($script:accentColor) { $script:accentColor } else { [System.Drawing.Color]::FromArgb(166, 124, 70) }
     $deleteColor = if (Get-IsWindowsDarkMode) { [System.Drawing.Color]::FromArgb(139, 67, 62) } else { [System.Drawing.Color]::FromArgb(151, 71, 65) }
     $renderSucceeded = $false
     $flowDashboardProjects.SuspendLayout()
@@ -5133,8 +5615,56 @@ function Refresh-DashboardProjects {
         })
 
         if ($matchingProjects.Count -eq 0) {
-            $empty = New-Label "아직 프로젝트가 없습니다. 감지된 모드를 선택해 프로젝트를 만들거나 폴더를 직접 추가하세요." 12 12 820 34 $script:itemMuted 10
-            $flowDashboardProjects.Controls.Add($empty)
+            $emptyWidth = [Math]::Max(560, $availableWidth - 24)
+            $emptyPanel = [System.Windows.Forms.Panel]::new()
+            $emptyPanel.Size = [System.Drawing.Size]::new($emptyWidth, 248)
+            $emptyPanel.Margin = [System.Windows.Forms.Padding]::new(10, 8, 10, 8)
+            $emptyPanel.BackColor = $script:surfaceColor
+            $emptyPanel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+            $scan = [System.Windows.Forms.Panel]::new()
+            $scan.SetBounds(28, 26, 160, 160)
+            $scan.BackColor = [System.Drawing.Color]::Transparent
+            $scan.TabStop = $false
+            $scan.Add_Paint({
+                param($sender, $eventArgs)
+                $graphics = $eventArgs.Graphics
+                $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+                $accentPen = [System.Drawing.Pen]::new($script:accentColor, 2)
+                $softPen = [System.Drawing.Pen]::new($script:borderColor, 1)
+                $dotBrush = [System.Drawing.SolidBrush]::new($script:accentColor)
+                try {
+                    foreach ($size in @(132, 92, 52)) {
+                        $offset = [int]((150 - $size) / 2)
+                        $graphics.DrawEllipse($softPen, $offset, $offset, $size, $size)
+                    }
+                    $graphics.DrawLine($softPen, 75, 3, 75, 147)
+                    $graphics.DrawLine($softPen, 3, 75, 147, 75)
+                    $graphics.DrawArc($accentPen, 9, 9, 132, 132, 294, 52)
+                    $graphics.FillEllipse($dotBrush, 104, 45, 9, 9)
+                    $graphics.FillEllipse($dotBrush, 48, 101, 6, 6)
+                } finally {
+                    $dotBrush.Dispose(); $softPen.Dispose(); $accentPen.Dispose()
+                }
+            })
+            $emptyTitle = New-Label "첫 번역 프로젝트를 준비하세요" 218 34 ([Math]::Max(280, $emptyWidth - 250)) 32 $script:itemText 13 ([System.Drawing.FontStyle]::Bold)
+            $emptyBody = New-Label "위에서 감지된 모드를 고르면 프로젝트와 원문 언어를 연결합니다.`r`n원본 모드는 읽기 전용으로 분석하며, 번역은 검수 프로젝트에 먼저 저장됩니다." 218 78 ([Math]::Max(280, $emptyWidth - 250)) 54 $script:itemMuted 9
+            $detectedCount = if ($script:modCatalog) { @($script:modCatalog).Count } else { 0 }
+            $emptyStatus = New-Label "감지된 모드 $detectedCount개  ·  프로젝트 데이터는 로컬에만 저장" 218 142 ([Math]::Max(280, $emptyWidth - 250)) 24 $script:itemSubtle 8.3 ([System.Drawing.FontStyle]::Bold)
+            $emptyCreate = New-Button "선택한 모드로 시작" $projectAccent
+            $emptyCreate.ForeColor = if ($script:accentTextColor) { $script:accentTextColor } else { [System.Drawing.Color]::White }
+            $emptyCreate.SetBounds(218, 178, 154, 38)
+            $emptyCreate.Enabled = $null -ne $cmbDashboardMods.SelectedItem
+            Set-AccessibleControl $emptyCreate "선택한 모드로 첫 프로젝트 만들기" "프로젝트 대상 모드 목록에서 선택한 모드로 번역 프로젝트를 만듭니다." 0
+            $emptyCreate.Add_Click({ $btnDashboardAddMod.PerformClick() })
+            $emptyChoose = New-Button "폴더에서 찾기" $script:surfaceColor
+            $emptyChoose.ForeColor = $script:textColor
+            $emptyChoose.FlatAppearance.BorderColor = $script:borderColor
+            $emptyChoose.SetBounds(382, 178, 118, 38)
+            Set-AccessibleControl $emptyChoose "모드 폴더에서 첫 프로젝트 만들기" "자동 감지되지 않은 RimWorld 모드 폴더를 직접 선택합니다." 1
+            $emptyChoose.Add_Click({ $btnDashboardChooseMod.PerformClick() })
+            $emptyPanel.Controls.AddRange(@($scan, $emptyTitle, $emptyBody, $emptyStatus, $emptyCreate, $emptyChoose))
+            [void]$flowDashboardProjects.Controls.Add($emptyPanel)
             $renderSucceeded = $true
             return
         }
@@ -5152,7 +5682,7 @@ function Refresh-DashboardProjects {
 
             $name = [string]$project.name
             $accentLine = [System.Windows.Forms.Panel]::new()
-            $accentLine.SetBounds(0, 0, 4, 204)
+            $accentLine.SetBounds(0, 0, 4, [Math]::Max(1, $card.Height - 2))
             $accentLine.BackColor = $projectAccent
             $lblName = New-Label $name 22 18 $cardInnerWidth 26 $script:itemText 11.5 ([System.Drawing.FontStyle]::Bold)
             $lblName.AutoEllipsis = $true
@@ -5183,7 +5713,7 @@ function Refresh-DashboardProjects {
 
             $lblTime = New-Label ("최근 작업 " + (Format-LocalTimeText ([string]$project.latestReviewAt))) 22 170 ([Math]::Max(110, $cardWidth - 218)) 20 $script:itemSubtle 8.1
             $btnOpen = New-Button "열기" $projectAccent
-            $btnOpen.ForeColor = [System.Drawing.Color]::White
+            $btnOpen.ForeColor = if ($script:accentTextColor) { $script:accentTextColor } else { [System.Drawing.Color]::White }
             $btnOpen.SetBounds(($cardWidth - 106), 158, 86, 36)
             $btnOpen.Tag = $project
             Set-AccessibleControl $btnOpen "$name 프로젝트 열기" "$name 모드의 번역 및 검수 작업 화면을 엽니다." 0
@@ -5508,6 +6038,9 @@ function Apply-TextSize {
     $txtTerms.Font = New-Font $bodySize
     $txtMemo.Font = New-Font $bodySize
     $txtWarnings.Font = New-Font $bodySize
+    $txtDiffSource.Font = New-Font ([Math]::Max(8.5, $bodySize - 1))
+    $txtDiffBefore.Font = New-Font ([Math]::Max(8.5, $bodySize - 1))
+    $txtDiffAfter.Font = New-Font ([Math]::Max(8.5, $bodySize - 1))
     $txtMeta.Font = New-Font ([Math]::Max(9, $bodySize - 1))
     $script:historyTitleFont = New-Font ([Math]::Max(8.5, $bodySize - 1.5)) ([System.Drawing.FontStyle]::Bold)
     $script:historyBodyFont = New-Font ([Math]::Max(9, $bodySize - 0.5))
@@ -5538,6 +6071,158 @@ function Queue-AutoSave {
     $autoSaveTimer.Start()
 }
 
+function Get-CommandPaletteActions {
+    $workspaceVisible = $main -and $main.Visible -and -not ($operationOverlay -and $operationOverlay.Visible)
+    $hasReview = $script:rows.Count -gt 0 -and [bool]$script:reviewRoot
+    $hasMod = [bool](Get-ActiveProjectModRoot)
+    $running = $script:process -and -not $script:process.HasExited
+    return @(
+        [pscustomobject]@{ Id = "projects"; Name = "프로젝트 목록 열기"; Group = "이동"; Shortcut = "Ctrl+Home"; Enabled = $true },
+        [pscustomobject]@{ Id = "search"; Name = "현재 화면 검색"; Group = "이동"; Shortcut = "Ctrl+F"; Enabled = $true },
+        [pscustomobject]@{ Id = "compare"; Name = "선택 문자열 비교 열기"; Group = "검수"; Shortcut = "Alt+C"; Enabled = $workspaceVisible -and $hasReview },
+        [pscustomobject]@{ Id = "quality"; Name = "프로젝트 품질 센터 열기"; Group = "검수"; Shortcut = "Alt+Q"; Enabled = $workspaceVisible -and $hasReview },
+        [pscustomobject]@{ Id = "previous"; Name = "이전 문자열"; Group = "검수"; Shortcut = "Shift+F3"; Enabled = $workspaceVisible -and $hasReview },
+        [pscustomobject]@{ Id = "next"; Name = "다음 문자열"; Group = "검수"; Shortcut = "F3"; Enabled = $workspaceVisible -and $hasReview },
+        [pscustomobject]@{ Id = "approve-next"; Name = "검토 완료 후 다음"; Group = "검수"; Shortcut = "Ctrl+Enter"; Enabled = $workspaceVisible -and $hasReview },
+        [pscustomobject]@{ Id = "save"; Name = "검수 내용 저장"; Group = "프로젝트"; Shortcut = "Ctrl+S"; Enabled = $workspaceVisible -and $hasReview },
+        [pscustomobject]@{ Id = "source"; Name = "모드 원문 다시 분석"; Group = "프로젝트"; Shortcut = "F5"; Enabled = $workspaceVisible -and $hasMod -and -not $running },
+        [pscustomobject]@{ Id = "translate"; Name = "AI 초벌 번역 준비"; Group = "프로젝트"; Shortcut = "F9"; Enabled = $workspaceVisible -and $hasMod -and -not $running },
+        [pscustomobject]@{ Id = "report"; Name = "개인정보 보호 품질 보고서"; Group = "도구"; Shortcut = ""; Enabled = $workspaceVisible -and $hasReview },
+        [pscustomobject]@{ Id = "folder"; Name = "현재 모드 폴더 열기"; Group = "도구"; Shortcut = ""; Enabled = $workspaceVisible -and $hasMod },
+        [pscustomobject]@{ Id = "settings"; Name = "API 및 화면 설정 열기"; Group = "설정"; Shortcut = ""; Enabled = $true },
+        [pscustomobject]@{ Id = "diagnostics"; Name = "개인정보 보호 진단 번들 저장"; Group = "도구"; Shortcut = ""; Enabled = $true }
+    )
+}
+
+function Invoke-CommandPaletteAction([string]$Id) {
+    switch ($Id) {
+        "projects" { Show-Dashboard "projects" }
+        "search" {
+            $target = if ($dashboardPanel.Visible) { $txtDashboardSearch } else { $txtSearch }
+            [void]$target.Focus(); $target.SelectAll()
+        }
+        "compare" { $tabs.SelectedTab = $tabHistory }
+        "quality" { $tabs.SelectedTab = $tabIssues; Refresh-QualityCenter }
+        "previous" { Move-Selection -1 }
+        "next" { Move-Selection 1 }
+        "approve-next" { Mark-Current "approved" $true }
+        "save" { Save-ReviewWithDuplicatePrompt }
+        "source" { Load-SourceOnlyForSelectedMod }
+        "translate" { Start-Translation }
+        "report" { Export-QualityReport }
+        "folder" { Open-ModFolder }
+        "settings" { Show-Dashboard "settings" }
+        "diagnostics" { Export-DiagnosticBundle }
+    }
+}
+
+function Show-CommandPalette {
+    param([switch]$PreviewOnly)
+    if ($operationOverlay -and $operationOverlay.Visible) { return }
+    $dialog = [System.Windows.Forms.Form]::new()
+    $dialog.Text = "명령 찾기"
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $dialog.ClientSize = [System.Drawing.Size]::new(640, 476)
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+    $dialog.ShowInTaskbar = $false
+    $dialog.ShowIcon = $false
+    $dialog.BackColor = $script:surfaceColor
+    $dialog.Font = New-Font 9
+    $dialog.Tag = ""
+
+    $accent = [System.Windows.Forms.Panel]::new()
+    $accent.SetBounds(0, 0, 640, 4)
+    $accent.BackColor = $script:accentColor
+    $title = New-Label "명령 찾기" 24 20 400 30 $script:textColor 13 ([System.Drawing.FontStyle]::Bold)
+    $hint = New-Label "작업 이름을 입력하고 Enter를 누르세요. 비활성 명령은 현재 화면에서 실행할 수 없습니다." 24 52 590 22 $script:mutedColor 8.5
+    $search = New-TextBox
+    $search.SetBounds(24, 86, 592, 34)
+    $list = [System.Windows.Forms.ListView]::new()
+    $list.SetBounds(24, 132, 592, 280)
+    $list.View = [System.Windows.Forms.View]::Details
+    $list.FullRowSelect = $true
+    $list.HideSelection = $false
+    $list.MultiSelect = $false
+    $list.Font = New-Font 9
+    $list.BackColor = $script:surfaceColor
+    $list.ForeColor = $script:textColor
+    [void]$list.Columns.Add("명령", 350)
+    [void]$list.Columns.Add("영역", 90)
+    [void]$list.Columns.Add("단축키", 120)
+    $run = New-Button "실행" $script:accentColor
+    $run.ForeColor = $script:accentTextColor
+    $run.SetBounds(506, 426, 110, 36)
+    $cancel = New-Button "닫기" $script:surfaceColor
+    $cancel.ForeColor = $script:textColor
+    $cancel.FlatAppearance.BorderColor = $script:borderColor
+    $cancel.SetBounds(388, 426, 110, 36)
+    Set-AccessibleControl $search "명령 검색" "프로젝트, 번역, 검수와 설정 명령을 이름으로 검색합니다." 0
+    Set-AccessibleControl $list "사용 가능한 명령 목록" "검색 결과와 현재 화면에서 실행 가능한지 표시합니다." 1
+    Set-AccessibleControl $run "선택한 명령 실행" "선택한 활성 명령을 실행합니다." 2
+    Set-AccessibleControl $cancel "명령 찾기 닫기" "명령을 실행하지 않고 닫습니다." 3
+    Set-CueBanner $search "명령 검색"
+
+    $actions = @(Get-CommandPaletteActions)
+    $paletteMutedColor = $script:mutedColor
+    $refresh = {
+        $query = $search.Text.Trim().ToLowerInvariant()
+        $list.BeginUpdate()
+        try {
+            $list.Items.Clear()
+            foreach ($action in $actions) {
+                $blob = "$($action.Name) $($action.Group) $($action.Shortcut)".ToLowerInvariant()
+                if ($query -and -not $blob.Contains($query)) { continue }
+                $item = [System.Windows.Forms.ListViewItem]::new([string]$action.Name)
+                [void]$item.SubItems.Add([string]$action.Group)
+                [void]$item.SubItems.Add([string]$action.Shortcut)
+                $item.Tag = $action
+                if (-not [bool]$action.Enabled) { $item.ForeColor = $paletteMutedColor }
+                [void]$list.Items.Add($item)
+            }
+            if ($list.Items.Count -gt 0) { $list.Items[0].Selected = $true }
+        } finally { $list.EndUpdate() }
+        $run.Enabled = $list.SelectedItems.Count -gt 0 -and [bool]$list.SelectedItems[0].Tag.Enabled
+    }.GetNewClosure()
+    $execute = {
+        if ($list.SelectedItems.Count -eq 0) { return }
+        $action = $list.SelectedItems[0].Tag
+        if (-not [bool]$action.Enabled) { return }
+        $dialog.Tag = [string]$action.Id
+        $dialog.Close()
+    }.GetNewClosure()
+    $search.Add_TextChanged(({ & $refresh }).GetNewClosure())
+    $list.Add_SelectedIndexChanged(({
+        if ($list.IsDisposed -or $run.IsDisposed) { return }
+        $hasSelection = $list.SelectedItems.Count -gt 0
+        $run.Enabled = $hasSelection -and [bool]$list.SelectedItems[0].Tag.Enabled
+    }).GetNewClosure())
+    $list.Add_DoubleClick(({ & $execute }).GetNewClosure())
+    $search.Add_KeyDown(({
+        if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Down -and $list.Items.Count -gt 0) { [void]$list.Focus(); $list.Items[0].Selected = $true; $_.SuppressKeyPress = $true }
+        elseif ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { & $execute; $_.SuppressKeyPress = $true }
+    }).GetNewClosure())
+    $list.Add_KeyDown(({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { & $execute; $_.SuppressKeyPress = $true } }).GetNewClosure())
+    $run.Add_Click(({ & $execute }).GetNewClosure())
+    $cancel.Add_Click(({ $dialog.Close() }).GetNewClosure())
+    $dialog.CancelButton = $cancel
+    $dialog.Controls.AddRange(@($accent, $title, $hint, $search, $list, $run, $cancel))
+    & $refresh
+    $dialog.Add_Shown(({ [void]$search.Focus() }).GetNewClosure())
+    if ($PreviewOnly) {
+        $dialog.Show($form)
+        return $dialog
+    }
+    try {
+        [void]$dialog.ShowDialog($form)
+        $selectedAction = [string]$dialog.Tag
+    } finally {
+        $dialog.Dispose()
+    }
+    if ($selectedAction) { Invoke-CommandPaletteAction $selectedAction }
+}
+
 function Focus-NextWorkRegion([int]$Direction = 1) {
     if ($dashboardPanel.Visible) {
         if ($dashSettingsPage.Visible) {
@@ -5563,17 +6248,17 @@ function Focus-NextWorkRegion([int]$Direction = 1) {
 
 function Refresh-DashboardTabButtons {
     if (-not $btnDashProjects) { return }
-    $inactiveBack = [System.Drawing.Color]::FromArgb(48, 53, 49)
-    $inactiveFore = [System.Drawing.Color]::FromArgb(224, 229, 222)
+    $inactiveBack = if ($script:headerButtonColor) { $script:headerButtonColor } else { [System.Drawing.Color]::FromArgb(48, 53, 49) }
+    $inactiveFore = if ($script:headerTextColor) { $script:headerTextColor } else { [System.Drawing.Color]::FromArgb(224, 229, 222) }
     foreach ($button in @($btnDashProjects, $btnDashActivity, $btnDashSettings)) {
         $button.BackColor = $inactiveBack
         $button.ForeColor = $inactiveFore
-        $button.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(77, 83, 77)
+        $button.FlatAppearance.BorderColor = if ($script:borderColor) { $script:borderColor } else { [System.Drawing.Color]::FromArgb(77, 83, 77) }
         $button.FlatAppearance.BorderSize = 1
     }
     $active = if ($dashSettingsPage.Visible) { $btnDashSettings } elseif ($dashActivityPage.Visible) { $btnDashActivity } else { $btnDashProjects }
     $active.BackColor = $script:accentColor
-    $active.ForeColor = [System.Drawing.Color]::White
+    $active.ForeColor = if ($script:accentTextColor) { $script:accentTextColor } else { [System.Drawing.Color]::White }
     $active.FlatAppearance.BorderColor = $script:accentColor
 }
 
@@ -5585,21 +6270,6 @@ function Show-Dashboard([string]$Tab = "projects") {
     $dashboardPanel.Visible = $true
     $dashboardPanel.BringToFront()
     if (Get-Command Apply-AppTheme -ErrorAction SilentlyContinue) { Apply-AppTheme }
-
-    $isDark = Get-IsWindowsDarkMode
-    $inactiveBack = [System.Drawing.Color]::FromArgb(53, 59, 54)
-    $inactiveFore = [System.Drawing.Color]::FromArgb(224, 229, 222)
-    $activeBack = if ($script:highContrast) {
-        if ($isDark) { [System.Drawing.Color]::FromArgb(224, 177, 92) } else { [System.Drawing.Color]::FromArgb(119, 77, 22) }
-    } else {
-        if ($isDark) { [System.Drawing.Color]::FromArgb(190, 150, 92) } else { [System.Drawing.Color]::FromArgb(166, 124, 70) }
-    }
-    foreach ($button in @($btnDashProjects, $btnDashActivity, $btnDashSettings)) {
-        if ($button) {
-            $button.BackColor = $inactiveBack
-            $button.ForeColor = $inactiveFore
-        }
-    }
     $dashProjectsPage.Visible = $false
     $dashActivityPage.Visible = $false
     $dashSettingsPage.Visible = $false
@@ -5607,21 +6277,15 @@ function Show-Dashboard([string]$Tab = "projects") {
     switch ($Tab) {
         "activity" {
             $dashActivityPage.Visible = $true
-            $btnDashActivity.BackColor = $activeBack
-            $btnDashActivity.ForeColor = [System.Drawing.Color]::White
             Refresh-DashboardActivity
         }
         "settings" {
             $dashSettingsPage.Visible = $true
-            $btnDashSettings.BackColor = $activeBack
-            $btnDashSettings.ForeColor = [System.Drawing.Color]::White
             Refresh-RmkRoots
             Sync-DashboardSettingsFromMain
         }
         default {
             $dashProjectsPage.Visible = $true
-            $btnDashProjects.BackColor = $activeBack
-            $btnDashProjects.ForeColor = [System.Drawing.Color]::White
             Refresh-DashboardProjects
         }
     }
@@ -6125,7 +6789,7 @@ $tabs.Multiline = $false
 $side.Controls.Add($tabs)
 
 $tabHistory = [System.Windows.Forms.TabPage]::new()
-$tabHistory.Text = "역사"
+$tabHistory.Text = "비교"
 $tabTerms = [System.Windows.Forms.TabPage]::new()
 $tabTerms.Text = "용어"
 $tabMemo = [System.Windows.Forms.TabPage]::new()
@@ -6133,7 +6797,7 @@ $tabMemo.Text = "메모"
 $tabRmk = [System.Windows.Forms.TabPage]::new()
 $tabRmk.Text = "RMK"
 $tabIssues = [System.Windows.Forms.TabPage]::new()
-$tabIssues.Text = "문제"
+$tabIssues.Text = "품질"
 $tabLog = [System.Windows.Forms.TabPage]::new()
 $tabLog.Text = "로그"
 [void]$tabs.TabPages.AddRange(@($tabHistory, $tabTerms, $tabMemo, $tabRmk, $tabIssues, $tabLog))
@@ -6194,14 +6858,73 @@ $tabs.Add_DrawItem({
 })
 
 $txtHistory = [System.Windows.Forms.RichTextBox]::new()
-$txtHistory.Dock = [System.Windows.Forms.DockStyle]::Fill
 $txtHistory.ReadOnly = $true
 $txtHistory.DetectUrls = $false
 $txtHistory.Font = New-Font 9.5
 $txtHistory.BackColor = [System.Drawing.Color]::FromArgb(248, 249, 250)
 $script:historyTitleFont = New-Font 8.5 ([System.Drawing.FontStyle]::Bold)
 $script:historyBodyFont = New-Font 9.5
-$tabHistory.Controls.Add($txtHistory)
+$tabHistory.AutoScroll = $true
+$lblDiffSummary = New-Label "비교할 문자열을 선택하세요" 12 12 300 24 ([System.Drawing.Color]::FromArgb(52, 61, 70)) 9 ([System.Drawing.FontStyle]::Bold)
+$lblDiffSource = New-Label "원문" 12 44 280 18 ([System.Drawing.Color]::FromArgb(80, 88, 96)) 8.2 ([System.Drawing.FontStyle]::Bold)
+$txtDiffSource = [System.Windows.Forms.RichTextBox]::new()
+$txtDiffSource.ReadOnly = $true
+$txtDiffSource.DetectUrls = $false
+$txtDiffSource.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$txtDiffSource.Font = New-Font 8.8
+$lblDiffBefore = New-Label "기존 번역" 12 144 280 18 ([System.Drawing.Color]::FromArgb(80, 88, 96)) 8.2 ([System.Drawing.FontStyle]::Bold)
+$txtDiffBefore = [System.Windows.Forms.RichTextBox]::new()
+$txtDiffBefore.ReadOnly = $true
+$txtDiffBefore.DetectUrls = $false
+$txtDiffBefore.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$txtDiffBefore.Font = New-Font 8.8
+$lblDiffAfter = New-Label "현재 번역" 12 244 280 18 ([System.Drawing.Color]::FromArgb(80, 88, 96)) 8.2 ([System.Drawing.FontStyle]::Bold)
+$txtDiffAfter = [System.Windows.Forms.RichTextBox]::new()
+$txtDiffAfter.ReadOnly = $true
+$txtDiffAfter.DetectUrls = $false
+$txtDiffAfter.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$txtDiffAfter.Font = New-Font 8.8
+$lblHistoryDetail = New-Label "번역 기록" 12 344 280 18 ([System.Drawing.Color]::FromArgb(80, 88, 96)) 8.2 ([System.Drawing.FontStyle]::Bold)
+$tabHistory.Controls.AddRange(@($lblDiffSummary, $lblDiffSource, $txtDiffSource, $lblDiffBefore, $txtDiffBefore, $lblDiffAfter, $txtDiffAfter, $lblHistoryDetail, $txtHistory))
+
+function Resize-DiffTab {
+    if (-not $tabHistory -or $tabHistory.ClientSize.Width -le 0) { return }
+    $pad = 12
+    $width = [Math]::Max(240, $tabHistory.ClientSize.Width - ($pad * 2))
+    $wide = $width -ge 680
+    if ($wide) {
+        $gap = 10
+        $column = [Math]::Max(190, [int](($width - ($gap * 2)) / 3))
+        $labels = @($lblDiffSource, $lblDiffBefore, $lblDiffAfter)
+        $boxes = @($txtDiffSource, $txtDiffBefore, $txtDiffAfter)
+        for ($i = 0; $i -lt 3; $i++) {
+            $x = $pad + (($column + $gap) * $i)
+            $labels[$i].SetBounds($x, 44, $column, 18)
+            $boxes[$i].SetBounds($x, 66, $column, 116)
+        }
+        $lblHistoryDetail.SetBounds($pad, 198, $width, 18)
+        $txtHistory.SetBounds($pad, 220, $width, [Math]::Max(120, $tabHistory.ClientSize.Height - 234))
+        $tabHistory.AutoScrollMinSize = [System.Drawing.Size]::new(0, 380)
+    } else {
+        $boxHeight = 74
+        $y = 44
+        foreach ($pair in @(
+            [pscustomobject]@{ Label = $lblDiffSource; Box = $txtDiffSource },
+            [pscustomobject]@{ Label = $lblDiffBefore; Box = $txtDiffBefore },
+            [pscustomobject]@{ Label = $lblDiffAfter; Box = $txtDiffAfter }
+        )) {
+            $pair.Label.SetBounds($pad, $y, $width, 18)
+            $pair.Box.SetBounds($pad, ($y + 22), $width, $boxHeight)
+            $y += 110
+        }
+        $lblHistoryDetail.SetBounds($pad, $y, $width, 18)
+        $txtHistory.SetBounds($pad, ($y + 22), $width, 170)
+        $tabHistory.AutoScrollMinSize = [System.Drawing.Size]::new(0, $y + 214)
+    }
+    $lblDiffSummary.SetBounds($pad, 12, $width, 24)
+}
+$tabHistory.Add_Resize({ Resize-DiffTab })
+Resize-DiffTab
 
 $txtTerms = New-TextBox -Multiline
 $txtTerms.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -6243,10 +6966,55 @@ $tabRmk.Add_Resize({ Resize-RmkTab })
 Resize-RmkTab
 
 $txtWarnings = New-TextBox -Multiline
-$txtWarnings.Dock = [System.Windows.Forms.DockStyle]::Fill
 $txtWarnings.ReadOnly = $true
 $txtWarnings.BackColor = [System.Drawing.Color]::FromArgb(248, 249, 250)
-$tabIssues.Controls.Add($txtWarnings)
+$tabIssues.AutoScroll = $true
+$lblQualitySummary = New-Label "품질 검사를 준비하는 중" 12 12 320 42 ([System.Drawing.Color]::FromArgb(52, 61, 70)) 9 ([System.Drawing.FontStyle]::Bold)
+$cmbQualityCategory = [System.Windows.Forms.ComboBox]::new()
+$cmbQualityCategory.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$cmbQualityCategory.Font = New-Font 8.5
+[void]$cmbQualityCategory.Items.AddRange(@("전체 문제", "오류", "경고", "미번역", "원문 변경", "토큰/태그", "길이 이상", "원문과 동일", "중복 식별자"))
+$cmbQualityCategory.SelectedIndex = 0
+$btnQualityRefresh = New-Button "다시 검사" ([System.Drawing.Color]::FromArgb(238, 241, 244))
+$btnQualityReport = New-Button "보고서" ([System.Drawing.Color]::FromArgb(166, 124, 70))
+$btnQualityReport.ForeColor = [System.Drawing.Color]::White
+$lvQualityIssues = [System.Windows.Forms.ListView]::new()
+$lvQualityIssues.View = [System.Windows.Forms.View]::Details
+$lvQualityIssues.VirtualMode = $true
+$lvQualityIssues.VirtualListSize = 0
+$lvQualityIssues.FullRowSelect = $true
+$lvQualityIssues.HideSelection = $false
+$lvQualityIssues.MultiSelect = $false
+$lvQualityIssues.Font = New-Font 8.3
+[void]$lvQualityIssues.Columns.Add("등급", 48)
+[void]$lvQualityIssues.Columns.Add("분류", 92)
+[void]$lvQualityIssues.Columns.Add("키", 200)
+$lblSelectedQuality = New-Label "선택 문자열 검사" 12 350 260 18 ([System.Drawing.Color]::FromArgb(80, 88, 96)) 8.2 ([System.Drawing.FontStyle]::Bold)
+$btnQualityJump = New-Button "문자열로 이동" ([System.Drawing.Color]::FromArgb(62, 122, 82))
+$btnQualityJump.ForeColor = [System.Drawing.Color]::White
+$btnQualityJump.Enabled = $false
+$tabIssues.Controls.AddRange(@($lblQualitySummary, $cmbQualityCategory, $btnQualityRefresh, $btnQualityReport, $lvQualityIssues, $lblSelectedQuality, $txtWarnings, $btnQualityJump))
+
+function Resize-QualityTab {
+    if (-not $tabIssues -or $tabIssues.ClientSize.Width -le 0) { return }
+    $pad = 12
+    $width = [Math]::Max(240, $tabIssues.ClientSize.Width - ($pad * 2))
+    $lblQualitySummary.SetBounds($pad, 12, $width, 42)
+    $filterWidth = [Math]::Max(110, $width - 184)
+    $cmbQualityCategory.SetBounds($pad, 60, $filterWidth, 30)
+    $btnQualityRefresh.SetBounds(($pad + $filterWidth + 6), 60, 82, 30)
+    $btnQualityReport.SetBounds(($pad + $filterWidth + 94), 60, 78, 30)
+    $listHeight = [Math]::Max(150, [int]($tabIssues.ClientSize.Height * 0.46))
+    $lvQualityIssues.SetBounds($pad, 100, $width, $listHeight)
+    if ($lvQualityIssues.Columns.Count -ge 3) { $lvQualityIssues.Columns[2].Width = [Math]::Max(90, $width - 146) }
+    $detailY = 112 + $listHeight
+    $lblSelectedQuality.SetBounds($pad, $detailY, [Math]::Max(120, $width - 122), 18)
+    $btnQualityJump.SetBounds(($pad + $width - 114), ($detailY - 4), 114, 30)
+    $txtWarnings.SetBounds($pad, ($detailY + 26), $width, [Math]::Max(82, $tabIssues.ClientSize.Height - $detailY - 38))
+    $tabIssues.AutoScrollMinSize = [System.Drawing.Size]::new(0, $detailY + 126)
+}
+$tabIssues.Add_Resize({ Resize-QualityTab })
+Resize-QualityTab
 
 $txtLog = New-TextBox -Multiline
 $txtLog.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -6312,7 +7080,10 @@ $btnDashActivity.SetBounds(724, 22, 74, 34)
 $btnDashSettings = New-Button "설정" ([System.Drawing.Color]::FromArgb(37, 46, 55))
 $btnDashSettings.ForeColor = [System.Drawing.Color]::FromArgb(215, 226, 237)
 $btnDashSettings.SetBounds(806, 22, 74, 34)
-$dashHeader.Controls.AddRange(@($lblDashTitle, $lblDashSub, $btnDashProjects, $btnDashActivity, $btnDashSettings, $dashAccent))
+$btnCommandPalette = New-Button "명령  Ctrl+Shift+P" ([System.Drawing.Color]::FromArgb(37, 46, 55))
+$btnCommandPalette.ForeColor = [System.Drawing.Color]::FromArgb(215, 226, 237)
+$btnCommandPalette.SetBounds(1000, 16, 154, 36)
+$dashHeader.Controls.AddRange(@($lblDashTitle, $lblDashSub, $btnDashProjects, $btnDashActivity, $btnDashSettings, $btnCommandPalette, $dashAccent))
 
 $dashContent = [System.Windows.Forms.Panel]::new()
 $dashContent.SetBounds(0, 76, $form.ClientSize.Width, [Math]::Max(1, $form.ClientSize.Height - 76))
@@ -6326,7 +7097,29 @@ $dashProjectsPage.Dock = [System.Windows.Forms.DockStyle]::Fill
 $dashProjectsPage.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
 $dashContent.Controls.Add($dashProjectsPage)
 
-$lblDashProjects = New-Label "프로젝트" 24 20 180 30 ([System.Drawing.Color]::White) 14 ([System.Drawing.FontStyle]::Bold)
+$lblDashEyebrow = New-Label "FRONTIER TRANSLATION OPERATIONS" 32 20 340 18 ([System.Drawing.Color]::FromArgb(190, 150, 92)) 7.8 ([System.Drawing.FontStyle]::Bold)
+$lblDashProjects = New-Label "모드 번역 작업실" 32 42 340 34 ([System.Drawing.Color]::White) 15 ([System.Drawing.FontStyle]::Bold)
+$lblDashIntro = New-Label "원문을 분석하고 초벌 번역을 만든 뒤, 한 줄씩 검토해 안전하게 적용합니다." 32 78 620 24 ([System.Drawing.Color]::FromArgb(160, 174, 188)) 8.8
+$lblDashProviderStatus = New-Label "번역 엔진 확인 중" 760 28 380 28 ([System.Drawing.Color]::FromArgb(218, 228, 238)) 9 ([System.Drawing.FontStyle]::Bold)
+$lblDashProviderHint = New-Label "API 키는 저장하지 않습니다." 760 58 380 22 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.1
+$dashWorkflow = [System.Windows.Forms.FlowLayoutPanel]::new()
+$dashWorkflow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+$dashWorkflow.WrapContents = $false
+$dashWorkflow.AutoScroll = $false
+$dashWorkflow.Margin = [System.Windows.Forms.Padding]::new(0)
+$dashWorkflow.Padding = [System.Windows.Forms.Padding]::new(0)
+$dashWorkflow.BackColor = [System.Drawing.Color]::Transparent
+$dashWorkflowSteps = New-Object "System.Collections.Generic.List[System.Windows.Forms.Label]"
+$stepIndex = 0
+foreach ($stepText in @("모드 선택", "원문 분석", "초벌 번역", "검토 · 적용")) {
+    $stepIndex++
+    $step = New-Label (("0{0}  {1}" -f $stepIndex, $stepText)) 0 0 132 28 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.2 ([System.Drawing.FontStyle]::Bold)
+    $step.Margin = [System.Windows.Forms.Padding]::new(0, 0, 14, 0)
+    $step.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    [void]$dashWorkflowSteps.Add($step)
+    [void]$dashWorkflow.Controls.Add($step)
+}
+$dashboardDivider = [System.Windows.Forms.Panel]::new()
 $lblDashboardSearch = New-Label "프로젝트 검색" 24 36 170 20 ([System.Drawing.Color]::FromArgb(160, 174, 188)) 8.5 ([System.Drawing.FontStyle]::Bold)
 $txtDashboardSearch = New-TextBox
 $txtDashboardSearch.SetBounds(24, 60, 330, 30)
@@ -6349,11 +7142,11 @@ $btnDashboardRefreshMods.ForeColor = [System.Drawing.Color]::White
 $btnDashboardRefreshMods.SetBounds(1050, 58, 92, 32)
 
 $flowDashboardProjects = [System.Windows.Forms.FlowLayoutPanel]::new()
-$flowDashboardProjects.SetBounds(16, 112, 1418, 560)
+$flowDashboardProjects.SetBounds(16, 216, 1418, 456)
 $flowDashboardProjects.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $flowDashboardProjects.AutoScroll = $true
 $flowDashboardProjects.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 30)
-$dashProjectsPage.Controls.AddRange(@($lblDashProjects, $lblDashboardSearch, $txtDashboardSearch, $lblDashboardMod, $cmbDashboardMods, $btnDashboardAddMod, $btnDashboardChooseMod, $btnDashboardRefreshMods, $flowDashboardProjects))
+$dashProjectsPage.Controls.AddRange(@($lblDashEyebrow, $lblDashProjects, $lblDashIntro, $lblDashProviderStatus, $lblDashProviderHint, $dashWorkflow, $dashboardDivider, $lblDashboardSearch, $txtDashboardSearch, $lblDashboardMod, $cmbDashboardMods, $btnDashboardAddMod, $btnDashboardChooseMod, $btnDashboardRefreshMods, $flowDashboardProjects))
 
 $dashActivityPage = [System.Windows.Forms.Panel]::new()
 $dashActivityPage.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -6514,6 +7307,136 @@ $pnlRmkSettings.Controls.AddRange(@($settingsRmkDivider, $lblDashRmk, $lblDashbo
 
 $dashSettingsPage.Controls.AddRange(@($lblDashSettings, $pnlApiSettings, $pnlAppearanceSettings, $pnlRmkSettings))
 
+$operationOverlay = [System.Windows.Forms.Panel]::new()
+$operationOverlay.Dock = [System.Windows.Forms.DockStyle]::Fill
+$operationOverlay.Visible = $false
+$operationOverlay.TabStop = $false
+$form.Controls.Add($operationOverlay)
+
+$operationCard = [System.Windows.Forms.Panel]::new()
+$operationCard.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$operationOverlay.Controls.Add($operationCard)
+
+$operationAccent = [System.Windows.Forms.Panel]::new()
+$operationAccent.Height = 4
+$operationCard.Controls.Add($operationAccent)
+$lblOperationEyebrow = New-Label "FRONTIER PROCESS CONTROL" 28 24 320 18 ([System.Drawing.Color]::FromArgb(190, 150, 92)) 7.8 ([System.Drawing.FontStyle]::Bold)
+$lblOperationTitle = New-Label "번역 작업" 28 48 520 34 ([System.Drawing.Color]::White) 15 ([System.Drawing.FontStyle]::Bold)
+$lblOperationStage = New-Label "작업공간 확인" 220 102 500 30 ([System.Drawing.Color]::White) 12 ([System.Drawing.FontStyle]::Bold)
+$lblOperationDetail = New-Label "실제 작업 로그를 기다리는 중입니다." 220 136 500 48 ([System.Drawing.Color]::FromArgb(180, 190, 200)) 8.8
+$lblOperationCount = New-Label "실제 작업 상태를 기다리는 중" 220 188 500 22 ([System.Drawing.Color]::FromArgb(150, 164, 178)) 8.3 ([System.Drawing.FontStyle]::Bold)
+
+$pnlOperationScan = [System.Windows.Forms.Panel]::new()
+$pnlOperationScan.SetBounds(34, 88, 156, 156)
+$pnlOperationScan.TabStop = $false
+$pnlOperationScan.Add_Paint({
+    param($sender, $eventArgs)
+    $graphics = $eventArgs.Graphics
+    $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $accentColor = if ($script:accentColor) { $script:accentColor } else { [System.Drawing.Color]::FromArgb(183, 131, 66) }
+    $lineColor = if ($script:borderColor) { $script:borderColor } else { [System.Drawing.Color]::FromArgb(90, 96, 90) }
+    $accentPen = [System.Drawing.Pen]::new($accentColor, 3)
+    $linePen = [System.Drawing.Pen]::new($lineColor, 1)
+    $dotBrush = [System.Drawing.SolidBrush]::new($accentColor)
+    try {
+        foreach ($size in @(138, 100, 62)) {
+            $offset = [int]((154 - $size) / 2)
+            $graphics.DrawEllipse($linePen, $offset, $offset, $size, $size)
+        }
+        $graphics.DrawLine($linePen, 77, 4, 77, 150)
+        $graphics.DrawLine($linePen, 4, 77, 150, 77)
+        $startAngle = [int](($script:operationPulse * 18) % 360)
+        $sweep = if ($progressOperation -and $progressOperation.Style -ne [System.Windows.Forms.ProgressBarStyle]::Marquee -and $progressOperation.Maximum -gt 0) {
+            [Math]::Max(8, [int](330 * ($progressOperation.Value / [double]$progressOperation.Maximum)))
+        } else { 72 }
+        $graphics.DrawArc($accentPen, 8, 8, 138, 138, $startAngle, $sweep)
+        $dotRadians = ($startAngle + $sweep) * [Math]::PI / 180.0
+        $dotX = 77 + [Math]::Cos($dotRadians) * 69
+        $dotY = 77 + [Math]::Sin($dotRadians) * 69
+        $graphics.FillEllipse($dotBrush, [float]($dotX - 4), [float]($dotY - 4), 8, 8)
+    } finally {
+        $dotBrush.Dispose(); $linePen.Dispose(); $accentPen.Dispose()
+    }
+})
+
+$progressOperation = [System.Windows.Forms.ProgressBar]::new()
+$progressOperation.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+$progressOperation.MarqueeAnimationSpeed = 28
+$progressOperation.TabStop = $false
+$progressOperation.AccessibleName = "현재 작업 진행률"
+
+$txtOperationLog = [System.Windows.Forms.RichTextBox]::new()
+$txtOperationLog.ReadOnly = $true
+$txtOperationLog.DetectUrls = $false
+$txtOperationLog.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$txtOperationLog.Font = New-Font 8.3
+$txtOperationLog.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
+Set-AccessibleControl $txtOperationLog "현재 작업 로그 요약" "최근 작업 단계와 재시도, 오류 메시지를 최대 일곱 줄로 보여줍니다." 0
+
+$operationDivider = [System.Windows.Forms.Panel]::new()
+$btnOperationCancel = New-Button "중지" ([System.Drawing.Color]::FromArgb(167, 74, 69))
+$btnOperationCancel.ForeColor = [System.Drawing.Color]::White
+$btnOperationRetry = New-Button "다시 시도" ([System.Drawing.Color]::FromArgb(183, 131, 66))
+$btnOperationReview = New-Button "검수 화면 계속" ([System.Drawing.Color]::FromArgb(62, 122, 82))
+$btnOperationReview.ForeColor = [System.Drawing.Color]::White
+$btnOperationClose = New-Button "닫기" ([System.Drawing.Color]::FromArgb(72, 86, 100))
+
+$btnOperationCancel.Add_Click({ Stop-Translation })
+$btnOperationRetry.Add_Click({
+    $operationType = [string]$script:lastOperationType
+    Hide-OperationOverlay
+    if ($operationType -eq "SourceOnly") { Load-SourceOnlyForSelectedMod } else { Start-Translation }
+})
+$btnOperationReview.Add_Click({
+    if ($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath -PathType Container)) {
+        if (-not $script:reviewRoot -or $script:reviewRoot -ne $script:lastReviewOutputPath) { Load-ReviewRoot $script:lastReviewOutputPath }
+    }
+    Hide-OperationOverlay
+    Show-Workspace
+})
+$btnOperationClose.Add_Click({ Hide-OperationOverlay })
+Set-AccessibleControl $btnOperationCancel "현재 작업 중지" "완료된 번역 배치를 보존하면서 현재 작업의 취소를 요청합니다." 0
+Set-AccessibleControl $btnOperationRetry "실패한 작업 다시 시도" "같은 프로젝트에서 번역 준비 단계를 다시 엽니다." 1
+Set-AccessibleControl $btnOperationReview "생성된 검수 프로젝트 열기" "현재까지 생성된 번역 결과를 검수 화면에서 엽니다." 2
+Set-AccessibleControl $btnOperationClose "작업 상태 닫기" "작업 상태 화면을 닫고 현재 프로젝트로 돌아갑니다." 3
+
+$operationCard.Controls.AddRange(@($lblOperationEyebrow, $lblOperationTitle, $pnlOperationScan, $lblOperationStage, $lblOperationDetail, $lblOperationCount, $progressOperation, $txtOperationLog, $operationDivider, $btnOperationCancel, $btnOperationRetry, $btnOperationReview, $btnOperationClose))
+
+function Resize-OperationOverlay {
+    if (-not $operationOverlay -or $operationOverlay.ClientSize.Width -le 0) { return }
+    $cardWidth = [Math]::Min(780, [Math]::Max(620, $operationOverlay.ClientSize.Width - 64))
+    $cardHeight = [Math]::Min(500, [Math]::Max(440, $operationOverlay.ClientSize.Height - 64))
+    $cardX = [int](($operationOverlay.ClientSize.Width - $cardWidth) / 2)
+    $cardY = [int](($operationOverlay.ClientSize.Height - $cardHeight) / 2)
+    $operationCard.SetBounds($cardX, $cardY, $cardWidth, $cardHeight)
+    $operationAccent.SetBounds(0, 0, [Math]::Max(1, $cardWidth - 2), 4)
+    $rightX = 220
+    $rightWidth = [Math]::Max(340, $cardWidth - $rightX - 28)
+    $lblOperationTitle.Width = $cardWidth - 56
+    $lblOperationStage.SetBounds($rightX, 102, $rightWidth, 30)
+    $lblOperationDetail.SetBounds($rightX, 136, $rightWidth, 48)
+    $lblOperationCount.SetBounds($rightX, 188, $rightWidth, 22)
+    $progressOperation.SetBounds($rightX, 218, $rightWidth, 12)
+    $txtOperationLog.SetBounds(28, 266, $cardWidth - 56, [Math]::Max(86, $cardHeight - 358))
+    $operationDivider.SetBounds(28, $cardHeight - 72, $cardWidth - 56, 1)
+    $buttonY = $cardHeight - 56
+    $buttonX = $cardWidth - 28
+    foreach ($buttonSpec in @(
+        [pscustomobject]@{ Button = $btnOperationClose; Width = 88 },
+        [pscustomobject]@{ Button = $btnOperationReview; Width = 136 },
+        [pscustomobject]@{ Button = $btnOperationRetry; Width = 104 },
+        [pscustomobject]@{ Button = $btnOperationCancel; Width = 88 }
+    )) {
+        $button = $buttonSpec.Button
+        if (-not $button.Visible) { continue }
+        $buttonX -= [int]$buttonSpec.Width
+        $button.SetBounds($buttonX, $buttonY, [int]$buttonSpec.Width, 38)
+        $buttonX -= 8
+    }
+}
+
+$operationOverlay.Add_Resize({ Resize-OperationOverlay })
+
 $dashboardPanel.Add_Resize({
     $dashHeader.SetBounds(0, 0, $dashboardPanel.ClientSize.Width, 70)
     $dashAccent.SetBounds(0, 67, $dashboardPanel.ClientSize.Width, 3)
@@ -6563,64 +7486,26 @@ function Apply-AppTheme {
     $isDark = Get-IsWindowsDarkMode
     $themeSignature = "$isDark|$($script:highContrast)|$($script:textSize)|$($form.ClientSize.Width)x$($form.ClientSize.Height)"
     if ($script:appliedThemeSignature -eq $themeSignature) { return }
-    if ($isDark) {
-        $bg = [System.Drawing.Color]::FromArgb(25, 28, 27)
-        $surface = [System.Drawing.Color]::FromArgb(34, 38, 36)
-        $subtle = [System.Drawing.Color]::FromArgb(43, 48, 45)
-        $line = [System.Drawing.Color]::FromArgb(68, 74, 69)
-        $text = [System.Drawing.Color]::FromArgb(239, 236, 227)
-        $muted = [System.Drawing.Color]::FromArgb(181, 180, 169)
-        $faint = [System.Drawing.Color]::FromArgb(137, 143, 136)
-        $header = [System.Drawing.Color]::FromArgb(30, 33, 31)
-        $headerButton = [System.Drawing.Color]::FromArgb(48, 53, 49)
-        $headerLine = [System.Drawing.Color]::FromArgb(77, 83, 77)
-        $searchCard = [System.Drawing.Color]::FromArgb(43, 49, 44)
-    } else {
-        $bg = [System.Drawing.Color]::FromArgb(241, 242, 239)
-        $surface = [System.Drawing.Color]::FromArgb(253, 253, 251)
-        $subtle = [System.Drawing.Color]::FromArgb(235, 238, 235)
-        $line = [System.Drawing.Color]::FromArgb(204, 209, 203)
-        $text = [System.Drawing.Color]::FromArgb(42, 46, 43)
-        $muted = [System.Drawing.Color]::FromArgb(91, 99, 92)
-        $faint = [System.Drawing.Color]::FromArgb(132, 140, 133)
-        $header = [System.Drawing.Color]::FromArgb(39, 43, 40)
-        $headerButton = [System.Drawing.Color]::FromArgb(53, 59, 54)
-        $headerLine = [System.Drawing.Color]::FromArgb(80, 87, 81)
-        $searchCard = [System.Drawing.Color]::FromArgb(229, 234, 228)
-    }
-    if ($script:highContrast) {
-        if ($isDark) {
-            $bg = [System.Drawing.Color]::FromArgb(12, 12, 12)
-            $surface = [System.Drawing.Color]::FromArgb(22, 22, 22)
-            $subtle = [System.Drawing.Color]::FromArgb(34, 34, 34)
-            $line = [System.Drawing.Color]::FromArgb(174, 165, 147)
-            $text = [System.Drawing.Color]::White
-            $muted = [System.Drawing.Color]::FromArgb(225, 218, 204)
-            $faint = [System.Drawing.Color]::FromArgb(194, 188, 176)
-            $searchCard = [System.Drawing.Color]::FromArgb(32, 32, 30)
-        } else {
-            $bg = [System.Drawing.Color]::White
-            $surface = [System.Drawing.Color]::White
-            $subtle = [System.Drawing.Color]::FromArgb(242, 242, 238)
-            $line = [System.Drawing.Color]::FromArgb(74, 70, 63)
-            $text = [System.Drawing.Color]::FromArgb(15, 15, 15)
-            $muted = [System.Drawing.Color]::FromArgb(55, 52, 47)
-            $faint = [System.Drawing.Color]::FromArgb(78, 74, 67)
-            $searchCard = [System.Drawing.Color]::FromArgb(238, 235, 226)
-        }
-    }
-    $headerText = [System.Drawing.Color]::FromArgb(245, 242, 233)
-    $headerMuted = [System.Drawing.Color]::FromArgb(180, 187, 178)
-    $primary = if ($isDark) { [System.Drawing.Color]::FromArgb(196, 154, 91) } else { [System.Drawing.Color]::FromArgb(174, 126, 66) }
-    $primarySoft = if ($isDark) { [System.Drawing.Color]::FromArgb(68, 59, 44) } else { [System.Drawing.Color]::FromArgb(240, 229, 210) }
-    $steel = if ($isDark) { [System.Drawing.Color]::FromArgb(82, 124, 139) } else { [System.Drawing.Color]::FromArgb(74, 111, 124) }
-    $green = if ($isDark) { [System.Drawing.Color]::FromArgb(71, 139, 92) } else { [System.Drawing.Color]::FromArgb(62, 124, 82) }
-    if ($script:highContrast) {
-        $primary = if ($isDark) { [System.Drawing.Color]::FromArgb(224, 177, 92) } else { [System.Drawing.Color]::FromArgb(119, 77, 22) }
-        $primarySoft = if ($isDark) { [System.Drawing.Color]::FromArgb(75, 61, 38) } else { [System.Drawing.Color]::FromArgb(244, 232, 210) }
-        $steel = if ($isDark) { [System.Drawing.Color]::FromArgb(94, 163, 190) } else { [System.Drawing.Color]::FromArgb(38, 88, 108) }
-        $green = if ($isDark) { [System.Drawing.Color]::FromArgb(68, 158, 94) } else { [System.Drawing.Color]::FromArgb(31, 103, 56) }
-    }
+    $script:uiTokens = Get-RimWorldUiTokens -Mode $(if ($isDark) { "Dark" } else { "Light" }) -HighContrast:$script:highContrast
+    $colors = $script:uiTokens.Colors
+    $bg = ConvertTo-RimWorldUiColor $colors.Canvas
+    $surface = ConvertTo-RimWorldUiColor $colors.Surface
+    $subtle = ConvertTo-RimWorldUiColor $colors.SurfaceMuted
+    $line = ConvertTo-RimWorldUiColor $colors.Border
+    $text = ConvertTo-RimWorldUiColor $colors.Text
+    $muted = ConvertTo-RimWorldUiColor $colors.TextMuted
+    $faint = ConvertTo-RimWorldUiColor $colors.TextFaint
+    $header = ConvertTo-RimWorldUiColor $colors.Header
+    $headerButton = ConvertTo-RimWorldUiColor $colors.HeaderSecondary
+    $headerLine = ConvertTo-RimWorldUiColor $colors.Border
+    $searchCard = ConvertTo-RimWorldUiColor $colors.Selection
+    $headerText = if ($script:highContrast) { $text } else { ConvertTo-RimWorldUiColor $(if ($isDark) { $colors.Text } else { "#F5F2E9" }) }
+    $headerMuted = ConvertTo-RimWorldUiColor $(if ($script:highContrast) { $colors.TextMuted } else { $(if ($isDark) { "#B8B9AF" } else { "#C4C9C2" }) })
+    $primary = ConvertTo-RimWorldUiColor $colors.Accent
+    $primarySoft = ConvertTo-RimWorldUiColor $colors.Selection
+    $primaryText = ConvertTo-RimWorldUiColor $colors.AccentText
+    $steel = ConvertTo-RimWorldUiColor $colors.Info
+    $green = ConvertTo-RimWorldUiColor $colors.Success
 
     $script:itemCardBack = $surface
     $script:itemCardSelected = if ($isDark) { [System.Drawing.Color]::FromArgb(53, 58, 53) } else { [System.Drawing.Color]::FromArgb(225, 232, 225) }
@@ -6632,9 +7517,13 @@ function Apply-AppTheme {
     $script:tabText = $muted
     $script:tabActiveText = [System.Drawing.Color]::White
     $script:accentColor = $primary
+    $script:accentTextColor = $primaryText
     $script:surfaceColor = $surface
     $script:textColor = $text
     $script:mutedColor = $muted
+    $script:borderColor = $line
+    $script:headerButtonColor = $headerButton
+    $script:headerTextColor = $headerText
 
     $form.BackColor = $bg
     $formWidth = [Math]::Max(1, $form.ClientSize.Width)
@@ -6659,12 +7548,28 @@ function Apply-AppTheme {
     $dashAccent.SetBounds(0, 67, $formWidth, 3)
     $dashAccent.BackColor = $primary
     $dashContent.Top = 70
-    foreach ($control in @($main, $main.Panel1, $main.Panel2, $left, $center, $side, $rightSplit, $rightSplit.Panel1, $rightSplit.Panel2, $dashboardPanel, $dashContent, $dashProjectsPage, $dashActivityPage, $dashSettingsPage, $flowDashboardProjects, $flowItems, $statusFilterBar, $pnlApiSettings, $pnlAppearanceSettings, $pnlRmkSettings)) {
+    foreach ($control in @($main, $main.Panel1, $main.Panel2, $left, $center, $side, $rightSplit, $rightSplit.Panel1, $rightSplit.Panel2, $dashboardPanel, $dashContent, $dashProjectsPage, $dashActivityPage, $dashSettingsPage, $flowDashboardProjects, $flowItems, $statusFilterBar, $pnlApiSettings, $pnlAppearanceSettings, $pnlRmkSettings, $operationOverlay)) {
         if ($control) { $control.BackColor = $bg }
     }
-    foreach ($panel in @($center, $side, $pnlApiDetail, $flowApiProviders)) {
+    foreach ($panel in @($center, $side, $pnlApiDetail, $flowApiProviders, $operationCard)) {
         if ($panel) { $panel.BackColor = $surface }
     }
+    $operationAccent.BackColor = $primary
+    $operationDivider.BackColor = $line
+    $lblOperationEyebrow.ForeColor = $primary
+    $lblOperationTitle.ForeColor = $text
+    $lblOperationStage.ForeColor = $text
+    $lblOperationDetail.ForeColor = $muted
+    $lblOperationCount.ForeColor = $faint
+    $txtOperationLog.BackColor = $subtle
+    $txtOperationLog.ForeColor = $text
+    $btnOperationRetry.BackColor = $primary
+    $btnOperationRetry.ForeColor = $primaryText
+    $btnOperationReview.BackColor = $green
+    $btnOperationReview.ForeColor = [System.Drawing.Color]::White
+    $btnOperationClose.BackColor = $surface
+    $btnOperationClose.ForeColor = $text
+    $btnOperationClose.FlatAppearance.BorderColor = $line
 
     $topWidth = $formWidth
     $lblProject.SetBounds(24, 12, 286, 25)
@@ -6733,7 +7638,7 @@ function Apply-AppTheme {
     $btnApplyTranslated.Text = "전체 적용"
     $btnApplyTranslated.SetBounds(($actionX + $actionWidths[0] + $actionGap + $actionWidths[1] + $actionGap + $actionWidths[2] + $actionGap + $actionWidths[3] + $actionGap), 21, $actionWidths[4], 36)
 
-    foreach ($button in @($btnHome, $btnSave, $btnOpenFolder, $btnLoad, $btnDashboardChooseMod, $btnDashboardRefreshMods, $btnDashboardRmkAuto, $btnDashboardRmkChoose, $btnDashboardRmkOpen, $btnRmkRefresh, $btnRmkOpen, $btnDashActivity, $btnDashSettings, $btnExportDiagnostics)) {
+    foreach ($button in @($btnHome, $btnSave, $btnOpenFolder, $btnLoad, $btnDashboardChooseMod, $btnDashboardRefreshMods, $btnDashboardRmkAuto, $btnDashboardRmkChoose, $btnDashboardRmkOpen, $btnRmkRefresh, $btnRmkOpen, $btnDashActivity, $btnDashSettings, $btnCommandPalette, $btnExportDiagnostics)) {
         if ($button) {
             $button.BackColor = $headerButton
             $button.ForeColor = $headerText
@@ -6744,7 +7649,7 @@ function Apply-AppTheme {
     foreach ($button in @($btnTranslate, $btnDashProjects, $btnDashboardAddMod)) {
         if ($button) {
             $button.BackColor = $primary
-            $button.ForeColor = [System.Drawing.Color]::White
+            $button.ForeColor = $primaryText
             $button.FlatAppearance.BorderColor = $primary
             $button.FlatAppearance.BorderSize = 0
         }
@@ -6808,13 +7713,16 @@ function Apply-AppTheme {
     $flowItems.ItemHeight = 94 + ([Math]::Max(-1, [Math]::Min(2, $script:textSize - 10)) * 4)
     $flowItems.BorderStyle = [System.Windows.Forms.BorderStyle]::None
 
-    foreach ($box in @($txtSearch, $txtSource, $txtTranslation, $txtMeta, $txtExisting, $txtCandidate, $txtHistory, $txtTerms, $txtMemo, $txtRmkDetails, $txtWarnings, $txtDashboardSearch, $txtDashboardApiKeys, $txtDashboardRmkWorkspace, $txtApiKeys, $txtApiProviderUrl, $txtApiProviderCustomName)) {
+    foreach ($box in @($txtSearch, $txtSource, $txtTranslation, $txtMeta, $txtExisting, $txtCandidate, $txtHistory, $txtDiffSource, $txtDiffBefore, $txtDiffAfter, $txtTerms, $txtMemo, $txtRmkDetails, $txtWarnings, $txtDashboardSearch, $txtDashboardApiKeys, $txtDashboardRmkWorkspace, $txtApiKeys, $txtApiProviderUrl, $txtApiProviderCustomName)) {
         if ($box) {
             $box.BackColor = $surface
             $box.ForeColor = $text
         }
     }
     $txtSource.BackColor = $subtle
+    $txtDiffSource.BackColor = $subtle
+    $txtDiffBefore.BackColor = $surface
+    $txtDiffAfter.BackColor = $surface
     $pnlSourceFrame.BackColor = $subtle
     $pnlTranslationFrame.BackColor = $surface
     $pnlSourceFrame.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
@@ -6834,14 +7742,14 @@ function Apply-AppTheme {
     $txtLog.BackColor = if ($isDark) { [System.Drawing.Color]::FromArgb(16, 22, 28) } else { [System.Drawing.Color]::FromArgb(248, 247, 242) }
     $txtLog.ForeColor = $text
 
-    foreach ($combo in @($cmbSearchField, $cmbStatus, $cmbSort, $cmbModCatalog, $cmbProject, $cmbDashboardMods, $cmbDashboardTheme, $cmbDashboardTextSize, $cmbApiProviderModel, $cmbApiProviderTemperature)) {
+    foreach ($combo in @($cmbSearchField, $cmbStatus, $cmbSort, $cmbQualityCategory, $cmbModCatalog, $cmbProject, $cmbDashboardMods, $cmbDashboardTheme, $cmbDashboardTextSize, $cmbApiProviderModel, $cmbApiProviderTemperature)) {
         if ($combo) {
             $combo.BackColor = $surface
             $combo.ForeColor = $text
             $combo.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         }
     }
-    foreach ($list in @($lvFiles, $lvDashboardActivity)) {
+    foreach ($list in @($lvFiles, $lvDashboardActivity, $lvQualityIssues)) {
         if ($list) {
             $list.BackColor = $surface
             $list.ForeColor = $text
@@ -6860,9 +7768,14 @@ function Apply-AppTheme {
             $sideBox.BackColor = $surface
         }
     }
-    foreach ($label in @($lblSearchCrumb, $lblProjectStats, $lblProgress, $lblExisting, $lblCandidate, $lblReferenceTitle, $lblRmkStatus, $lblDashProjects, $lblDashActivity, $lblDashSettings, $lblDashApi, $lblDashApiHint, $lblApiProviderTitle, $lblApiProviderDescription, $lblApiProviderCustomName, $lblApiProviderKeys, $lblApiProviderUrl, $lblApiProviderModel, $lblApiProviderTemperature, $lblApiProviderNotice, $lblDashboardSearch, $lblDashboardMod, $lblDashSettingsNote, $lblDashAppearance, $lblDashTheme, $lblDashTextSize, $lblDashRmk, $lblDashboardRmkWorkspace, $lblDashboardRmkReference, $lblDashboardRmkNote)) {
+    foreach ($label in @($lblSearchCrumb, $lblProjectStats, $lblProgress, $lblExisting, $lblCandidate, $lblReferenceTitle, $lblRmkStatus, $lblDiffSummary, $lblDiffSource, $lblDiffBefore, $lblDiffAfter, $lblHistoryDetail, $lblQualitySummary, $lblSelectedQuality, $lblDashProjects, $lblDashIntro, $lblDashProviderStatus, $lblDashProviderHint, $lblDashActivity, $lblDashSettings, $lblDashApi, $lblDashApiHint, $lblApiProviderTitle, $lblApiProviderDescription, $lblApiProviderCustomName, $lblApiProviderKeys, $lblApiProviderUrl, $lblApiProviderModel, $lblApiProviderTemperature, $lblApiProviderNotice, $lblDashboardSearch, $lblDashboardMod, $lblDashSettingsNote, $lblDashAppearance, $lblDashTheme, $lblDashTextSize, $lblDashRmk, $lblDashboardRmkWorkspace, $lblDashboardRmkReference, $lblDashboardRmkNote)) {
         if ($label -and $label -ne $lblSearchCrumb) { $label.ForeColor = $text }
     }
+    $lblDashEyebrow.ForeColor = $primary
+    $lblDashIntro.ForeColor = $muted
+    $lblDashProviderHint.ForeColor = $muted
+    foreach ($step in $dashWorkflowSteps) { $step.ForeColor = $muted }
+    $dashboardDivider.BackColor = $line
     $lblSourceTitle.ForeColor = $muted
     $lblTranslationTitle.ForeColor = $muted
     $lblReferenceTitle.ForeColor = $muted
@@ -6919,8 +7832,19 @@ function Apply-AppTheme {
     $btnRmkBuild.BackColor = $primary
     $btnRmkBuild.ForeColor = [System.Drawing.Color]::White
     $btnRmkBuild.FlatAppearance.BorderColor = $primary
+    $btnQualityRefresh.BackColor = $surface
+    $btnQualityRefresh.ForeColor = $text
+    $btnQualityRefresh.FlatAppearance.BorderColor = $line
+    $btnQualityReport.BackColor = $primary
+    $btnQualityReport.ForeColor = $primaryText
+    $btnQualityReport.FlatAppearance.BorderColor = $primary
+    $btnQualityJump.BackColor = $green
+    $btnQualityJump.ForeColor = [System.Drawing.Color]::White
+    $btnQualityJump.FlatAppearance.BorderColor = $green
     Refresh-StatusFilterButtons
     Resize-ReviewEditorLayout
+    Resize-DiffTab
+    Resize-QualityTab
 
     $tabs.Appearance = [System.Windows.Forms.TabAppearance]::Normal
     $tabs.SizeMode = [System.Windows.Forms.TabSizeMode]::Fixed
@@ -6937,28 +7861,40 @@ function Apply-AppTheme {
     $btnDashProjects.SetBounds(350, 16, 92, 36)
     $btnDashActivity.SetBounds(450, 16, 82, 36)
     $btnDashSettings.SetBounds(540, 16, 82, 36)
+    $btnCommandPalette.SetBounds(($dashWidth - 184), 16, 156, 36)
     $dashHeader.SetBounds(0, 0, $dashWidth, 70)
     $dashContent.SetBounds(0, 70, $dashWidth, [Math]::Max(1, $dashHeight - 70))
-    $lblDashProjects.SetBounds(32, 24, 220, 34)
+    $lblDashEyebrow.SetBounds(32, 22, 360, 18)
+    $lblDashProjects.SetBounds(32, 42, 360, 34)
+    $lblDashIntro.SetBounds(32, 78, [Math]::Max(360, [int]($dashWidth * 0.54)), 24)
+    $providerWidth = [Math]::Max(250, [Math]::Min(420, [int]($dashWidth * 0.30)))
+    $providerX = $dashWidth - 32 - $providerWidth
+    $lblDashProviderStatus.SetBounds($providerX, 26, $providerWidth, 26)
+    $lblDashProviderStatus.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+    $lblDashProviderHint.SetBounds($providerX, 54, $providerWidth, 22)
+    $lblDashProviderHint.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+    $dashWorkflow.SetBounds(32, 110, [Math]::Max(420, $dashWidth - 64), 30)
+    $dashboardDivider.SetBounds(32, 148, [Math]::Max(320, $dashWidth - 64), 1)
     $searchWidth = [Math]::Min(360, [Math]::Max(250, [int]($dashWidth * 0.25)))
     $buttonTotal = 126 + 90 + 90 + 16
     $modX = 32 + $searchWidth + 28
     $buttonX = $dashWidth - 32 - $buttonTotal
     $comboWidth = [Math]::Max(180, $buttonX - $modX - 14)
-    $lblDashboardSearch.SetBounds(32, 72, 170, 20)
-    $txtDashboardSearch.SetBounds(32, 96, $searchWidth, 34)
-    $lblDashboardMod.SetBounds($modX, 72, 170, 20)
-    $cmbDashboardMods.SetBounds($modX, 96, $comboWidth, 34)
-    $btnDashboardAddMod.SetBounds($buttonX, 96, 126, 34)
-    $btnDashboardChooseMod.SetBounds(($buttonX + 134), 96, 90, 34)
-    $btnDashboardRefreshMods.SetBounds(($buttonX + 232), 96, 90, 34)
+    $lblDashboardSearch.SetBounds(32, 166, 170, 20)
+    $txtDashboardSearch.SetBounds(32, 190, $searchWidth, 34)
+    $lblDashboardMod.SetBounds($modX, 166, 170, 20)
+    $cmbDashboardMods.SetBounds($modX, 190, $comboWidth, 34)
+    $btnDashboardAddMod.SetBounds($buttonX, 190, 126, 34)
+    $btnDashboardChooseMod.SetBounds(($buttonX + 134), 190, 90, 34)
+    $btnDashboardRefreshMods.SetBounds(($buttonX + 232), 190, 90, 34)
     foreach ($button in @($btnDashboardChooseMod, $btnDashboardRefreshMods)) {
         $button.BackColor = $surface
         $button.ForeColor = $text
         $button.FlatAppearance.BorderColor = $line
     }
-    $flowDashboardProjects.SetBounds(22, 152, [Math]::Max(320, $dashWidth - 44), [Math]::Max(260, $dashHeight - 176))
-    $lvDashboardActivity.SetBounds(24, 66, [Math]::Max(320, $dashWidth - 48), [Math]::Max(260, $dashHeight - 154))
+    $dashboardPageHeight = [Math]::Max(1, $dashHeight - 70)
+    $flowDashboardProjects.SetBounds(22, 244, [Math]::Max(320, $dashWidth - 44), [Math]::Max(180, $dashboardPageHeight - 268))
+    $lvDashboardActivity.SetBounds(24, 66, [Math]::Max(320, $dashWidth - 48), [Math]::Max(220, $dashboardPageHeight - 90))
     Resize-DashboardSettingsLayout
     Refresh-ApiProviderButtons
     if ($dashboardPanel.Visible) { Refresh-DashboardTabButtons }
@@ -7011,20 +7947,29 @@ Set-AccessibleControl $btnApproveNext "검토 완료 후 다음" "현재 항목�
 Set-AccessibleControl $btnApproveAll "전체 검토 완료" "빈 번역, 원문 변경과 주의 항목을 제외한 모든 안전한 번역을 검토 완료로 표시합니다. 단축키 Ctrl+Shift+3." 13
 Set-AccessibleControl $txtExisting "기존 번역" "모드 또는 RMK에서 가져온 기존 Korean 번역입니다." 14
 Set-AccessibleControl $txtCandidate "AI 번역 후보" "AI 또는 Google이 만든 초벌 번역입니다." 15
-Set-AccessibleControl $tabs "참고 정보 탭" "역사, 용어, 메모, RMK, 문제와 로그를 전환합니다." 0
-Set-AccessibleControl $txtHistory "번역 역사" "원문, 기존 번역, AI 후보와 현재 검수 번역을 보여줍니다." 0
+Set-AccessibleControl $tabs "검수 도구 탭" "번역 비교, 용어, 메모, RMK, 품질 검사와 로그를 전환합니다." 0
+Set-AccessibleControl $txtDiffSource "비교 원문" "현재 문자열의 원문입니다." 0
+Set-AccessibleControl $txtDiffBefore "비교 기준 번역" "기존 번역 또는 AI 후보이며 현재 번역과 달라진 부분이 강조됩니다." 1
+Set-AccessibleControl $txtDiffAfter "현재 번역 비교" "현재 검수 번역이며 비교 기준과 달라진 부분이 강조됩니다." 2
+Set-AccessibleControl $txtHistory "번역 상세 기록" "원문, 기존 번역, AI 후보와 현재 검수 번역의 전체 기록입니다." 3
 Set-AccessibleControl $txtTerms "관련 용어와 로컬 번역 메모리" "현재 문자열과 관련된 RimWorld 용어와 동일 원문의 안전한 기존 번역을 출처와 함께 보여줍니다. 자동 적용하지 않습니다." 0
 Set-AccessibleControl $txtMemo "검수 메모" "현재 문자열에 대한 로컬 메모를 편집합니다." 0
 Set-AccessibleControl $txtRmkDetails "RMK 연결 정보" "현재 프로젝트의 RMK 번역 경로, 버전과 Git 작업 상태를 보여줍니다." 0
 Set-AccessibleControl $btnRmkRefresh "RMK 상태 갱신" "RMK 구독본과 작업 클론에서 현재 프로젝트를 다시 찾습니다." 1
 Set-AccessibleControl $btnRmkOpen "RMK 폴더 열기" "현재 RMK 번역 항목 또는 작업 클론 폴더를 엽니다." 2
 Set-AccessibleControl $btnRmkBuild "RMK LoadFolders 빌드" "RMK 작업 클론의 LoadFoldersBuilder를 실행합니다." 3
-Set-AccessibleControl $txtWarnings "주의 사항" "토큰 누락, 림월드 조사 표기 오류와 안전 적용 여부 등 현재 문자열의 문제를 보여줍니다." 0
+Set-AccessibleControl $cmbQualityCategory "품질 문제 필터" "오류, 경고, 미번역, 원문 변경, 토큰과 길이 이상 등 프로젝트 품질 문제를 필터링합니다." 0
+Set-AccessibleControl $btnQualityRefresh "프로젝트 품질 다시 검사" "현재 검수 프로젝트 전체 문자열의 품질 문제를 다시 계산합니다." 1
+Set-AccessibleControl $btnQualityReport "개인정보 보호 품질 보고서" "원문과 번역문, API 키, 절대 경로를 제외한 집계 HTML 보고서를 저장합니다." 2
+Set-AccessibleControl $lvQualityIssues "프로젝트 품질 문제 목록" "현재 프로젝트에서 찾은 미번역, 원문 변경, 토큰, 길이와 중복 문제입니다." 3
+Set-AccessibleControl $txtWarnings "선택 품질 문제 설명" "선택한 문제의 원인과 현재 문자열의 안전 검사 결과를 보여줍니다." 4
+Set-AccessibleControl $btnQualityJump "품질 문제 문자열로 이동" "선택한 품질 문제가 있는 번역 문자열로 이동합니다." 5
 Set-AccessibleControl $txtLog "작업 로그" "원문 로드, 번역과 적용 과정의 로그입니다." 0
 
 Set-AccessibleControl $btnDashProjects "프로젝트 탭" "로컬 번역 프로젝트를 표시합니다." 0
 Set-AccessibleControl $btnDashActivity "활동 탭" "최근 번역과 검토 활동을 표시합니다." 1
 Set-AccessibleControl $btnDashSettings "설정 탭" "API와 화면 설정을 표시합니다." 2
+Set-AccessibleControl $btnCommandPalette "명령 찾기" "검색 가능한 작업 명령을 엽니다. 단축키 Ctrl+Shift+P." 3
 Set-AccessibleControl $btnExportDiagnostics "진단 번들 저장" "원문, 번역문, 키, API 키, 전체 경로와 원시 로그를 제외한 로컬 진단 ZIP을 저장합니다." 6
 Set-AccessibleControl $txtDashboardSearch "프로젝트 검색" "모드 이름, Workshop ID 또는 패키지 ID를 검색합니다." 0
 Set-AccessibleControl $cmbDashboardMods "프로젝트 대상 모드" "자동으로 찾은 RimWorld 모드 중 프로젝트로 만들 모드를 선택합니다." 1
@@ -7067,6 +8012,7 @@ $toolTip.SetToolTip($btnSave, "저장 (Ctrl+S)")
 $toolTip.SetToolTip($btnLoad, "원문 갱신 (F5)")
 $toolTip.SetToolTip($btnTranslate, "AI 번역 (F9)")
 $toolTip.SetToolTip($btnStop, "AI 번역 중지 (Shift+F9)")
+$toolTip.SetToolTip($btnCommandPalette, "명령 찾기 (Ctrl+Shift+P)")
 $toolTip.SetToolTip($txtTranslation, "번역문 입력으로 이동 (F2)")
 $toolTip.SetToolTip($btnPrev, "이전 문자열 (Shift+F3 또는 Alt+↑)")
 $toolTip.SetToolTip($btnNext, "다음 문자열 (F3 또는 Alt+↓)")
@@ -7167,6 +8113,7 @@ $btnSave.Add_Click({ Save-ReviewWithDuplicatePrompt })
 $btnDashProjects.Add_Click({ Show-Dashboard "projects" })
 $btnDashActivity.Add_Click({ Show-Dashboard "activity" })
 $btnDashSettings.Add_Click({ Show-Dashboard "settings" })
+$btnCommandPalette.Add_Click({ Show-CommandPalette })
 $btnExportDiagnostics.Add_Click({ Export-DiagnosticBundle })
 $txtDashboardSearch.Add_TextChanged({
     $dashboardSearchTimer.Stop()
@@ -7219,6 +8166,20 @@ $chkDashboardRmkUseExisting.Add_CheckedChanged({
 $btnRmkRefresh.Add_Click({ Refresh-RmkPanel -Force })
 $btnRmkOpen.Add_Click({ Open-RmkFolder })
 $btnRmkBuild.Add_Click({ Build-RmkWorkspace })
+$cmbQualityCategory.Add_SelectedIndexChanged({ Refresh-QualityCenter })
+$btnQualityRefresh.Add_Click({ Invoke-QualityCenterRefresh -Force })
+$btnQualityReport.Add_Click({ Export-QualityReport })
+$lvQualityIssues.Add_RetrieveVirtualItem({
+    $index = [int]$_.ItemIndex
+    if ($index -ge 0 -and $index -lt $script:visibleQualityIssues.Count) {
+        $_.Item = New-QualityListViewItem $script:visibleQualityIssues[$index]
+    } else {
+        $_.Item = [System.Windows.Forms.ListViewItem]::new("")
+    }
+})
+$lvQualityIssues.Add_SelectedIndexChanged({ Show-SelectedQualityIssue })
+$lvQualityIssues.Add_DoubleClick({ Jump-ToSelectedQualityIssue })
+$btnQualityJump.Add_Click({ Jump-ToSelectedQualityIssue })
 $cmbSearchField.Add_SelectedIndexChanged({ if (-not $script:loading) { Refresh-ItemList -SelectRowIndex $script:currentRowIndex } })
 $txtSearch.Add_TextChanged({
     if ($script:loading) { return }
@@ -7250,6 +8211,11 @@ $cmbStatus.Add_SelectedIndexChanged({
 $tabs.Add_SelectedIndexChanged({
     if ($tabs.SelectedTab -eq $tabRmk) {
         Refresh-RmkPanel
+        return
+    }
+    if ($tabs.SelectedTab -eq $tabIssues) {
+        Save-CurrentEdit
+        Invoke-QualityCenterRefresh
         return
     }
     if ($tabs.SelectedTab -ne $tabTerms) { return }
@@ -7289,6 +8255,12 @@ $txtTranslation.Add_TextChanged({
             [System.StringComparison]::Ordinal
         )
         $script:dirty = $true
+        $script:qualityDirty = $true
+        if ($script:currentRowIndex -ge 0 -and $script:currentRowIndex -lt $script:rows.Count) {
+            $diffRow = $script:rows[$script:currentRowIndex]
+            $diffDecision = Get-Decision $diffRow
+            Update-TranslationDiffView -Source (ConvertTo-FlatString $diffRow.source) -Existing (ConvertTo-FlatString $diffRow.existing) -Candidate (ConvertTo-FlatString $diffRow.candidate) -Translation (ConvertTo-FlatString $txtTranslation.Text) -SourceChanged (ConvertTo-BoolValue $diffDecision.sourceChanged)
+        }
         $lblSave.Text = if ($script:autoSave) { "자동 저장 대기" } else { "저장 필요" }
         Queue-AutoSave
     }
@@ -7351,7 +8323,19 @@ $txtExisting.Add_DoubleClick({ Copy-ToClipboard $txtExisting.Text })
 $txtMeta.Add_DoubleClick({ Copy-ToClipboard $txtMeta.Text })
 
 $form.Add_KeyDown({
-    if ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::F) {
+    if ($_.Control -and $_.Shift -and $_.KeyCode -eq [System.Windows.Forms.Keys]::P) {
+        Show-CommandPalette
+        $_.SuppressKeyPress = $true
+    } elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::Home) {
+        Show-Dashboard "projects"
+        $_.SuppressKeyPress = $true
+    } elseif ($_.Alt -and $_.KeyCode -eq [System.Windows.Forms.Keys]::Q -and -not $dashboardPanel.Visible) {
+        $tabs.SelectedTab = $tabIssues
+        $_.SuppressKeyPress = $true
+    } elseif ($_.Alt -and $_.KeyCode -eq [System.Windows.Forms.Keys]::C -and -not $dashboardPanel.Visible) {
+        $tabs.SelectedTab = $tabHistory
+        $_.SuppressKeyPress = $true
+    } elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::F) {
         if ($dashboardPanel.Visible) {
             [void]$txtDashboardSearch.Focus()
             $txtDashboardSearch.SelectAll()
@@ -7440,6 +8424,10 @@ $form.Add_KeyDown({
 $timer = [System.Windows.Forms.Timer]::new()
 $timer.Interval = 250
 $timer.Add_Tick({
+    if ($operationOverlay -and $operationOverlay.Visible) {
+        $script:operationPulse = ([int]$script:operationPulse + 1) % 1000
+        $pnlOperationScan.Invalidate()
+    }
     foreach ($line in (Read-NewProcessLogLines)) {
         Add-Log $line
         Update-ProgressFromLine $line
@@ -7483,12 +8471,15 @@ $timer.Add_Tick({
             if ($partialLoaded) {
                 $lblRunStatus.Text = "중지됨 · 완료분 복구"
                 Add-Log "중지 완료. 완료된 배치를 검수 화면에 복구했습니다."
+                Complete-OperationOverlay -Kind "cancelled" -Title "작업을 중지하고 완료분을 복구했습니다" -Detail "완료된 배치는 검수 프로젝트에 남아 있습니다."
             } else {
                 $lblRunStatus.Text = "중지됨"
                 Add-Log "사용자 요청으로 중지 완료."
+                Complete-OperationOverlay -Kind "cancelled" -Title "작업을 중지했습니다" -Detail "완료된 결과가 없거나 검수 프로젝트를 만들기 전 단계에서 중지되었습니다."
             }
         } elseif ($exitCode -eq 0) {
             if ($progressRun.Maximum -gt 0) { $progressRun.Value = $progressRun.Maximum }
+            $overlayFailed = $false
             if ($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath -PathType Container)) {
                 try {
                     if ($isSourceRefresh) {
@@ -7511,12 +8502,22 @@ $timer.Add_Tick({
                 } catch {
                     $lblRunStatus.Text = "검수 결과 열기 실패"
                     Add-Log "검수 결과를 열지 못했습니다: $($_.Exception.Message)"
+                    $overlayFailed = $true
+                    Complete-OperationOverlay -Kind "error" -Title "결과는 생성됐지만 열지 못했습니다" -Detail $_.Exception.Message
                 }
             } else {
                 $lblRunStatus.Text = if ($isSourceRefresh) { "원문 로드 완료" } else { "완료" }
             }
+            if (-not $overlayFailed) {
+                if ($isSourceRefresh) {
+                    Complete-OperationOverlay -Kind "completed" -Title "원문 분석이 완료되었습니다" -Detail "번역 가능한 문자열과 기존 번역을 검수 프로젝트에 불러왔습니다."
+                } else {
+                    Complete-OperationOverlay -Kind "completed" -Title "초벌 번역이 완료되었습니다" -Detail "새 번역 후보를 불러왔습니다. 이제 문제 항목을 확인하고 검토할 수 있습니다."
+                }
+            }
         } else {
             $lblRunStatus.Text = if ($isSourceRefresh) { "원문 로드 실패" } else { "종료 코드 $exitCode" }
+            Complete-OperationOverlay -Kind "error" -Title $(if ($isSourceRefresh) { "원문 분석에 실패했습니다" } else { "번역 작업에 실패했습니다" }) -Detail "프로세스 종료 코드 $exitCode · 아래 작업 로그에서 원인을 확인하세요."
         }
 
         try { $script:process.Dispose() } catch {}
@@ -7576,6 +8577,8 @@ $form.Add_FormClosing({
 
 $form.Add_FormClosed({
     if ($resizeLayoutTimer) { $resizeLayoutTimer.Dispose() }
+    if ($script:previewPreflightDialog) { try { $script:previewPreflightDialog.Dispose() } catch {}; $script:previewPreflightDialog = $null }
+    if ($script:previewCommandPaletteDialog) { try { $script:previewCommandPaletteDialog.Dispose() } catch {}; $script:previewCommandPaletteDialog = $null }
     foreach ($font in @($script:fontCache.Values)) {
         try { $font.Dispose() } catch {}
     }
@@ -7633,8 +8636,39 @@ $form.Add_Shown({
             $initialTab = if ($InitialDashboardTab -in @("projects", "activity", "settings")) { $InitialDashboardTab } else { "projects" }
             Show-Dashboard $initialTab
         }
+        switch ($PreviewOperationState) {
+            "loading" {
+                Show-OperationOverlay -Title "초벌 번역 실행" -Detail "Cerebras · English 원문 · 검수 프로젝트에만 저장" -OperationType "Translation"
+                Update-OperationOverlay -Operation (Get-RimWorldOperationStateFromLine "Translating batch 3/12 (40 entries)...") -Line "Translating batch 3/12 (40 entries)..."
+            }
+            "error" {
+                Show-OperationOverlay -Title "초벌 번역 실행" -Detail "검수 프로젝트를 준비했습니다." -OperationType "Translation"
+                Add-OperationOverlayLog "Batch 3/12 failed after retries: HTTP 429"
+                Complete-OperationOverlay -Kind "error" -Title "번역 작업에 실패했습니다" -Detail "요청 한도를 확인한 뒤 실패한 작업만 다시 시도할 수 있습니다."
+            }
+            "cancelled" {
+                Show-OperationOverlay -Title "초벌 번역 실행" -Detail "완료된 배치를 보존합니다." -OperationType "Translation"
+                Complete-OperationOverlay -Kind "cancelled" -Title "작업을 중지했습니다" -Detail "완료된 배치는 가능한 경우 검수 프로젝트에 남아 있습니다."
+            }
+            "completed" {
+                Show-OperationOverlay -Title "초벌 번역 실행" -Detail "번역 후보를 검수 프로젝트에 저장했습니다." -OperationType "Translation"
+                Complete-OperationOverlay -Kind "completed" -Title "초벌 번역이 완료되었습니다" -Detail "문제 항목을 확인하고 검토를 시작할 수 있습니다."
+            }
+        }
+        if ($PreviewTranslationPreflight) {
+            $script:previewPreflightDialog = Select-AiTranslationMode -ExistingInfo ([pscustomobject]@{
+                ReviewTranslationCount = @($script:decisions.Values | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.text) }).Count
+                KoreanFileCount = 4
+                RmkFileCount = 12
+                HasExistingTranslation = $true
+            }) -PreviewOnly
+        }
+        if ($PreviewCommandPalette) { $script:previewCommandPaletteDialog = Show-CommandPalette -PreviewOnly }
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("검토 결과를 열지 못했습니다.`r`n$($_.Exception.Message)", "RimWorld AI Translator") | Out-Null
+        Add-Log "초기 화면 구성 실패: $($_.Exception.Message)"
+        if ([string]::IsNullOrWhiteSpace($script:layoutSnapshotPath)) {
+            [System.Windows.Forms.MessageBox]::Show("검토 결과를 열지 못했습니다.`r`n$($_.Exception.Message)", "RimWorld AI Translator") | Out-Null
+        }
     }
 
     # RMK 폴더 탐색은 설정 탭, 번역 시작, 내보내기처럼 실제로 필요할 때 수행한다.
@@ -7672,26 +8706,96 @@ $form.Add_Shown({
                 if ($snapshotDir -and -not (Test-Path -LiteralPath $snapshotDir)) {
                     New-Item -ItemType Directory -Force -Path $snapshotDir | Out-Null
                 }
+                $form.Invalidate($true)
+                $form.Update()
+                [System.Windows.Forms.Application]::DoEvents()
+                [System.Threading.Thread]::Sleep(180)
                 $form.Refresh()
                 [System.Windows.Forms.Application]::DoEvents()
                 $bitmap = [System.Drawing.Bitmap]::new($form.ClientSize.Width, $form.ClientSize.Height)
                 try {
-                    $rect = [System.Drawing.Rectangle]::new(0, 0, $form.ClientSize.Width, $form.ClientSize.Height)
-                    $form.DrawToBitmap($bitmap, $rect)
+                    $captured = $false
+                    $screenGraphics = $null
+                    try {
+                        if ($script:previewPreflightDialog -and $script:previewPreflightDialog.Visible) {
+                            $script:previewPreflightDialog.Activate()
+                            $script:previewPreflightDialog.BringToFront()
+                        } elseif ($script:previewCommandPaletteDialog -and $script:previewCommandPaletteDialog.Visible) {
+                            $script:previewCommandPaletteDialog.Activate()
+                            $script:previewCommandPaletteDialog.BringToFront()
+                        } else {
+                            $form.Activate()
+                            $form.BringToFront()
+                        }
+                        [System.Windows.Forms.Application]::DoEvents()
+                        $clientOrigin = $form.PointToScreen([System.Drawing.Point]::Empty)
+                        $clientEnd = $form.PointToScreen([System.Drawing.Point]::new($form.ClientSize.Width, $form.ClientSize.Height))
+                        $physicalWidth = [Math]::Max(1, $clientEnd.X - $clientOrigin.X)
+                        $physicalHeight = [Math]::Max(1, $clientEnd.Y - $clientOrigin.Y)
+                        $frameRect = [RimWorldTranslatorCaptureRect]::new()
+                        $frameResult = [RimWorldTranslatorCaptureMethods]::DwmGetWindowAttribute(
+                            $form.Handle,
+                            9,
+                            [ref]$frameRect,
+                            [System.Runtime.InteropServices.Marshal]::SizeOf([type][RimWorldTranslatorCaptureRect])
+                        )
+                        if ($frameResult -eq 0 -and $form.Bounds.Width -gt 0 -and $form.Bounds.Height -gt 0) {
+                            $scaleX = ($frameRect.Right - $frameRect.Left) / [double]$form.Bounds.Width
+                            $scaleY = ($frameRect.Bottom - $frameRect.Top) / [double]$form.Bounds.Height
+                            if ($scaleX -ge 0.75 -and $scaleX -le 3.0 -and $scaleY -ge 0.75 -and $scaleY -le 3.0) {
+                                $relativeClientX = $clientOrigin.X - $form.Bounds.Left
+                                $relativeClientY = $clientOrigin.Y - $form.Bounds.Top
+                                $clientOrigin = [System.Drawing.Point]::new(
+                                    [int][Math]::Round($frameRect.Left + ($relativeClientX * $scaleX)),
+                                    [int][Math]::Round($frameRect.Top + ($relativeClientY * $scaleY))
+                                )
+                                $physicalWidth = [Math]::Max(1, [int][Math]::Round($form.ClientSize.Width * $scaleX))
+                                $physicalHeight = [Math]::Max(1, [int][Math]::Round($form.ClientSize.Height * $scaleY))
+                            }
+                        }
+                        $screenBitmap = [System.Drawing.Bitmap]::new($physicalWidth, $physicalHeight)
+                        try {
+                            $screenGraphics = [System.Drawing.Graphics]::FromImage($screenBitmap)
+                            $screenGraphics.CopyFromScreen($clientOrigin, [System.Drawing.Point]::Empty, [System.Drawing.Size]::new($physicalWidth, $physicalHeight), [System.Drawing.CopyPixelOperation]::SourceCopy)
+                            $screenGraphics.Dispose()
+                            $screenGraphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                            $screenGraphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                            $screenGraphics.DrawImage($screenBitmap, [System.Drawing.Rectangle]::new(0, 0, $bitmap.Width, $bitmap.Height))
+                        } finally {
+                            $screenBitmap.Dispose()
+                        }
+                        $captured = $true
+                    } catch {
+                        $captured = $false
+                    } finally {
+                        if ($screenGraphics) { $screenGraphics.Dispose() }
+                    }
+                    if (-not $captured) {
+                        $rect = [System.Drawing.Rectangle]::new(0, 0, $form.ClientSize.Width, $form.ClientSize.Height)
+                        $form.DrawToBitmap($bitmap, $rect)
+                    }
                     $bitmap.Save($script:layoutSnapshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
                 } finally {
                     $bitmap.Dispose()
                 }
                 $auditPath = [System.IO.Path]::ChangeExtension($script:layoutSnapshotPath, ".accessibility.json")
-                $auditRows = @(Get-AccessibilityAuditRows -Parent $form)
+                $auditRows = New-Object "System.Collections.Generic.List[object]"
+                foreach ($auditRow in @(Get-AccessibilityAuditRows -Parent $form)) { [void]$auditRows.Add($auditRow) }
+                foreach ($previewDialog in @($script:previewPreflightDialog, $script:previewCommandPaletteDialog)) {
+                    if (-not $previewDialog -or -not $previewDialog.Visible) { continue }
+                    foreach ($auditRow in @(Get-AccessibilityAuditRows -Parent $previewDialog -ParentPath $previewDialog.Text)) { [void]$auditRows.Add($auditRow) }
+                }
                 [System.IO.File]::WriteAllText(
                     $auditPath,
-                    ($auditRows | ConvertTo-Json -Depth 5),
+                    ($auditRows.ToArray() | ConvertTo-Json -Depth 5),
                     (New-Object System.Text.UTF8Encoding($false))
                 )
                 $runtimeLogPath = [System.IO.Path]::ChangeExtension($script:layoutSnapshotPath, ".runtime.log")
                 [System.IO.File]::WriteAllText($runtimeLogPath, [string]$txtLog.Text, [System.Text.UTF8Encoding]::new($false))
             } finally {
+                foreach ($previewDialog in @($script:previewPreflightDialog, $script:previewCommandPaletteDialog)) {
+                    if ($previewDialog -and -not $previewDialog.IsDisposed) { try { $previewDialog.Close() } catch {} }
+                }
                 $form.Close()
             }
         })

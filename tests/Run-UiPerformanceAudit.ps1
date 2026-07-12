@@ -4,7 +4,8 @@ param(
     [ValidateRange(100, 20000)]
     [int]$Rows = 5000,
     [ValidateRange(1, 20)]
-    [int]$Iterations = 5
+    [int]$Iterations = 5,
+    [string]$ScenarioName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -126,21 +127,73 @@ try {
     }
     Write-Utf8Text (Join-Path $memoryReviewRoot "review-decisions.json") ($memoryDecisions | ConvertTo-Json -Depth 7 -Compress)
 
+    $dashboardReviewRoot = Join-Path $workspace "dashboard-review"
+    Copy-Item -LiteralPath $reviewRoot -Destination $dashboardReviewRoot -Recurse
+    $dashboardDecisions = [ordered]@{
+        version = 5
+        sparse = $true
+        reviewRoot = $dashboardReviewRoot
+        comparison = Join-Path $dashboardReviewRoot "_TranslationAudit\synthetic-comparison.json"
+        updatedAt = [DateTime]::UtcNow.ToString("o")
+        items = @(
+            [ordered]@{ id = "E000001"; key = "Synthetic.Entry.0"; target = "Keyed\Synthetic.xml"; status = "approved"; text = "$korean 0"; translationOrigin = "local"; sourceText = "needle source 0 with a deliberately long localization sentence for layout stress"; sourceChanged = $false },
+            [ordered]@{ id = "E000002"; key = "Synthetic.Entry.1"; target = "Keyed\Synthetic.xml"; status = "translated"; text = "$korean 1"; translationOrigin = "ai"; sourceText = "Synthetic source 1"; sourceChanged = $false },
+            [ordered]@{ id = "E000003"; key = "Synthetic.Entry.2"; target = "Keyed\Synthetic.xml"; status = "pending"; text = "$korean old"; translationOrigin = "rmk"; sourceText = "Synthetic source before update"; previousSourceText = "Synthetic source before update"; sourceChanged = $true }
+        )
+    }
+    Write-Utf8Text (Join-Path $dashboardReviewRoot "review-decisions.json") ($dashboardDecisions | ConvertTo-Json -Depth 7 -Compress)
+    $dashboardModRoot = Join-Path $workspace "FrontierFurniture"
+    [System.IO.Directory]::CreateDirectory($dashboardModRoot) | Out-Null
+
     $scenarios = @(
+        [pscustomobject]@{ Name = "dashboard-empty-minimum-light"; Width = 900; Height = 600; Theme = "Light"; TextSize = 12; HighContrast = $false; Measure = $false; Dashboard = "projects" },
+        [pscustomobject]@{ Name = "dashboard-projects-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $false; Dashboard = "projects"; ProjectStore = $true },
+        [pscustomobject]@{ Name = "dashboard-settings-dark"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false; Dashboard = "settings" },
         [pscustomobject]@{ Name = "minimum-light-large-text"; Width = 900; Height = 600; Theme = "Light"; TextSize = 12; HighContrast = $false; Measure = $false },
         [pscustomobject]@{ Name = "notebook-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $true },
         [pscustomobject]@{ Name = "desktop-dark"; Width = 1920; Height = 1080; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false },
         [pscustomobject]@{ Name = "notebook-dark-high-contrast"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 12; HighContrast = $true; Measure = $false },
+        [pscustomobject]@{ Name = "translation-preflight-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $false; Preflight = $true },
+        [pscustomobject]@{ Name = "command-palette-dark"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false; CommandPalette = $true },
+        [pscustomobject]@{ Name = "operation-loading-dark"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false; OperationState = "loading" },
+        [pscustomobject]@{ Name = "operation-error-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $false; OperationState = "error" },
+        [pscustomobject]@{ Name = "operation-cancelled-light"; Width = 900; Height = 600; Theme = "Light"; TextSize = 12; HighContrast = $false; Measure = $false; OperationState = "cancelled" },
+        [pscustomobject]@{ Name = "operation-completed-dark"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false; OperationState = "completed" },
+        [pscustomobject]@{ Name = "quality-center-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $false; SideTab = "issues" },
         [pscustomobject]@{ Name = "translation-memory-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $false; ReviewRoot = $memoryReviewRoot; SideTab = "terms" }
     )
+    if (-not [string]::IsNullOrWhiteSpace($ScenarioName)) {
+        $scenarios = @($scenarios | Where-Object { $_.Name -eq $ScenarioName })
+        Assert-True ($scenarios.Count -eq 1) "Unknown UI audit scenario: $ScenarioName"
+    }
     $results = New-Object "System.Collections.Generic.List[object]"
     foreach ($scenario in $scenarios) {
         $snapshotPath = Join-Path $outputFull ($scenario.Name + ".png")
         $appDataRoot = Join-Path $workspace ("appdata-" + $scenario.Name)
         $scenarioReviewRoot = if ($scenario.PSObject.Properties["ReviewRoot"] -and $scenario.ReviewRoot) { [string]$scenario.ReviewRoot } else { $reviewRoot }
+        if ($scenario.PSObject.Properties["ProjectStore"] -and $scenario.ProjectStore) {
+            [System.IO.Directory]::CreateDirectory($appDataRoot) | Out-Null
+            $projectStore = [ordered]@{
+                version = 2
+                projects = @([ordered]@{
+                    id = "fixture-frontier-furniture"
+                    name = "Frontier Furniture Expansion"
+                    modRoot = $dashboardModRoot
+                    packageId = "codex.fixture.frontier"
+                    workshopId = "1234567890"
+                    sourceLanguageFolder = "English"
+                    latestReviewRoot = $dashboardReviewRoot
+                    latestReviewAt = [DateTime]::UtcNow.AddMinutes(-12).ToString("o")
+                    lastAppliedAt = ""
+                    createdAt = [DateTime]::UtcNow.AddDays(-2).ToString("o")
+                    updatedAt = [DateTime]::UtcNow.ToString("o")
+                    runs = @([ordered]@{ createdAt = [DateTime]::UtcNow.AddMinutes(-12).ToString("o") })
+                })
+            }
+            Write-Utf8Text (Join-Path $appDataRoot "projects.json") ($projectStore | ConvertTo-Json -Depth 8 -Compress)
+        }
         $arguments = @(
             "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $repoRoot "Start-RimWorldAiReviewGui.ps1"),
-            "-ReviewRoot", $scenarioReviewRoot,
             "-LayoutSnapshotPath", $snapshotPath,
             "-LayoutSnapshotWidth", $scenario.Width,
             "-LayoutSnapshotHeight", $scenario.Height,
@@ -149,7 +202,15 @@ try {
             "-AppDataRoot", $appDataRoot,
             "-DisableBackgroundDiscovery"
         )
+        if ($scenario.PSObject.Properties["Dashboard"] -and $scenario.Dashboard) {
+            $arguments += @("-InitialDashboardTab", [string]$scenario.Dashboard)
+        } else {
+            $arguments += @("-ReviewRoot", $scenarioReviewRoot)
+        }
         if ($scenario.PSObject.Properties["SideTab"] -and $scenario.SideTab) { $arguments += @("-InitialWorkspaceSideTab", [string]$scenario.SideTab) }
+        if ($scenario.PSObject.Properties["Preflight"] -and $scenario.Preflight) { $arguments += "-PreviewTranslationPreflight" }
+        if ($scenario.PSObject.Properties["CommandPalette"] -and $scenario.CommandPalette) { $arguments += "-PreviewCommandPalette" }
+        if ($scenario.PSObject.Properties["OperationState"] -and $scenario.OperationState) { $arguments += @("-PreviewOperationState", [string]$scenario.OperationState) }
         $performancePath = ""
         if ($scenario.Measure) {
             $performancePath = Join-Path $outputFull "performance.json"
@@ -203,25 +264,28 @@ try {
             image = $image
         })
     }
-    $performanceFile = Join-Path $outputFull "performance.json"
-    $performance = if (Test-Path -LiteralPath $performanceFile -PathType Leaf) {
-        [System.IO.File]::ReadAllText($performanceFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-    } else { $null }
-    Assert-True ($null -ne $performance) "UI performance report was not created."
-    $expectedNeedle = [Math]::Floor(($Rows - 1) / 17) + 1
-    foreach ($searchCase in @($performance.searchCases)) {
-        $expectedMatches = if ([string]$searchCase.query -eq "needle") { $expectedNeedle } else { $Rows }
-        Assert-True ([int]$searchCase.matches -eq $expectedMatches) "Search result count changed for '$($searchCase.query)': expected=$expectedMatches actual=$($searchCase.matches)"
+    $performance = $null
+    if (@($scenarios | Where-Object { $_.Measure }).Count -gt 0) {
+        $performanceFile = Join-Path $outputFull "performance.json"
+        $performance = if (Test-Path -LiteralPath $performanceFile -PathType Leaf) {
+            [System.IO.File]::ReadAllText($performanceFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        } else { $null }
+        Assert-True ($null -ne $performance) "UI performance report was not created."
+        $expectedNeedle = [Math]::Floor(($Rows - 1) / 17) + 1
+        foreach ($searchCase in @($performance.searchCases)) {
+            $expectedMatches = if ([string]$searchCase.query -eq "needle") { $expectedNeedle } else { $Rows }
+            Assert-True ([int]$searchCase.matches -eq $expectedMatches) "Search result count changed for '$($searchCase.query)': expected=$expectedMatches actual=$($searchCase.matches)"
+        }
+        $candidateCount = [Math]::Floor(($Rows - 1) / 3) + 1
+        $existingCount = [Math]::Floor(($Rows - 1) / 5) + 1
+        $overlapCount = [Math]::Floor(($Rows - 1) / 15) + 1
+        $expectedTranslated = $candidateCount + $existingCount - $overlapCount
+        $expectedPending = $Rows - $expectedTranslated
+        $translatedStatus = ConvertFrom-Json '"\uBC88\uC5ED\uB428"'
+        $pendingStatus = ConvertFrom-Json '"\uBBF8\uBC88\uC5ED"'
+        Assert-True ([int]$performance.statusFilterMatches.PSObject.Properties[$translatedStatus].Value -eq $expectedTranslated) "Translated status filter count changed."
+        Assert-True ([int]$performance.statusFilterMatches.PSObject.Properties[$pendingStatus].Value -eq $expectedPending) "Pending status filter count changed."
     }
-    $candidateCount = [Math]::Floor(($Rows - 1) / 3) + 1
-    $existingCount = [Math]::Floor(($Rows - 1) / 5) + 1
-    $overlapCount = [Math]::Floor(($Rows - 1) / 15) + 1
-    $expectedTranslated = $candidateCount + $existingCount - $overlapCount
-    $expectedPending = $Rows - $expectedTranslated
-    $translatedStatus = ConvertFrom-Json '"\uBC88\uC5ED\uB428"'
-    $pendingStatus = ConvertFrom-Json '"\uBBF8\uBC88\uC5ED"'
-    Assert-True ([int]$performance.statusFilterMatches.PSObject.Properties[$translatedStatus].Value -eq $expectedTranslated) "Translated status filter count changed."
-    Assert-True ([int]$performance.statusFilterMatches.PSObject.Properties[$pendingStatus].Value -eq $expectedPending) "Pending status filter count changed."
 
     $summary = [ordered]@{
         version = 1

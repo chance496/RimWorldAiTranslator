@@ -12,6 +12,7 @@ function Get-RimWorldQualityIssues {
 
     $issues = New-Object "System.Collections.Generic.List[object]"
     $identities = @{}
+    $hasTokenValidator = $null -ne (Get-Command Test-RimWorldProtectedTokenStructure -ErrorAction SilentlyContinue)
     $index = -1
     foreach ($entry in @($Entries)) {
         $index++
@@ -24,9 +25,19 @@ function Get-RimWorldQualityIssues {
         $rowIndex = [int](Get-RimWorldQualityProperty $entry @("index", "Index") $index)
         $sourceChanged = [bool](Get-RimWorldQualityProperty $entry @("sourceChanged", "SourceChanged", "rmkSourceChanged") $false)
         $safe = [bool](Get-RimWorldQualityProperty $entry @("safeToApply", "SafeToApply", "safe", "Safe") $true)
+        $tokenOrTagIssue = Get-RimWorldQualityProperty $entry @("tokenOrTagIssue", "TokenOrTagIssue") $null
         $identity = ($target.ToLowerInvariant() + "`u{1f}" + $key)
-        if (-not $identities.ContainsKey($identity)) { $identities[$identity] = New-Object "System.Collections.Generic.List[int]" }
-        [void]$identities[$identity].Add($rowIndex)
+        $identityRow = [pscustomobject]@{ Index = $rowIndex; Key = $key; Target = $target; DefClass = $defClass }
+        if (-not $identities.ContainsKey($identity)) {
+            $identities[$identity] = $identityRow
+        } elseif ($identities[$identity] -is [System.Collections.Generic.List[object]]) {
+            [void]$identities[$identity].Add($identityRow)
+        } else {
+            $duplicates = New-Object "System.Collections.Generic.List[object]"
+            [void]$duplicates.Add($identities[$identity])
+            [void]$duplicates.Add($identityRow)
+            $identities[$identity] = $duplicates
+        }
 
         $base = [ordered]@{ Index = $rowIndex; Key = $key; Target = $target; DefClass = $defClass }
         if ([string]::IsNullOrWhiteSpace($translation)) {
@@ -39,10 +50,11 @@ function Get-RimWorldQualityIssues {
         if (-not $safe) {
             [void]$issues.Add([pscustomobject]($base + [ordered]@{ Category = "Unsafe"; Severity = "error"; Detail = "안전 검사에 통과하지 못했습니다." }))
         }
-        if (Get-Command Test-RimWorldProtectedTokenStructure -ErrorAction SilentlyContinue) {
-            if (-not (Test-RimWorldProtectedTokenStructure -Source $source -Translation $translation)) {
-                [void]$issues.Add([pscustomobject]($base + [ordered]@{ Category = "TokenOrTag"; Severity = "error"; Detail = "보호 토큰 또는 태그의 종류나 개수가 다릅니다." }))
-            }
+        if ($null -eq $tokenOrTagIssue -and $hasTokenValidator) {
+            $tokenOrTagIssue = -not (Test-RimWorldProtectedTokenStructure -Source $source -Translation $translation)
+        }
+        if ([bool]$tokenOrTagIssue) {
+            [void]$issues.Add([pscustomobject]($base + [ordered]@{ Category = "TokenOrTag"; Severity = "error"; Detail = "보호 토큰 또는 태그의 종류나 개수가 다릅니다." }))
         }
         if ($source.Length -ge 3 -and [string]::Equals($source.Trim(), $translation.Trim(), [System.StringComparison]::Ordinal)) {
             [void]$issues.Add([pscustomobject]($base + [ordered]@{ Category = "SameAsSource"; Severity = "info"; Detail = "번역문이 원문과 같습니다." }))
@@ -61,10 +73,10 @@ function Get-RimWorldQualityIssues {
     }
 
     foreach ($pair in $identities.GetEnumerator()) {
-        if ($pair.Value.Count -le 1) { continue }
-        foreach ($rowIndex in @($pair.Value)) {
+        if ($pair.Value -isnot [System.Collections.Generic.List[object]]) { continue }
+        foreach ($duplicate in $pair.Value.ToArray()) {
             [void]$issues.Add([pscustomobject]@{
-                Index = [int]$rowIndex; Key = ""; Target = ""; DefClass = ""
+                Index = [int]$duplicate.Index; Key = [string]$duplicate.Key; Target = [string]$duplicate.Target; DefClass = [string]$duplicate.DefClass
                 Category = "DuplicateIdentity"; Severity = "error"; Detail = "같은 대상 파일과 키가 둘 이상 존재합니다."
             })
         }
