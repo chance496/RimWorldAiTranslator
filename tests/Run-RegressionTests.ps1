@@ -1567,12 +1567,19 @@ function Test-UiAndQualityTools {
     . (Join-Path $script:RepoRoot "RimWorldAiTranslator.UiSystem.ps1")
     . (Join-Path $script:RepoRoot "RimWorldAiTranslator.Quality.ps1")
 
-    $light = Get-RimWorldUiTokens -Mode Light
+    $presets = @(Get-RimWorldUiPresetCatalog)
+    Assert-Equal 5 $presets.Count "Design preset catalog changed unexpectedly."
+    $uniquePresetIds = @($presets.Id | Select-Object -Unique)
+    Assert-Equal 5 $uniquePresetIds.Count "Design preset IDs are not unique."
+    $light = Get-RimWorldUiTokens -Mode Light -Preset Professional
     $dark = Get-RimWorldUiTokens -Mode Dark
     $contrast = Get-RimWorldUiTokens -Mode Light -HighContrast
-    Assert-Equal "#B78342" ([string]$light.Colors.Accent) "Light theme accent token changed."
+    Assert-Equal "#35738A" ([string]$light.Colors.Accent) "Professional light accent token changed."
     Assert-True (-not [string]::Equals([string]$light.Colors.Canvas, [string]$dark.Colors.Canvas, [System.StringComparison]::OrdinalIgnoreCase)) "Light and dark theme canvases are identical."
     Assert-Equal "#FFFFFF" ([string]$contrast.Colors.Border) "High-contrast borders are not explicit."
+    $presetAccents = @(foreach ($preset in $presets) { [string](Get-RimWorldUiTokens -Mode Light -Preset $preset.Id).Colors.Accent })
+    $uniquePresetAccents = @($presetAccents | Select-Object -Unique)
+    Assert-Equal 5 $uniquePresetAccents.Count "Design presets do not have distinct accents."
 
     $estimate = Get-RimWorldTranslationEstimate -Entries @(
         [pscustomobject]@{ source = "abcdefghij"; translation = "" },
@@ -1620,6 +1627,23 @@ function Test-UiAndQualityTools {
         Assert-Contains @($issues.Category) "Unsafe" "Unsafe translation was not detected."
         Assert-Contains @($issues.Category) "Missing" "Missing translation was not detected."
         Assert-Equal 2 @($issues | Where-Object Category -eq "DuplicateIdentity").Count "Duplicate identity must use target plus key."
+
+        $compatibilityIssues = @(Get-RimWorldQualityIssues -Entries @(
+            $null,
+            [pscustomobject]@{
+                Index = 41; RelativeTarget = "Keyed\Legacy.xml"; Key = "Legacy"; SourceText = "Legacy source"
+                Text = "레거시"; DefaultTranslation = ""; DefClass = ""; SourceChanged = $true
+                SafeToApply = $true; TokenOrTagIssue = $false
+            },
+            [pscustomobject]@{
+                index = 42; target = "Keyed\Canonical.xml"; key = "Canonical"; source = "Canonical source"
+                translation = "정규"; existing = ""; defClass = ""; sourceChanged = $true
+                safeToApply = $true; tokenOrTagIssue = $false
+            }
+        ))
+        Assert-Contains @($compatibilityIssues.Index) 41 "Legacy quality row shape is no longer supported."
+        Assert-Contains @($compatibilityIssues.Index) 42 "Canonical quality row shape is no longer supported."
+        Assert-Contains @($compatibilityIssues.Category) "Missing" "Null quality rows must be handled without terminating the audit."
 
         $reportPath = Join-Path $root "quality-report.html"
         [void](Export-RimWorldQualityReport -Path $reportPath -Entries $entries -Issues $issues)

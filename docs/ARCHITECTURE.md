@@ -9,6 +9,7 @@ RimWorldAiTranslator.exe
         -> 프로젝트/설정/검수 상태 (%LOCALAPPDATA%)
         -> Storage / Validation / ProviderValidation / TranslationMemory / Diagnostics 모듈
         -> UiSystem / Quality 모듈
+        -> UiAudit 모듈 (감사 옵션에서만 지연 로드)
         -> Run-RimWorldAiTranslation.ps1
            -> Invoke-RimWorldAiTranslation.ps1
               -> Google 또는 OpenAI 호환 번역 API
@@ -20,11 +21,15 @@ RimWorldAiTranslator.exe
 
 ## 실행과 UI
 
-- `launcher/RimWorldAiTranslatorLauncher.cs`가 패키지 EXE다. Windows 기본 PowerShell을 숨은 프로세스로 시작하고 WinForms 메인 창이 나타날 때까지 준비 창을 표시한다.
+- `launcher/RimWorldAiTranslatorLauncher.cs`가 패키지 EXE다. Windows 기본 PowerShell을 숨은 프로세스로 시작하고 가벼운 무한 진행 표시가 있는 준비 화면을 표시한다. 준비 화면은 실제 완료율을 꾸며내지 않으며 40ms 타이머로 작은 영역만 다시 그린다. WinForms 메인 창은 투명 상태에서 초기 구성을 끝낸 뒤 원자적으로 공개되며, 실행기는 이 공개 상태를 확인한 뒤 준비 화면을 닫는다.
 - `Start-RimWorldAiTranslatorGui.cmd`와 `Start-RimWorldAiTranslatorGui.ps1`는 소스 실행 경로다.
 - `Start-RimWorldAiReviewGui.ps1`가 대시보드, 프로젝트, 모드 탐색, 제공자 설정, 검수 편집기, 저장, RMK와 자식 프로세스 제어를 모두 담당한다.
 - 저장·검증·프로젝트 정리·제공자 설정 점검·동일 원문 번역 메모리·진단 집계는 독립 PowerShell 모듈로 분리되어 GUI와 CLI에서 공유한다.
 - `RimWorldAiTranslator.UiSystem.ps1`는 테마 토큰, 번역 범위 추정, 단순 Diff와 실제 로그 단계 해석을 제공한다. `RimWorldAiTranslator.Quality.ps1`는 품질 문제 모델과 본문 없는 HTML 보고서를 제공한다.
+- `RimWorldAiTranslator.UiAudit.ps1`는 화면 캡처, 실제 글자 잘림·접근성 검사와 성능 보고만 담당한다. 일반 실행에서는 읽지 않고 `LayoutSnapshotPath` 또는 `PerformanceReportPath`가 전달된 감사 실행에서만 지연 로드한다.
+- 대시보드의 반응형 기하 계산은 `Resize-DashboardLayout`이 담당한다. 최대화 창의 네이티브 크기가 확정된 뒤 이 함수와 프로젝트 카드 배치만 다시 실행해 테마 전체를 중복 적용하지 않는다.
+- 이미 생성된 검수 프로젝트는 내용을 숨은 작업 컨트롤에 먼저 구성한 뒤 화면을 전환한다. 새 프로젝트의 첫 원문 분석은 대시보드를 유지한 채 별도 프로세스에서 수행하고, `Load-ReviewRoot`가 끝난 뒤에만 `Show-Workspace`가 완성된 작업 화면을 공개한다. 보이는 작업 화면에서 새 원문·번역 결과를 다시 읽을 때는 폼 자식 전체를 잠그지 않고 `workspaceLoadCover`가 검수 본문을 가린다.
+- `operationOverlay`는 헤더 아래에 겹쳐지는 고정 상태 표면이며 `main`과 `dashContent`의 bounds를 변경하지 않는다. RMK 참조 검색은 정상 `ModList.tsv`를 인덱스로 사용하고, 인덱스에 대상 Workshop/Package ID가 없으면 광범위한 Data 재귀 탐색을 수행하지 않는다. 인덱스가 비었거나 읽히지 않는 예외 경로에서만 호환 fallback을 사용한다.
 
 ## 데이터 흐름
 
@@ -66,6 +71,7 @@ RimWorldAiTranslator.exe
 ## 주요 기술 부채
 
 - UI와 애플리케이션 계층이 하나의 390KB+ PowerShell 파일에 결합되어 있다.
+- `Apply-AppTheme`가 팔레트 적용과 반응형 배치를 함께 조정하는 큰 결합 지점이다. 단순 파일 이동이 아니라 컨트롤 소유권 경계를 먼저 만든 뒤 단계적으로 분리해야 한다.
 - 오프라인 회귀와 UI/성능 runner는 있으나 원격 CI workflow는 없다.
 - PowerShell과 native C#에 Def/토큰/안전 규칙이 중복되어 동기화 회귀 위험이 있다.
 - 빌드와 패키징이 한 스크립트에 결합되어 빠른 build-only/verify-only 경로가 없다.

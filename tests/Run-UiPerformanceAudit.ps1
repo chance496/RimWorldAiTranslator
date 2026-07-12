@@ -56,6 +56,7 @@ function Get-ImageSampleStats([string]$Path) {
         $colors = New-Object "System.Collections.Generic.HashSet[int]"
         $samples = 0
         $nonBlank = 0
+        $nearBlack = 0
         $stepX = [Math]::Max(1, [int]($bitmap.Width / 80))
         $stepY = [Math]::Max(1, [int]($bitmap.Height / 50))
         for ($y = 0; $y -lt $bitmap.Height; $y += $stepY) {
@@ -64,9 +65,11 @@ function Get-ImageSampleStats([string]$Path) {
                 [void]$colors.Add($argb)
                 $samples++
                 if (($argb -band 0x00FFFFFF) -notin @(0x00FFFFFF, 0x00000000)) { $nonBlank++ }
+                $color = [System.Drawing.Color]::FromArgb($argb)
+                if ($color.R -lt 8 -and $color.G -lt 8 -and $color.B -lt 8) { $nearBlack++ }
             }
         }
-        return [pscustomobject]@{ width = $bitmap.Width; height = $bitmap.Height; uniqueColors = $colors.Count; nonBlankRatio = [Math]::Round($nonBlank / [double]$samples, 4) }
+        return [pscustomobject]@{ width = $bitmap.Width; height = $bitmap.Height; uniqueColors = $colors.Count; nonBlankRatio = [Math]::Round($nonBlank / [double]$samples, 4); nearBlackRatio = [Math]::Round($nearBlack / [double]$samples, 4) }
     } finally {
         $bitmap.Dispose()
     }
@@ -147,11 +150,11 @@ try {
 
     $scenarios = @(
         [pscustomobject]@{ Name = "dashboard-empty-minimum-light"; Width = 900; Height = 600; Theme = "Light"; TextSize = 12; HighContrast = $false; Measure = $false; Dashboard = "projects" },
-        [pscustomobject]@{ Name = "dashboard-projects-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $false; Dashboard = "projects"; ProjectStore = $true },
-        [pscustomobject]@{ Name = "dashboard-settings-dark"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false; Dashboard = "settings" },
+        [pscustomobject]@{ Name = "dashboard-projects-light"; Width = 1280; Height = 720; Theme = "Light"; Preset = "Frontier"; TextSize = 10; HighContrast = $false; Measure = $false; Dashboard = "projects"; ProjectStore = $true },
+        [pscustomobject]@{ Name = "dashboard-settings-dark"; Width = 1280; Height = 720; Theme = "Dark"; Preset = "SciFi"; TextSize = 10; HighContrast = $false; Measure = $false; Dashboard = "settings" },
         [pscustomobject]@{ Name = "minimum-light-large-text"; Width = 900; Height = 600; Theme = "Light"; TextSize = 12; HighContrast = $false; Measure = $false },
-        [pscustomobject]@{ Name = "notebook-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $true },
-        [pscustomobject]@{ Name = "desktop-dark"; Width = 1920; Height = 1080; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false },
+        [pscustomobject]@{ Name = "notebook-light"; Width = 1280; Height = 720; Theme = "Light"; Preset = "Vivid"; TextSize = 10; HighContrast = $false; Measure = $true },
+        [pscustomobject]@{ Name = "desktop-dark"; Width = 1920; Height = 1080; Theme = "Dark"; Preset = "Studio"; TextSize = 10; HighContrast = $false; Measure = $false },
         [pscustomobject]@{ Name = "notebook-dark-high-contrast"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 12; HighContrast = $true; Measure = $false },
         [pscustomobject]@{ Name = "translation-preflight-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $false; Preflight = $true },
         [pscustomobject]@{ Name = "command-palette-dark"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false; CommandPalette = $true },
@@ -208,6 +211,7 @@ try {
             $arguments += @("-ReviewRoot", $scenarioReviewRoot)
         }
         if ($scenario.PSObject.Properties["SideTab"] -and $scenario.SideTab) { $arguments += @("-InitialWorkspaceSideTab", [string]$scenario.SideTab) }
+        if ($scenario.PSObject.Properties["Preset"] -and $scenario.Preset) { $arguments += @("-PreviewDesignPreset", [string]$scenario.Preset) }
         if ($scenario.PSObject.Properties["Preflight"] -and $scenario.Preflight) { $arguments += "-PreviewTranslationPreflight" }
         if ($scenario.PSObject.Properties["CommandPalette"] -and $scenario.CommandPalette) { $arguments += "-PreviewCommandPalette" }
         if ($scenario.PSObject.Properties["OperationState"] -and $scenario.OperationState) { $arguments += @("-PreviewOperationState", [string]$scenario.OperationState) }
@@ -242,25 +246,35 @@ try {
         $audit = @(foreach ($row in $parsedAudit) { $row })
         $missingNames = @($audit | Where-Object { $_.visible -and $_.interactive -and [string]::IsNullOrWhiteSpace([string]$_.accessibleName) })
         $clipped = @($audit | Where-Object { $_.visible -and $_.clipped })
+        $textClipped = @($audit | Where-Object { $_.visible -and $_.textClipped })
         $image = Get-ImageSampleStats $snapshotPath
         Assert-True ($image.uniqueColors -ge 12 -and $image.nonBlankRatio -ge 0.1) "UI snapshot appears blank: $($scenario.Name)"
+        if ($scenario.Theme -eq "Light") {
+            Assert-True ($image.nearBlackRatio -lt 0.35) "Light UI snapshot contains abnormal black regions: $($scenario.Name) ratio=$($image.nearBlackRatio)"
+        }
         Assert-True ($missingNames.Count -eq 0) "Visible interactive controls without accessible names: $($scenario.Name) count=$($missingNames.Count)"
         Assert-True ($clipped.Count -eq 0) "Visible controls extend outside a non-scroll parent: $($scenario.Name) count=$($clipped.Count)"
+        Assert-True ($textClipped.Count -eq 0) "Visible control text is clipped: $($scenario.Name) count=$($textClipped.Count)"
         $runtimeText = [System.IO.File]::ReadAllText($runtimeLogPath, [System.Text.Encoding]::UTF8)
         $loadLabel = ConvertFrom-Json '"\uAC80\uC218 \uD654\uBA74 \uB85C\uB4DC: "'
+        $startupLabel = ConvertFrom-Json '"\uCCAB \uD654\uBA74 \uC900\uBE44: "'
         $secondsSuffix = ConvertFrom-Json '"\uCD08"'
         $loadMatch = [regex]::Match($runtimeText, ([regex]::Escape($loadLabel) + '([0-9.,]+)' + [regex]::Escape($secondsSuffix)))
+        $startupMatch = [regex]::Match($runtimeText, ([regex]::Escape($startupLabel) + '([0-9.,]+)' + [regex]::Escape($secondsSuffix)))
         [void]$results.Add([pscustomobject]@{
             name = $scenario.Name
             client = "$($scenario.Width)x$($scenario.Height)"
             theme = $scenario.Theme
+            preset = if ($scenario.PSObject.Properties["Preset"] -and $scenario.Preset) { [string]$scenario.Preset } else { "Professional" }
             textSize = $scenario.TextSize
             highContrast = $scenario.HighContrast
             processElapsedMs = [Math]::Round($watch.Elapsed.TotalMilliseconds, 3)
+            firstShownSeconds = if ($startupMatch.Success) { [double]($startupMatch.Groups[1].Value.Replace(",", "")) } else { -1 }
             reviewLoadSeconds = if ($loadMatch.Success) { [double]($loadMatch.Groups[1].Value.Replace(",", "")) } else { -1 }
             visibleControls = @($audit | Where-Object { $_.visible }).Count
             missingAccessibleNames = $missingNames.Count
             clippedControls = $clipped.Count
+            clippedTextControls = $textClipped.Count
             image = $image
         })
     }
@@ -285,6 +299,10 @@ try {
         $pendingStatus = ConvertFrom-Json '"\uBBF8\uBC88\uC5ED"'
         Assert-True ([int]$performance.statusFilterMatches.PSObject.Properties[$translatedStatus].Value -eq $expectedTranslated) "Translated status filter count changed."
         Assert-True ([int]$performance.statusFilterMatches.PSObject.Properties[$pendingStatus].Value -eq $expectedPending) "Pending status filter count changed."
+        Assert-True ([bool]$performance.visibleReviewReload.atomicCoverUsed) "Visible project reload did not use the atomic loading cover."
+        Assert-True ([double]$performance.visibleReviewReload.totalMilliseconds -lt 15000) "Visible project reload exceeded the 15-second stability limit."
+        Assert-True ([bool]$performance.operationLayout.stableWhileVisible) "Operation status visibility resized or shifted the workspace content."
+        Assert-True ([bool]$performance.operationLayout.stableAfterHide) "Hiding the operation status did not preserve the workspace content bounds."
     }
 
     $summary = [ordered]@{

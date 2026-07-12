@@ -17,8 +17,14 @@ $projectLauncherExe = Join-Path $projectRoot "RimWorldAiTranslator.exe"
 $nativeSource = Join-Path $projectRoot "native\RimWorldTranslatorNative.cs"
 $nativeDll = Join-Path $launcherBuildRoot "RimWorldAiTranslator.Native.dll"
 $projectNativeDll = Join-Path $projectRoot "RimWorldAiTranslator.Native.dll"
+$versionPath = Join-Path $projectRoot "VERSION"
 $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $regressionScript = Join-Path $projectRoot "tests\Run-RegressionTests.ps1"
+
+if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) { throw "VERSION file was not found: $versionPath" }
+$productVersion = [System.IO.File]::ReadAllText($versionPath, [System.Text.Encoding]::ASCII).Trim()
+if ($productVersion -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION must use major.minor.patch: $productVersion" }
+$fileVersion = "$productVersion.0"
 
 function Assert-SafeBuildPath([string]$Path) {
     $projectFull = [System.IO.Path]::GetFullPath($projectRoot).TrimEnd("\", "/")
@@ -101,6 +107,45 @@ if ($LASTEXITCODE -ne 0) {
     throw "Native reader build failed with exit code $LASTEXITCODE."
 }
 
+foreach ($binary in @($launcherExe, $nativeDll)) {
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
+    if ([string]$versionInfo.FileVersion -ne $fileVersion -or [string]$versionInfo.ProductVersion -ne $productVersion) {
+        throw "Built binary version mismatch: $binary (file=$($versionInfo.FileVersion), product=$($versionInfo.ProductVersion), expected=$fileVersion/$productVersion)"
+    }
+}
+
+$cacheSmokeJob = Start-Job -ArgumentList $nativeDll -ScriptBlock {
+    param([string]$AssemblyPath)
+    $ErrorActionPreference = "Stop"
+    Add-Type -LiteralPath $AssemblyPath -ErrorAction Stop
+    $cacheStore = [RimWorldTranslatorRowRuntimeCacheStore]::new()
+    $cacheRow = [pscustomobject]@{ id = "cache-smoke" }
+    $firstCache = $cacheStore.Get($cacheRow)
+    $secondCache = $cacheStore.Get($cacheRow)
+    if (-not [object]::ReferenceEquals($firstCache, $secondCache)) {
+        throw "Native row cache did not return a stable entry."
+    }
+    if ($cacheRow.PSObject.Properties["_runtimeCache"]) {
+        throw "Native row cache mutated the source row."
+    }
+    $cacheStore.Reset()
+    $resetCache = $cacheStore.Get($cacheRow)
+    if ([object]::ReferenceEquals($firstCache, $resetCache)) {
+        throw "Native row cache reset did not discard the previous entry."
+    }
+}
+try {
+    $cacheSmokeJob | Wait-Job | Out-Null
+    if ($cacheSmokeJob.State -ne "Completed") {
+        $reason = $cacheSmokeJob.ChildJobs[0].JobStateInfo.Reason
+        throw "Native row cache smoke failed: $reason"
+    }
+    $cacheSmokeJob | Receive-Job -ErrorAction Stop | Out-Null
+} finally {
+    if ($cacheSmokeJob.State -eq "Running") { $cacheSmokeJob | Stop-Job | Out-Null }
+    $cacheSmokeJob | Remove-Job -Force -ErrorAction SilentlyContinue
+}
+
 try {
     Copy-Item -LiteralPath $launcherExe -Destination $projectLauncherExe -Force -ErrorAction Stop
 } catch {
@@ -131,6 +176,7 @@ $packageFiles = @(
     "RimWorldAiTranslator.Diagnostics.ps1",
     "RimWorldAiTranslator.ProjectCleanup.ps1",
     "RimWorldAiTranslator.UiSystem.ps1",
+    "RimWorldAiTranslator.UiAudit.ps1",
     "RimWorldAiTranslator.Quality.ps1",
     "Invoke-RimWorldAiTranslation.ps1",
     "Run-RimWorldAiTranslation.ps1",
@@ -143,6 +189,8 @@ $packageFiles = @(
     "rimworld-def-field-rules.txt",
     "README.md",
     "PACKAGE_README.txt",
+    "RELEASE_NOTES.md",
+    "VERSION",
     "LICENSE"
 )
 
@@ -174,7 +222,21 @@ foreach ($scriptFile in Get-ChildItem -LiteralPath $packageRoot -File -Filter "*
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
-Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -Force
+$archiveCreated = $false
+for ($attempt = 1; $attempt -le 4; $attempt++) {
+    try {
+        Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -Force -ErrorAction Stop
+        $archiveCreated = $true
+        break
+    } catch {
+        if ($attempt -ge 4) { throw }
+        if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds (300 * $attempt)
+    }
+}
+if (-not $archiveCreated) { throw "Package archive was not created." }
 
 $smokeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("RimWorldAiTranslator-package-smoke-" + [System.Guid]::NewGuid().ToString("N"))
 $smokePrefix = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar

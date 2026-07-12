@@ -16,16 +16,34 @@ function Get-RimWorldQualityIssues {
     $index = -1
     foreach ($entry in @($Entries)) {
         $index++
-        $source = [string](Get-RimWorldQualityProperty $entry @("source", "Source", "sourceText", "SourceText") "")
-        $translation = [string](Get-RimWorldQualityProperty $entry @("translation", "Translation", "text", "Text") "")
-        $existing = [string](Get-RimWorldQualityProperty $entry @("existing", "Existing", "defaultTranslation", "DefaultTranslation") "")
-        $key = [string](Get-RimWorldQualityProperty $entry @("key", "Key") "")
-        $target = [string](Get-RimWorldQualityProperty $entry @("target", "Target", "relativeTarget", "RelativeTarget") "")
-        $defClass = [string](Get-RimWorldQualityProperty $entry @("defClass", "DefClass") "")
-        $rowIndex = [int](Get-RimWorldQualityProperty $entry @("index", "Index") $index)
-        $sourceChanged = [bool](Get-RimWorldQualityProperty $entry @("sourceChanged", "SourceChanged", "rmkSourceChanged") $false)
-        $safe = [bool](Get-RimWorldQualityProperty $entry @("safeToApply", "SafeToApply", "safe", "Safe") $true)
-        $tokenOrTagIssue = Get-RimWorldQualityProperty $entry @("tokenOrTagIssue", "TokenOrTagIssue") $null
+        $properties = $entry.PSObject.Properties
+        $canonical = $null -ne $properties -and $properties["source"] -and $properties["translation"] -and $properties["existing"] -and
+            $properties["key"] -and $properties["target"] -and $properties["defClass"] -and
+            $properties["index"] -and $properties["sourceChanged"] -and $properties["safeToApply"] -and
+            $properties["tokenOrTagIssue"]
+        if ($canonical) {
+            $source = [string]$entry.source
+            $translation = [string]$entry.translation
+            $existing = [string]$entry.existing
+            $key = [string]$entry.key
+            $target = [string]$entry.target
+            $defClass = [string]$entry.defClass
+            $rowIndex = [int]$entry.index
+            $sourceChanged = [bool]$entry.sourceChanged
+            $safe = [bool]$entry.safeToApply
+            $tokenOrTagIssue = $entry.tokenOrTagIssue
+        } else {
+            $source = [string](Get-RimWorldQualityProperty $entry @("source", "Source", "sourceText", "SourceText") "")
+            $translation = [string](Get-RimWorldQualityProperty $entry @("translation", "Translation", "text", "Text") "")
+            $existing = [string](Get-RimWorldQualityProperty $entry @("existing", "Existing", "defaultTranslation", "DefaultTranslation") "")
+            $key = [string](Get-RimWorldQualityProperty $entry @("key", "Key") "")
+            $target = [string](Get-RimWorldQualityProperty $entry @("target", "Target", "relativeTarget", "RelativeTarget") "")
+            $defClass = [string](Get-RimWorldQualityProperty $entry @("defClass", "DefClass") "")
+            $rowIndex = [int](Get-RimWorldQualityProperty $entry @("index", "Index") $index)
+            $sourceChanged = [bool](Get-RimWorldQualityProperty $entry @("sourceChanged", "SourceChanged", "rmkSourceChanged") $false)
+            $safe = [bool](Get-RimWorldQualityProperty $entry @("safeToApply", "SafeToApply", "safe", "Safe") $true)
+            $tokenOrTagIssue = Get-RimWorldQualityProperty $entry @("tokenOrTagIssue", "TokenOrTagIssue") $null
+        }
         $identity = ($target.ToLowerInvariant() + "`u{1f}" + $key)
         $identityRow = [pscustomobject]@{ Index = $rowIndex; Key = $key; Target = $target; DefClass = $defClass }
         if (-not $identities.ContainsKey($identity)) {

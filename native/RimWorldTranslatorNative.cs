@@ -4,16 +4,81 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
 
+[assembly: AssemblyTitle("RimWorld AI Translator Native")]
+[assembly: AssemblyProduct("RimWorld AI Translator")]
+[assembly: AssemblyCompany("chance496")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyInformationalVersion("1.0.0")]
+
 public static class RimWorldTranslatorNativeMethods
 {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct RimWorldTranslatorCaptureRect
+{
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+}
+
+public static class RimWorldTranslatorCaptureMethods
+{
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RimWorldTranslatorCaptureRect value, int valueSize);
+}
+
+public sealed class RimWorldTranslatorRowRuntimeCache
+{
+    public string Identity { get; set; }
+    public string RelativeTarget { get; set; }
+    public string SourceFingerprint { get; set; }
+    public object Decision { get; set; }
+    public object DefContext { get; set; }
+    public string SearchKey { get; set; }
+    public string SearchText { get; set; }
+    public string SearchDefClass { get; set; }
+    public string SearchNode { get; set; }
+    public string SearchAll { get; set; }
+    public string SourcePreview { get; set; }
+    public string DefaultPreview { get; set; }
+
+    public RimWorldTranslatorRowRuntimeCache()
+    {
+        Identity = String.Empty;
+        RelativeTarget = String.Empty;
+        SourceFingerprint = String.Empty;
+    }
+}
+
+public sealed class RimWorldTranslatorRowRuntimeCacheStore
+{
+    private ConditionalWeakTable<object, RimWorldTranslatorRowRuntimeCache> entries =
+        new ConditionalWeakTable<object, RimWorldTranslatorRowRuntimeCache>();
+
+    public RimWorldTranslatorRowRuntimeCache Get(object row)
+    {
+        if (row == null) throw new ArgumentNullException("row");
+        return entries.GetValue(row, delegate(object key) { return new RimWorldTranslatorRowRuntimeCache(); });
+    }
+
+    public void Reset()
+    {
+        entries = new ConditionalWeakTable<object, RimWorldTranslatorRowRuntimeCache>();
+    }
 }
 
 public sealed class RimWorldTranslatorRmkHistoryRow
