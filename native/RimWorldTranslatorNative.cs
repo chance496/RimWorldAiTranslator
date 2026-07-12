@@ -151,7 +151,7 @@ public static class RimWorldTranslatorValidation
         @"\r?\n",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-    private static Dictionary<string, int> GetProtectedTokenCounts(string text)
+    public static Dictionary<string, int> GetProtectedTokenCounts(string text)
     {
         Dictionary<string, int> counts = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (Match match in ProtectedTokenRegex.Matches(text ?? String.Empty))

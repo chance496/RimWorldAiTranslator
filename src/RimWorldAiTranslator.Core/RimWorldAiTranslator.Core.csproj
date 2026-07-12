@@ -1,0 +1,12 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\RimWorldAiTranslator.Native\RimWorldAiTranslator.Native.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>RimWorldAiTranslator.Core</RootNamespace>
+  </PropertyGroup>
+
+</Project>
