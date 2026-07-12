@@ -75,6 +75,11 @@ if (-not (Test-Path -LiteralPath $validationScriptPath -PathType Leaf)) {
     throw "Translation validation component was not found: $validationScriptPath"
 }
 . $validationScriptPath
+$providerValidationScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.ProviderValidation.ps1"
+if (-not (Test-Path -LiteralPath $providerValidationScriptPath -PathType Leaf)) {
+    throw "API provider validation component was not found: $providerValidationScriptPath"
+}
+. $providerValidationScriptPath
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $script:powershellExe = $systemPowerShell
@@ -5137,6 +5142,57 @@ function Refresh-DashboardActivity {
     }
 }
 
+function Get-ApiProviderKeyCount([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
+    return @([System.Text.RegularExpressions.Regex]::Split($Text, "\r?\n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+}
+
+function Get-ApiProviderValidationMessage([string]$Code) {
+    switch ($Code) {
+        "UrlMissing" { return "API URL을 입력해야 합니다." }
+        "UrlInvalid" { return "API URL 형식이 올바르지 않습니다." }
+        "HttpsRequired" { return "외부 API는 HTTPS만 허용합니다. HTTP는 로컬 루프백 시험에만 사용할 수 있습니다." }
+        "UrlContainsCredential" { return "API URL에 키나 인증정보를 넣지 마세요. 키 입력란을 사용하세요." }
+        "ModelMissing" { return "모델 ID를 입력해야 합니다." }
+        "TemperatureOutOfRange" { return "Temperature는 모델 기본값 또는 0~2 범위여야 합니다." }
+        "NoKeyUsesGoogleFallback" { return "키 없음: 실행 시 Google 번역으로 전환" }
+        "ManualModel" { return "수동 모델 ID 유지" }
+        "OfflineAvailabilityNotVerified" { return "모델 제공 여부 온라인 미확인" }
+        "GooglePromptFeaturesUnavailable" { return "Google 번역: 용어집·추가 프롬프트 미지원" }
+        default { return $Code }
+    }
+}
+
+function Update-ApiProviderValidationNotice {
+    if (-not $lblApiProviderNotice) { return }
+    $profile = Get-ApiProviderProfile
+    $config = Get-SelectedApiProviderConfig
+    if (-not $profile -or -not $config) { return }
+    $keyCount = Get-ApiProviderKeyCount ([string]$script:apiProviderKeys[$script:selectedApiProviderId])
+    $result = Test-RimWorldApiProviderConfiguration -Profile $profile -Config $config -KeyCount $keyCount
+    if (-not $result.Valid) {
+        $messages = @($result.ErrorCodes | ForEach-Object { Get-ApiProviderValidationMessage ([string]$_) })
+        $lblApiProviderNotice.Text = [string]::Join(" ", $messages)
+        $lblApiProviderNotice.ForeColor = [System.Drawing.Color]::FromArgb(220, 104, 104)
+    } elseif ([string]$profile.Provider -eq "Google") {
+        $lblApiProviderNotice.Text = "API 키 없이 Google 기계 번역을 사용합니다. 용어집과 추가 프롬프트는 적용되지 않습니다."
+        $lblApiProviderNotice.ForeColor = $script:mutedColor
+    } else {
+        $prefix = if ($result.WarningCodes -contains "NoKeyUsesGoogleFallback") {
+            "키 없음: Google 전환"
+        } elseif ($result.WarningCodes -contains "ManualModel") {
+            "수동 모델 ID 유지"
+        } else {
+            "내장 프로필 일치"
+        }
+        $limit = if ([int]$result.Capabilities.rpm -gt 0) { " · $($result.Capabilities.rpm) RPM 프로필" } else { "" }
+        $lblApiProviderNotice.Text = "$prefix$limit · 모델 온라인 미확인"
+        $lblApiProviderNotice.ForeColor = if ($result.WarningCodes -contains "NoKeyUsesGoogleFallback") { [System.Drawing.Color]::FromArgb(226, 173, 84) } else { $script:mutedColor }
+    }
+    $lblApiProviderNotice.AccessibleDescription = "로컬 설정 점검 결과. API 호출 없이 URL, 모델 입력과 내장 프로필만 확인합니다. $($lblApiProviderNotice.Text)"
+    if ($toolTip) { $toolTip.SetToolTip($lblApiProviderNotice, $lblApiProviderNotice.Text) }
+}
+
 function Save-CurrentApiProviderControls([switch]$Persist) {
     if ($script:syncingApiProvider -or -not $txtDashboardApiKeys) { return }
     $providerProfile = Get-ApiProviderProfile
@@ -5159,6 +5215,7 @@ function Save-CurrentApiProviderControls([switch]$Persist) {
         }
     }
     if ($txtApiKeys) { $txtApiKeys.Text = [string]$script:apiProviderKeys[$script:selectedApiProviderId] }
+    Update-ApiProviderValidationNotice
     if ($Persist) { Save-AppSettings }
 }
 
@@ -5203,16 +5260,12 @@ function Show-ApiProviderControls([string]$ProviderId = "", [switch]$SkipCurrent
         foreach ($control in @($lblApiProviderKeys, $txtDashboardApiKeys, $lblApiProviderUrl, $txtApiProviderUrl, $lblApiProviderModel, $cmbApiProviderModel, $lblApiProviderTemperature, $cmbApiProviderTemperature)) {
             $control.Visible = -not $isGoogle
         }
-        $lblApiProviderNotice.Text = if ($isGoogle) {
-            "API 키 없이 Google 기계 번역으로 초벌 후보를 만듭니다. 용어집과 추가 프롬프트는 적용되지 않습니다."
-        } else {
-            "API 키가 비어 있으면 Google 번역으로 자동 전환합니다. 키는 메모리에만 유지됩니다."
-        }
         if ($txtApiKeys) { $txtApiKeys.Text = [string]$script:apiProviderKeys[$script:selectedApiProviderId] }
     } finally {
         $script:syncingApiProvider = $false
     }
     Refresh-ApiProviderButtons
+    Update-ApiProviderValidationNotice
 }
 
 function Select-ApiProvider([string]$ProviderId) {
@@ -6338,6 +6391,7 @@ $dashSettingsPage.Controls.AddRange(@($lblDashSettings, $pnlApiSettings, $pnlApp
 
 $dashboardPanel.Add_Resize({
     $dashHeader.SetBounds(0, 0, $dashboardPanel.ClientSize.Width, 70)
+    $dashAccent.SetBounds(0, 67, $dashboardPanel.ClientSize.Width, 3)
     $dashContent.SetBounds(0, 70, $dashboardPanel.ClientSize.Width, [Math]::Max(1, $dashboardPanel.ClientSize.Height - 70))
 })
 

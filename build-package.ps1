@@ -126,6 +126,7 @@ $packageFiles = @(
     "Start-RimWorldAiReviewGui.ps1",
     "RimWorldAiTranslator.Storage.ps1",
     "RimWorldAiTranslator.Validation.ps1",
+    "RimWorldAiTranslator.ProviderValidation.ps1",
     "RimWorldAiTranslator.ProjectCleanup.ps1",
     "Invoke-RimWorldAiTranslation.ps1",
     "Run-RimWorldAiTranslation.ps1",

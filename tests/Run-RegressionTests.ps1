@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("All", "Harness", "Syntax", "StateStore", "SecretHandling", "ProjectCleanup", "DryRun", "SourceExtraction", "DefSafety", "DuplicateIdentity", "TokenSafety", "ApiResilience", "DirectOutput", "LocalApply", "LocalRollback", "RmkExport", "RmkHistory")]
+    [ValidateSet("All", "Harness", "Syntax", "StateStore", "SecretHandling", "ProviderValidation", "ProjectCleanup", "DryRun", "SourceExtraction", "DefSafety", "DuplicateIdentity", "TokenSafety", "ApiResilience", "DirectOutput", "LocalApply", "LocalRollback", "RmkExport", "RmkHistory")]
     [string]$Suite = "All"
 )
 
@@ -1396,11 +1396,54 @@ function Test-RmkSourceHistoryRoundTrip {
     }
 }
 
+function Test-ProviderConfigurationValidation {
+    . (Join-Path $script:RepoRoot "RimWorldAiTranslator.ProviderValidation.ps1")
+    $profile = [pscustomobject]@{
+        Id = "Fixture"
+        Provider = "OpenAICompatible"
+        Models = @("fixture-model")
+        NeedsKey = $true
+        ResponseFormat = "JsonSchema"
+        TokenParameter = "max_completion_tokens"
+        MaxOutput = 32000
+        Rpm = 5
+        InputTpm = 30000
+        DailyTokens = 1000000
+    }
+    $config = [pscustomobject]@{ url = "https://api.example.invalid/v1/chat/completions"; model = "fixture-model"; temperature = 0.1 }
+    $known = Test-RimWorldApiProviderConfiguration -Profile $profile -Config $config -KeyCount 2
+    Assert-True ([bool]$known.Valid) "A valid provider profile was rejected."
+    Assert-True ([bool]$known.Capabilities.knownModel) "The bundled model was not recognized."
+    Assert-Contains @($known.WarningCodes) "OfflineAvailabilityNotVerified" "Offline capability status was not reported."
+    Assert-Equal 2 ([int]$known.KeyCount) "Only the API key count should cross the validation boundary."
+
+    $manual = Test-RimWorldApiProviderConfiguration -Profile $profile -Config ([pscustomobject]@{ url = $config.url; model = "manual-model"; temperature = -1 }) -KeyCount 1
+    Assert-True ([bool]$manual.Valid) "A manually entered model ID was blocked."
+    Assert-Contains @($manual.WarningCodes) "ManualModel" "Manual model provenance was not reported."
+    Assert-Equal "manual-model" ([string]$manual.Model) "The manual model ID was not preserved."
+
+    $credentialUrl = Test-RimWorldApiProviderConfiguration -Profile $profile -Config ([pscustomobject]@{ url = "https://api.example.invalid/v1?api_key=do-not-store"; model = "fixture-model"; temperature = 0 }) -KeyCount 0
+    Assert-True (-not [bool]$credentialUrl.Valid) "A credential-bearing URL was accepted."
+    Assert-Contains @($credentialUrl.ErrorCodes) "UrlContainsCredential" "Credential-bearing URL error was not classified."
+    Assert-Contains @($credentialUrl.WarningCodes) "NoKeyUsesGoogleFallback" "Missing-key fallback was not reported."
+
+    $insecure = Test-RimWorldApiProviderConfiguration -Profile $profile -Config ([pscustomobject]@{ url = "http://api.example.invalid/v1"; model = "fixture-model"; temperature = 0 }) -KeyCount 1
+    Assert-Contains @($insecure.ErrorCodes) "HttpsRequired" "External HTTP URL was accepted."
+    $loopback = Test-RimWorldApiProviderConfiguration -Profile $profile -Config ([pscustomobject]@{ url = "http://127.0.0.1:12345/v1"; model = "fixture-model"; temperature = 0 }) -KeyCount 1
+    Assert-True ([bool]$loopback.Valid) "Loopback HTTP test configuration was rejected."
+
+    $googleProfile = [pscustomobject]@{ Provider = "Google"; Models = @("Google Translate"); NeedsKey = $false }
+    $google = Test-RimWorldApiProviderConfiguration -Profile $googleProfile -Config ([pscustomobject]@{ url = ""; model = "Google Translate"; temperature = -1 }) -KeyCount 0
+    Assert-True ([bool]$google.Valid) "Google fallback configuration was rejected."
+    Assert-Contains @($google.WarningCodes) "GooglePromptFeaturesUnavailable" "Google feature limitation was not reported."
+}
+
 $tests = @(
     [pscustomobject]@{ Name = "Harness.Isolation"; Suite = "Harness"; Body = { Test-HarnessIsolation } },
     [pscustomobject]@{ Name = "Syntax.PowerShell"; Suite = "Syntax"; Body = { Test-PowerShellSyntax } },
     [pscustomobject]@{ Name = "StateStore.Recovery"; Suite = "StateStore"; Body = { Test-StateStoreRecovery } },
     [pscustomobject]@{ Name = "Security.ApiKeyHandling"; Suite = "SecretHandling"; Body = { Test-SecretHandling } },
+    [pscustomobject]@{ Name = "Settings.ProviderValidation"; Suite = "ProviderValidation"; Body = { Test-ProviderConfigurationValidation } },
     [pscustomobject]@{ Name = "Project.CleanupBoundary"; Suite = "ProjectCleanup"; Body = { Test-ProjectCleanupBoundary } },
     [pscustomobject]@{ Name = "Translation.DryRun"; Suite = "DryRun"; Body = { Test-TranslationDryRun } },
     [pscustomobject]@{ Name = "Source.Extraction"; Suite = "SourceExtraction"; Body = { Test-SourceExtraction } },
