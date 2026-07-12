@@ -40,6 +40,16 @@ if (-not (Test-Path -LiteralPath $storageScriptPath -PathType Leaf)) {
     throw "State storage component was not found: $storageScriptPath"
 }
 . $storageScriptPath
+$validationScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.Validation.ps1"
+if (-not (Test-Path -LiteralPath $validationScriptPath -PathType Leaf)) {
+    throw "Translation validation component was not found: $validationScriptPath"
+}
+. $validationScriptPath
+$projectCleanupScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.ProjectCleanup.ps1"
+if (-not (Test-Path -LiteralPath $projectCleanupScriptPath -PathType Leaf)) {
+    throw "Project cleanup component was not found: $projectCleanupScriptPath"
+}
+. $projectCleanupScriptPath
 $nativeAssemblyPath = Join-Path $scriptRoot "RimWorldAiTranslator.Native.dll"
 if ((Test-Path -LiteralPath $nativeAssemblyPath -PathType Leaf) -and -not ("RimWorldTranslatorNativeMethods" -as [type])) {
     Add-Type -LiteralPath $nativeAssemblyPath -ErrorAction Stop
@@ -158,6 +168,8 @@ $script:translationLogPartial = ""
 $script:tempFiles = New-Object "System.Collections.Generic.List[string]"
 $script:startedAt = $null
 $script:stopRequested = $false
+$script:stopRequestedAt = $null
+$script:cancellationFile = ""
 $script:itemCardBack = [System.Drawing.Color]::FromArgb(255, 255, 255)
 $script:itemCardSelected = [System.Drawing.Color]::FromArgb(232, 237, 244)
 $script:itemText = [System.Drawing.Color]::FromArgb(25, 35, 45)
@@ -887,33 +899,11 @@ function Set-ActiveProject([object]$Project) {
 }
 
 function Test-PathStrictlyInsideRoot([string]$Path, [string]$Root) {
-    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Root)) { return $false }
-    try {
-        $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd("\", "/")
-        $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd("\", "/")
-        $prefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
-        return $pathFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
-    } catch {
-        return $false
-    }
+    return Test-RimWorldPathStrictlyInsideRoot -Path $Path -Root $Root
 }
 
 function Test-PathContainsReparsePoint([string]$Path, [string]$StopRoot) {
-    try {
-        $current = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        $stopFull = [System.IO.Path]::GetFullPath($StopRoot).TrimEnd("\", "/")
-        while ($current) {
-            if (($current.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
-            $currentFull = [System.IO.Path]::GetFullPath($current.FullName).TrimEnd("\", "/")
-            if ($currentFull.Equals($stopFull, [System.StringComparison]::OrdinalIgnoreCase)) { break }
-            $parentPath = Split-Path -Parent $current.FullName
-            if (-not $parentPath) { break }
-            $current = Get-Item -LiteralPath $parentPath -Force -ErrorAction Stop
-        }
-    } catch {
-        return $true
-    }
-    return $false
+    return Test-RimWorldPathContainsReparsePoint -Path $Path -StopRoot $StopRoot
 }
 
 function Get-AppOwnedReviewRoots {
@@ -928,22 +918,8 @@ function Get-AppOwnedReviewRoots {
 }
 
 function Get-AppOwnedReviewDirectory([string]$Path, [object]$Project = $null) {
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Container)) { return "" }
-    try { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd("\", "/") } catch { return "" }
-    if ($Project -and $Project.modRoot) {
-        $modRoot = [string]$Project.modRoot
-        try { $modFull = [System.IO.Path]::GetFullPath($modRoot).TrimEnd("\", "/") } catch { return "" }
-        if ($full.Equals($modFull, [System.StringComparison]::OrdinalIgnoreCase) -or
-            (Test-PathStrictlyInsideRoot -Path $full -Root $modRoot)) {
-            return ""
-        }
-    }
-    foreach ($root in Get-AppOwnedReviewRoots) {
-        if (-not (Test-PathStrictlyInsideRoot -Path $full -Root $root)) { continue }
-        if (Test-PathContainsReparsePoint -Path $full -StopRoot $root) { return "" }
-        return $full
-    }
-    return ""
+    $modRoot = if ($Project -and $Project.modRoot) { [string]$Project.modRoot } else { "" }
+    return Get-RimWorldAppOwnedReviewDirectory -Path $Path -ReviewRoots @(Get-AppOwnedReviewRoots) -ModRoot $modRoot
 }
 
 function Write-ProjectReviewMarker([object]$Project, [string]$ReviewRoot) {
@@ -965,52 +941,11 @@ function Write-ProjectReviewMarker([object]$Project, [string]$ReviewRoot) {
 }
 
 function Get-ProjectCleanupPlan([object]$Project) {
-    $safePaths = New-Object "System.Collections.Generic.List[string]"
-    $unsafePaths = New-Object "System.Collections.Generic.List[string]"
-    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
-    $recorded = New-Object "System.Collections.Generic.List[string]"
-    if ($Project.latestReviewRoot) { [void]$recorded.Add([string]$Project.latestReviewRoot) }
-    foreach ($run in @($Project.runs)) {
-        if ($run -and $run.reviewRoot) { [void]$recorded.Add([string]$run.reviewRoot) }
-    }
-
-    foreach ($path in $recorded) {
-        if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
-        try { $full = [System.IO.Path]::GetFullPath($path).TrimEnd("\", "/") } catch { [void]$unsafePaths.Add($path); continue }
-        if (-not $seen.Add($full)) { continue }
-        $safe = Get-AppOwnedReviewDirectory -Path $full -Project $Project
-        if ($safe) { [void]$safePaths.Add($safe) } else { [void]$unsafePaths.Add($full) }
-    }
-
-    foreach ($root in Get-AppOwnedReviewRoots) {
-        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-        foreach ($directory in Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue) {
-            $markerPath = Join-Path $directory.FullName ".rimworld-ai-project.json"
-            if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { continue }
-            try {
-                $marker = [System.IO.File]::ReadAllText($markerPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-                if ([string]$marker.projectId -ne [string]$Project.id) { continue }
-                $safe = Get-AppOwnedReviewDirectory -Path $directory.FullName -Project $Project
-                if ($safe -and $seen.Add($safe)) { [void]$safePaths.Add($safe) }
-            } catch {
-            }
-        }
-    }
-    return [pscustomobject]@{ SafePaths = $safePaths.ToArray(); UnsafePaths = $unsafePaths.ToArray() }
+    return Get-RimWorldProjectCleanupPlan -Project $Project -ReviewRoots @(Get-AppOwnedReviewRoots)
 }
 
 function Remove-AppOwnedProjectReviewDirectories([object]$Project, [string[]]$Paths) {
-    $failures = New-Object "System.Collections.Generic.List[string]"
-    foreach ($path in @($Paths)) {
-        $verified = Get-AppOwnedReviewDirectory -Path $path -Project $Project
-        if (-not $verified) { [void]$failures.Add("안전 경계 재확인 실패: $path"); continue }
-        try {
-            Remove-Item -LiteralPath $verified -Recurse -Force -ErrorAction Stop
-        } catch {
-            [void]$failures.Add("$verified : $($_.Exception.Message)")
-        }
-    }
-    return $failures.ToArray()
+    return Remove-RimWorldAppOwnedReviewDirectories -Project $Project -ReviewRoots @(Get-AppOwnedReviewRoots) -Paths $Paths
 }
 
 function Remove-TranslationProject([object]$Project) {
@@ -2346,44 +2281,11 @@ function Refresh-StatusFilterButtons {
 }
 
 function Get-ProtectedTokenCountsForValidation([string]$Text) {
-    $counts = New-Object "System.Collections.Generic.Dictionary[string,int]" ([System.StringComparer]::Ordinal)
-    $pattern = '(\\r\\n|\\[nrt]|\{[^}\r\n]+\}|\[[A-Za-z0-9_.:;''" -]+\]|</?[A-Za-z][^>\r\n]*>|\$[A-Za-z_][A-Za-z0-9_]*\$?|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
-    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches([string]$Text, $pattern)) {
-        $token = [string]$match.Value
-        if ($counts.ContainsKey($token)) { $counts[$token]++ } else { $counts[$token] = 1 }
-    }
-    return $counts
+    return Get-RimWorldProtectedTokenCounts $Text
 }
 
 function Get-TranslationTokenIssues([string]$Source, [string]$Translation) {
-    $sourceCounts = Get-ProtectedTokenCountsForValidation $Source
-    $targetCounts = Get-ProtectedTokenCountsForValidation $Translation
-    $missing = New-Object "System.Collections.Generic.List[string]"
-    $unexpected = New-Object "System.Collections.Generic.List[string]"
-    $countMismatches = New-Object "System.Collections.Generic.List[string]"
-    foreach ($token in $sourceCounts.Keys) {
-        $sourceCount = [int]$sourceCounts[$token]
-        $targetCount = if ($targetCounts.ContainsKey($token)) { [int]$targetCounts[$token] } else { 0 }
-        if ($targetCount -lt $sourceCount) { [void]$missing.Add($token) }
-        if ($targetCount -ne $sourceCount) { [void]$countMismatches.Add("$token ($sourceCount->$targetCount)") }
-    }
-    foreach ($token in $targetCounts.Keys) {
-        $targetCount = [int]$targetCounts[$token]
-        $sourceCount = if ($sourceCounts.ContainsKey($token)) { [int]$sourceCounts[$token] } else { 0 }
-        if ($targetCount -gt $sourceCount) { [void]$unexpected.Add($token) }
-    }
-    $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($Source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
-    $grammarPrefixMoved = $false
-    if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($Translation, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) {
-        $grammarPrefixMoved = $true
-        if (-not $missing.Contains($grammarPrefix.Groups[1].Value)) { [void]$missing.Add($grammarPrefix.Groups[1].Value) }
-    }
-    return [pscustomobject]@{
-        MissingTokens = $missing.ToArray()
-        UnexpectedTokens = $unexpected.ToArray()
-        TokenCountMismatches = $countMismatches.ToArray()
-        GrammarPrefixMoved = $grammarPrefixMoved
-    }
+    return Get-RimWorldTokenPreservationIssues -Source $Source -Target $Translation
 }
 
 function Get-RmkReferenceWorkbookPath([object]$Project = $null) {
@@ -2412,11 +2314,7 @@ function Get-InternalLocalizationIdentifierReason([object]$Row) {
 }
 
 function Test-PathologicalTranslationText([string]$Text) {
-    if ([string]::IsNullOrEmpty($Text)) { return $false }
-    if ($Text -match "(\r?\n\s*){8,}") { return $true }
-    if ($Text -match "(\\u000a\s*){8,}") { return $true }
-    $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($Text, "\r?\n").Count
-    return $newlineCount -ge 20 -and $Text.Length -lt 4000
+    return Test-RimWorldPathologicalTranslation $Text
 }
 
 function Test-ContainsKoreanText([string]$Text) {
@@ -2425,14 +2323,7 @@ function Test-ContainsKoreanText([string]$Text) {
 }
 
 function Get-InvalidKoreanParticleNotations([string]$Text) {
-    $result = New-Object "System.Collections.Generic.List[string]"
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $result.ToArray() }
-    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
-    $pattern = '(은\(는\)|는\(은\)|이\(가\)|가\(이\)|을\(를\)|를\(을\)|과\(와\)|와\(과\)|으로\(로\)|로\(으로\)|(?:\[[^\]\r\n]+\]|\{[^}\r\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:으로|은|는|이|가|을|를|과|와|로)(?=$|[\s.,!?…:;，。！？、]))'
-    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
-        if ($seen.Add($match.Value)) { [void]$result.Add($match.Value) }
-    }
-    return $result.ToArray()
+    return @(Get-RimWorldInvalidKoreanParticleNotations $Text)
 }
 
 function Get-TranslationValidation([object]$Row, [string]$Translation) {
@@ -4360,10 +4251,14 @@ function New-PreserveTranslationFile {
     foreach ($row in $script:rows) {
         $decision = Get-Decision $row
         $key = ([string]$row.key).Trim()
+        $identity = Get-ReviewSourceIdentity $row
         $text = ConvertTo-FlatString $decision.text
-        if (-not $key -or -not $seen.Add($key) -or [string]::IsNullOrWhiteSpace($text) -or (ConvertTo-BoolValue $decision.sourceChanged)) { continue }
+        if (-not $key -or -not $identity -or -not $seen.Add($identity) -or [string]::IsNullOrWhiteSpace($text) -or (ConvertTo-BoolValue $decision.sourceChanged)) { continue }
         [void]$items.Add([pscustomobject]@{
             key = $key
+            kind = if ($row.PSObject.Properties["kind"]) { [string]$row.kind } else { "" }
+            defClass = if ($row.PSObject.Properties["defClass"]) { [string]$row.defClass } else { "" }
+            target = Get-RelativeTarget $row
             text = $text
             origin = [string]$decision.translationOrigin
             translationUpdatedAt = [string]$decision.translationUpdatedAt
@@ -4412,6 +4307,8 @@ function Start-Translation {
     [void]$script:tempFiles.Add($script:translationLogFile)
     $script:translationLogOffset = 0L
     $script:translationLogPartial = ""
+    $script:cancellationFile = New-TempFilePath "translation-cancel" ".signal"
+    [void]$script:tempFiles.Add($script:cancellationFile)
 
     $selectedProvider = Get-ApiProviderProfile
     $selectedProviderConfig = Get-SelectedApiProviderConfig
@@ -4458,6 +4355,7 @@ function Start-Translation {
         InputTokensPerMinutePerKey = [int]$effectiveProvider.InputTpm
         DailyTokenBudgetPerKey = [int]$effectiveProvider.DailyTokens
         MaxCompletionTokens = [int]$effectiveProvider.MaxOutput
+        CancellationFile = $script:cancellationFile
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$effectiveProvider.ReasoningEffort)) {
         $translationParameters.ReasoningEffort = [string]$effectiveProvider.ReasoningEffort
@@ -4534,6 +4432,7 @@ function Start-Translation {
     $script:startedAt = Get-Date
     $script:processExitHandled = $false
     $script:stopRequested = $false
+    $script:stopRequestedAt = $null
     $progressRun.Value = 0
     $progressRun.Maximum = 100
     $lblRunStatus.Text = "실행 준비 중"
@@ -4551,10 +4450,17 @@ function Start-Translation {
 function Stop-Translation {
     if ($script:process -and -not $script:process.HasExited) {
         $script:stopRequested = $true
+        $script:stopRequestedAt = Get-Date
         $btnStop.Enabled = $false
         $lblRunStatus.Text = "중지 요청 중"
-        Add-Log "사용자 요청으로 중지합니다."
-        Stop-ProcessTree $script:process.Id
+        Add-Log "사용자 요청으로 중지합니다. 완료된 배치는 보존합니다."
+        try {
+            if ([string]::IsNullOrWhiteSpace($script:cancellationFile)) { throw "Cancellation signal path is missing." }
+            [System.IO.File]::WriteAllText($script:cancellationFile, "cancel", [System.Text.UTF8Encoding]::new($false))
+        } catch {
+            Add-Log "취소 신호를 기록하지 못해 실행 프로세스를 즉시 종료합니다."
+            Stop-ProcessTree $script:process.Id
+        }
     }
 }
 
@@ -4586,6 +4492,8 @@ function Load-SourceOnlyForSelectedMod {
     [void]$script:tempFiles.Add($script:translationLogFile)
     $script:translationLogOffset = 0L
     $script:translationLogPartial = ""
+    $script:cancellationFile = New-TempFilePath "source-refresh-cancel" ".signal"
+    [void]$script:tempFiles.Add($script:cancellationFile)
     $sourceLanguage = Get-SelectedProjectSourceLanguage
     $rmkTarget = Get-RmkReferenceTarget (Get-SelectedProject)
     $rmkReference = if ($rmkTarget) { [string]$rmkTarget.LanguageRoot } else { "" }
@@ -4597,6 +4505,7 @@ function Load-SourceOnlyForSelectedMod {
         ReviewOnly = $true
         ReviewRoot = $script:appReviewRoot
         SourceOnly = $true
+        CancellationFile = $script:cancellationFile
     }
     if ($chkIncludePatches.Checked) { $translationParameters.IncludePatches = $true }
     if ($rmkReference) { $translationParameters.ReferenceLanguageRoot = @($rmkReference) }
@@ -4637,6 +4546,7 @@ function Load-SourceOnlyForSelectedMod {
     $script:startedAt = Get-Date
     $script:processExitHandled = $false
     $script:stopRequested = $false
+    $script:stopRequestedAt = $null
     $progressRun.Value = 0
     $progressRun.Maximum = 100
     $lblRunStatus.Text = "원문 로드 중"
@@ -7150,6 +7060,13 @@ $timer.Add_Tick({
         Update-ProgressFromLine $line
     }
 
+    if ($script:stopRequested -and $script:process -and -not $script:process.HasExited -and $script:stopRequestedAt -and
+        ((Get-Date) - $script:stopRequestedAt).TotalSeconds -ge 5) {
+        Add-Log "취소 응답 제한 시간을 넘어 실행 프로세스를 종료합니다. 마지막 완료 배치까지 복구합니다."
+        try { Stop-ProcessTree $script:process.Id } catch { Add-Log "프로세스 종료 실패: $($_.Exception.Message)" }
+        $script:stopRequestedAt = $null
+    }
+
     if ($script:process -and $script:process.HasExited -and -not $script:processExitHandled) {
         foreach ($line in (Read-NewProcessLogLines)) {
             Add-Log $line
@@ -7168,8 +7085,23 @@ $timer.Add_Tick({
         Add-Log "프로세스 종료. ExitCode=$exitCode, 경과 ${elapsed}s"
 
         if ($script:stopRequested) {
-            $lblRunStatus.Text = "중지됨"
-            Add-Log "사용자 요청으로 중지 완료."
+            $partialLoaded = $false
+            if ($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath -PathType Container)) {
+                try {
+                    Load-ReviewRoot $script:lastReviewOutputPath
+                    Register-ProjectRun -ReviewRoot $script:lastReviewOutputPath -Provider $script:lastProvider
+                    $partialLoaded = $true
+                } catch {
+                    Add-Log "완료된 배치 복구 실패: $($_.Exception.Message)"
+                }
+            }
+            if ($partialLoaded) {
+                $lblRunStatus.Text = "중지됨 · 완료분 복구"
+                Add-Log "중지 완료. 완료된 배치를 검수 화면에 복구했습니다."
+            } else {
+                $lblRunStatus.Text = "중지됨"
+                Add-Log "사용자 요청으로 중지 완료."
+            }
         } elseif ($exitCode -eq 0) {
             if ($progressRun.Maximum -gt 0) { $progressRun.Value = $progressRun.Maximum }
             if ($script:lastReviewOutputPath -and (Test-Path -LiteralPath $script:lastReviewOutputPath -PathType Container)) {
@@ -7205,14 +7137,38 @@ $timer.Add_Tick({
         try { $script:process.Dispose() } catch {}
         $script:process = $null
         $script:stopRequested = $false
+        $script:stopRequestedAt = $null
         $script:activeAiTranslationMode = ""
         Set-TranslationRunning $false
         Remove-TempFiles
+        $script:cancellationFile = ""
     }
 })
 $timer.Start()
 
 $form.Add_FormClosing({
+    [void](Confirm-DuplicateSourceTranslation)
+    if ($script:process -and -not $script:process.HasExited) {
+        $runningResult = [System.Windows.Forms.MessageBox]::Show(
+            "작업이 실행 중입니다. 완료된 배치를 보존하고 작업을 중지한 뒤 종료할까요?",
+            "RimWorld AI Translator",
+            [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        if ($runningResult -ne [System.Windows.Forms.DialogResult]::OK) {
+            $_.Cancel = $true
+            return
+        }
+    }
+    if ($script:dirty) {
+        $result = [System.Windows.Forms.MessageBox]::Show("저장하지 않은 검수 내용이 있습니다. 저장할까요?", "RimWorld AI Translator", [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
+            $_.Cancel = $true
+            return
+        }
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) { Save-Decisions }
+    }
+
     if ($autoSaveTimer) { $autoSaveTimer.Stop() }
     if ($dashboardSearchTimer) { $dashboardSearchTimer.Stop() }
     if ($searchTimer) { $searchTimer.Stop() }
@@ -7227,15 +7183,6 @@ $form.Add_FormClosing({
         try { Stop-ProcessTree $script:process.Id } catch {}
     }
     Remove-TempFiles
-    [void](Confirm-DuplicateSourceTranslation)
-    if ($script:dirty) {
-        $result = [System.Windows.Forms.MessageBox]::Show("저장하지 않은 검수 내용이 있습니다. 저장할까요?", "RimWorld AI Translator", [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, [System.Windows.Forms.MessageBoxIcon]::Question)
-        if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
-            $_.Cancel = $true
-            return
-        }
-        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) { Save-Decisions }
-    }
     if ($script:textFingerprintSha256) {
         try { $script:textFingerprintSha256.Dispose() } catch {}
         $script:textFingerprintSha256 = $null

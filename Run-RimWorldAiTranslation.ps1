@@ -62,11 +62,12 @@ $allowedParameters = New-Object "System.Collections.Generic.HashSet[string]" ([S
 foreach ($name in @(
     "ModRoot", "LanguageFolderName", "SourceLanguageFolder", "ReviewOnly", "ReviewRoot",
     "BatchSize", "MaxGeneratedGlossaryTermsPerBatch", "ReferenceLanguageRoot", "ReferenceSourceWorkbook",
-    "TranslateMissingOnly", "PreserveTranslationFile", "IncludePatches", "DryRun", "SourceOnly",
+    "TranslateMissingOnly", "PreserveTranslationFile", "IncludePatches", "Overwrite", "DryRun", "SourceOnly",
+    "CancellationFile",
     "TranslationProvider", "ProviderName", "BaseUrl", "Model", "Temperature",
     "ResponseFormatMode", "CompletionTokenParameter", "ReasoningEffort",
     "RequestsPerMinutePerKey", "InputTokensPerMinutePerKey", "DailyTokenBudgetPerKey",
-    "MaxCompletionTokens"
+    "MaxCompletionTokens", "TimeoutSec", "MaxRetries", "AllowInsecureLoopback"
 )) { [void]$allowedParameters.Add($name) }
 $parameters = @{}
 if (-not $payload.parameters) { throw "ArgumentFile does not contain parameters." }

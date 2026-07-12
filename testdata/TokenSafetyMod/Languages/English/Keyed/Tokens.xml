@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LanguageData>
+  <Token.Grammar>r_logentry-&gt;[INITIATOR_nameDef] gave an origami to [RECIPIENT_nameDef].</Token.Grammar>
+  <Token.Lodgers>[lodgersLabelSingOrPluralDef] arrived. Protect [lodgersObjective] until [shuttleDelayTicks_duration]. [helpersArrivalLetterEnd]</Token.Lodgers>
+  <Token.Format>{0} uses %s &lt;color=red&gt;$POWER_nameDef$&lt;/color&gt;.\nReady.</Token.Format>
+  <Token.Particle>[PAWN_nameDef] is ready.</Token.Particle>
+</LanguageData>

@@ -10,8 +10,9 @@ $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powe
 
 if (-not (Test-Path -LiteralPath $reviewGuiScript -PathType Leaf)) {
     Add-Type -AssemblyName System.Windows.Forms
+    $missingMessage = ConvertFrom-Json '"Start-RimWorldAiReviewGui.ps1 \uD30C\uC77C\uC744 \uCC3E\uC744 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.\nEXE\uC640 \uC2A4\uD06C\uB9BD\uD2B8\uB97C \uAC19\uC740 \uD3F4\uB354\uC5D0 \uB450\uC138\uC694."'
     [System.Windows.Forms.MessageBox]::Show(
-        "Start-RimWorldAiReviewGui.ps1 파일을 찾을 수 없습니다.`nEXE와 스크립트를 같은 폴더에 두세요.",
+        $missingMessage,
         "RimWorld AI Translator",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error

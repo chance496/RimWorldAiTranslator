@@ -38,6 +38,7 @@
     [switch]$MockTranslations,
     [switch]$SourceOnly,
     [switch]$NoStructuredOutputs,
+    [switch]$AllowInsecureLoopback,
     [switch]$ReviewOnly,
 
     [string]$ExistingLanguageRoot,
@@ -54,10 +55,15 @@
     [string]$ExtraPrompt,
     [string]$ExtraPromptFile,
 
+    [string]$CancellationFile,
+
     [string]$OutputFilePrefix = "CodexAI"
 )
 
 $ErrorActionPreference = "Stop"
+$validationScriptPath = Join-Path $PSScriptRoot "RimWorldAiTranslator.Validation.ps1"
+if (-not (Test-Path -LiteralPath $validationScriptPath -PathType Leaf)) { throw "Translation validation component was not found: $validationScriptPath" }
+. $validationScriptPath
 try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -79,6 +85,7 @@ $script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|clas
 $script:DefFieldRulesInitialized = $false
 $script:TranslatableDefFields = $null
 $script:ExcludedDefSegments = $null
+$script:CancellationFileFull = ""
 
 function Resolve-FullPath([string]$Path) {
     return [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path)
@@ -86,6 +93,27 @@ function Resolve-FullPath([string]$Path) {
 
 function Get-FullPathAllowMissing([string]$Path) {
     return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Test-TranslationCancellationRequested {
+    return $script:CancellationFileFull -and (Test-Path -LiteralPath $script:CancellationFileFull -PathType Leaf)
+}
+
+function Assert-TranslationNotCancelled {
+    if (Test-TranslationCancellationRequested) {
+        throw [System.OperationCanceledException]::new("Translation was cancelled by the user. Completed batches remain in the review checkpoint.")
+    }
+}
+
+function Wait-TranslationDelay([int]$Milliseconds) {
+    $remaining = [Math]::Max(0, $Milliseconds)
+    while ($remaining -gt 0) {
+        Assert-TranslationNotCancelled
+        $slice = [Math]::Min(200, $remaining)
+        [System.Threading.Thread]::Sleep($slice)
+        $remaining -= $slice
+    }
+    Assert-TranslationNotCancelled
 }
 
 function Assert-SafePathSegment([string]$Value, [string]$Name) {
@@ -153,13 +181,11 @@ function Initialize-RmkXlsxReader {
     if ("RimWorldTranslatorRmkXlsxReader" -as [type]) { return }
 
     $assemblyPath = Join-Path $PSScriptRoot "RimWorldAiTranslator.Native.dll"
-    if (Test-Path -LiteralPath $assemblyPath -PathType Leaf) {
-        Add-Type -LiteralPath $assemblyPath -ErrorAction Stop
-    } else {
-        $sourcePath = Join-Path $PSScriptRoot "native\RimWorldTranslatorNative.cs"
-        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-            throw "Native XML reader is missing. Reinstall the package: $assemblyPath"
-        }
+    $sourcePath = Join-Path $PSScriptRoot "native\RimWorldTranslatorNative.cs"
+    $useSource = (Test-Path -LiteralPath $sourcePath -PathType Leaf) -and
+        ((-not (Test-Path -LiteralPath $assemblyPath -PathType Leaf)) -or
+         (Get-Item -LiteralPath $sourcePath).LastWriteTimeUtc -gt (Get-Item -LiteralPath $assemblyPath).LastWriteTimeUtc)
+    if ($useSource) {
         Add-Type -AssemblyName System.IO.Compression
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         Add-Type -AssemblyName System.Xml.Linq
@@ -171,12 +197,26 @@ function Initialize-RmkXlsxReader {
             [System.Linq.Enumerable].Assembly.Location
         ) | Select-Object -Unique
         Add-Type -LiteralPath $sourcePath -ReferencedAssemblies $references -ErrorAction Stop
+    } elseif (Test-Path -LiteralPath $assemblyPath -PathType Leaf) {
+        Add-Type -LiteralPath $assemblyPath -ErrorAction Stop
+    } else {
+        throw "Native XML reader is missing. Reinstall the package: $assemblyPath"
     }
 
     if (-not ("RimWorldTranslatorRmkXlsxReader" -as [type])) {
         throw "Native XML reader failed to load: $assemblyPath"
     }
     Initialize-DefFieldRules
+}
+
+function Assert-ApiUri([string]$Value, [string]$Name, [switch]$AllowLoopbackHttp) {
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Value, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw "$Name must be an absolute URL."
+    }
+    if ($uri.Scheme -eq [System.Uri]::UriSchemeHttps) { return }
+    if ($AllowLoopbackHttp -and $uri.Scheme -eq [System.Uri]::UriSchemeHttp -and $uri.IsLoopback) { return }
+    throw "$Name must be an absolute HTTPS URL. Plain HTTP is allowed only for an explicitly enabled loopback test endpoint."
 }
 
 function Get-RmkWorkbookHistoryMap([string]$WorkbookPath) {
@@ -198,6 +238,28 @@ function Get-RmkEntryIdentifier([object]$Entry) {
     return "$className+$([string]$Entry.Key)"
 }
 
+function Get-LocalizationIdentity([string]$Namespace, [string]$Key) {
+    $namespaceText = ([string]$Namespace).Trim()
+    $keyText = ([string]$Key).Trim()
+    if (-not $namespaceText -or -not $keyText) { return "" }
+    return "namespace:$namespaceText|key:$keyText"
+}
+
+function Get-EntryLocalizationIdentity([object]$Entry) {
+    if (-not $Entry) { return "" }
+    $namespace = if ([string]$Entry.Kind -eq "Keyed") { "Keyed" } else { [string]$Entry.TypeName }
+    return Get-LocalizationIdentity -Namespace $namespace -Key ([string]$Entry.Key)
+}
+
+function Get-LocalizationNamespaceFromRelativePath([string]$RelativePath) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) { return "" }
+    $parts = @($RelativePath.Replace('/', '\').Split(@('\'), [System.StringSplitOptions]::RemoveEmptyEntries))
+    if ($parts.Count -eq 0) { return "" }
+    if ($parts[0] -ieq "Keyed") { return "Keyed" }
+    if ($parts[0] -ieq "DefInjected" -and $parts.Count -ge 2) { return [string]$parts[1] }
+    return ""
+}
+
 function Test-SourceTextEqual([string]$Left, [string]$Right) {
     $leftText = ((ConvertTo-FlatString $Left) -replace "`r`n", "`n" -replace "`r", "`n").Trim()
     $rightText = ((ConvertTo-FlatString $Right) -replace "`r`n", "`n" -replace "`r", "`n").Trim()
@@ -208,15 +270,13 @@ function Test-SourceTextEqual([string]$Left, [string]$Right) {
 
 function Get-ComparisonReferenceInfo(
     [object]$Entry,
-    [hashtable]$ExistingOriginMap,
-    [hashtable]$ExistingTranslationUpdatedAtMap,
+    [object]$ExistingInfo,
     [object]$RmkHistoryMap,
     [hashtable]$RmkCurrentSourceMap,
     [string]$RmkWorkbook
 ) {
-    $key = [string]$Entry.Key
-    $origin = if ($ExistingOriginMap.ContainsKey($key)) { [string]$ExistingOriginMap[$key] } else { "" }
-    $translationUpdatedAt = if ($ExistingTranslationUpdatedAtMap.ContainsKey($key)) { [string]$ExistingTranslationUpdatedAtMap[$key] } else { "" }
+    $origin = if ($ExistingInfo) { [string]$ExistingInfo.Origin } else { "" }
+    $translationUpdatedAt = if ($ExistingInfo) { [string]$ExistingInfo.TranslationUpdatedAt } else { "" }
     $identifier = Get-RmkEntryIdentifier $Entry
     $history = if ($identifier -and $RmkHistoryMap.ContainsKey($identifier)) { $RmkHistoryMap[$identifier] } else { $null }
     $historicalSource = if ($history) { ConvertTo-FlatString $history.Source } else { "" }
@@ -356,14 +416,30 @@ function Get-ExistingLanguageKeys([string]$LanguageRoot) {
 function Get-ExistingLanguageMap([string]$LanguageRoot) {
     $map = @{}
     if (-not (Test-Path -LiteralPath $LanguageRoot)) { return $map }
-
-    Get-ChildItem -LiteralPath $LanguageRoot -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object {
+    $ambiguous = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    $rootFull = [System.IO.Path]::GetFullPath($LanguageRoot).TrimEnd("\", "/")
+    $rootPrefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
+    Get-ChildItem -LiteralPath $rootFull -Recurse -File -Filter *.xml -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object {
         try {
+            $fileFull = [System.IO.Path]::GetFullPath($_.FullName)
+            if (-not $fileFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+            $relativePath = $fileFull.Substring($rootPrefix.Length)
+            $namespace = Get-LocalizationNamespaceFromRelativePath $relativePath
+            if (-not $namespace) { return }
             Initialize-RmkXlsxReader
             foreach ($raw in [RimWorldTranslatorRmkXlsxReader]::ReadLanguageData($_.FullName)) {
                 $key = [string]$raw.Key
-                if (-not $map.ContainsKey($key)) {
-                    $map[$key] = ConvertTo-FlatString $raw.Text
+                $identity = Get-LocalizationIdentity -Namespace $namespace -Key $key
+                if (-not $identity -or $ambiguous.Contains($identity)) { continue }
+                if ($map.ContainsKey($identity)) {
+                    $map.Remove($identity)
+                    [void]$ambiguous.Add($identity)
+                    Write-Warning "Ignoring duplicated existing localization identity: $namespace / $key"
+                } else {
+                    $map[$identity] = [pscustomobject]@{
+                        Text = ConvertTo-FlatString $raw.Text
+                        RelativePath = $relativePath
+                    }
                 }
             }
         } catch {
@@ -1198,7 +1274,7 @@ function Get-NextKeyState([object[]]$States, [int]$RequestsPerMinutePerKey, [int
             $sleepMs = [int][Math]::Ceiling(($readyAt - $now).TotalMilliseconds)
             if ($sleepMs -gt 0) {
                 Write-Host ("Waiting {0:n1}s for free-tier request/input-token limits..." -f ($sleepMs / 1000.0))
-                Start-Sleep -Milliseconds $sleepMs
+                Wait-TranslationDelay $sleepMs
             }
             continue
         }
@@ -1333,6 +1409,7 @@ function Invoke-OpenAICompatibleChat([string]$ChatUrl, [object]$Body, [object[]]
     $lastError = $null
 
     for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        Assert-TranslationNotCancelled
         $state = Get-NextKeyState `
             -States $KeyStates `
             -RequestsPerMinutePerKey $RequestsPerMinutePerKey `
@@ -1356,6 +1433,7 @@ function Invoke-OpenAICompatibleChat([string]$ChatUrl, [object]$Body, [object[]]
                 -DailyTokenBudgetPerKey $DailyTokenBudgetPerKey
             return $response
         } catch {
+            if (Test-TranslationCancellationRequested -or $_.Exception -is [System.OperationCanceledException]) { throw }
             $detail = Get-HttpErrorDetail $_
             $lastError = "HTTP $($detail.Code): $($detail.Body)"
             $state.Failures++
@@ -1373,7 +1451,7 @@ function Invoke-OpenAICompatibleChat([string]$ChatUrl, [object]$Body, [object[]]
                 continue
             }
             if ($detail.Code -ge 500 -or $null -eq $detail.Code) {
-                Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
+                Wait-TranslationDelay ([Math]::Min(30000, 2000 * $attempt))
                 continue
             }
             throw $lastError
@@ -1437,13 +1515,7 @@ function ConvertTo-TranslationMap([object]$Response) {
 }
 
 function Get-ProtectedTokenCounts([string]$Text) {
-    $counts = New-Object "System.Collections.Generic.Dictionary[string,int]" ([System.StringComparer]::Ordinal)
-    $pattern = '(\\r\\n|\\[nrt]|\{[^}\r\n]+\}|\[[A-Za-z0-9_.:;''" -]+\]|</?[A-Za-z][^>\r\n]*>|\$[A-Za-z_][A-Za-z0-9_]*\$?|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
-    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches([string]$Text, $pattern)) {
-        $token = [string]$match.Value
-        if ($counts.ContainsKey($token)) { $counts[$token]++ } else { $counts[$token] = 1 }
-    }
-    return $counts
+    return Get-RimWorldProtectedTokenCounts $Text
 }
 
 function Get-ProtectedTokens([string]$Text) {
@@ -1452,34 +1524,7 @@ function Get-ProtectedTokens([string]$Text) {
 }
 
 function Get-TokenPreservationIssues([string]$Source, [string]$Target) {
-    $sourceCounts = Get-ProtectedTokenCounts $Source
-    $targetCounts = Get-ProtectedTokenCounts $Target
-    $missing = New-Object "System.Collections.Generic.List[string]"
-    $unexpected = New-Object "System.Collections.Generic.List[string]"
-    $countMismatches = New-Object "System.Collections.Generic.List[string]"
-    foreach ($token in $sourceCounts.Keys) {
-        $sourceCount = [int]$sourceCounts[$token]
-        $targetCount = if ($targetCounts.ContainsKey($token)) { [int]$targetCounts[$token] } else { 0 }
-        if ($targetCount -lt $sourceCount) { [void]$missing.Add($token) }
-        if ($targetCount -ne $sourceCount) { [void]$countMismatches.Add("$token ($sourceCount->$targetCount)") }
-    }
-    foreach ($token in $targetCounts.Keys) {
-        $targetCount = [int]$targetCounts[$token]
-        $sourceCount = if ($sourceCounts.ContainsKey($token)) { [int]$sourceCounts[$token] } else { 0 }
-        if ($targetCount -gt $sourceCount) { [void]$unexpected.Add($token) }
-    }
-    $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($Source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
-    $grammarPrefixMoved = $false
-    if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($Target, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) {
-        $grammarPrefixMoved = $true
-        if (-not $missing.Contains($grammarPrefix.Groups[1].Value)) { [void]$missing.Add($grammarPrefix.Groups[1].Value) }
-    }
-    return [pscustomobject]@{
-        MissingTokens = $missing.ToArray()
-        UnexpectedTokens = $unexpected.ToArray()
-        TokenCountMismatches = $countMismatches.ToArray()
-        GrammarPrefixMoved = $grammarPrefixMoved
-    }
+    return Get-RimWorldTokenPreservationIssues -Source $Source -Target $Target
 }
 
 function ConvertTo-GoogleProtectedText([string]$Text) {
@@ -1557,6 +1602,7 @@ function Invoke-GoogleTranslateText([string]$Text, [string]$Endpoint, [int]$Time
     foreach ($chunk in (Split-GoogleTextChunks $protected.Text)) {
         $lastError = $null
         for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+            Assert-TranslationNotCancelled
             try {
                 $query = [System.Uri]::EscapeDataString($chunk)
                 $url = "$Endpoint`?client=gtx&sl=auto&tl=ko&dt=t&q=$query"
@@ -1565,14 +1611,15 @@ function Invoke-GoogleTranslateText([string]$Text, [string]$Endpoint, [int]$Time
                 $lastError = $null
                 break
             } catch {
+                if (Test-TranslationCancellationRequested -or $_.Exception -is [System.OperationCanceledException]) { throw }
                 $lastError = $_
                 if ($attempt -lt $MaxRetries) {
-                    Start-Sleep -Seconds ([Math]::Min(10, 1 + $attempt))
+                    Wait-TranslationDelay ([Math]::Min(10000, 1000 * (1 + $attempt)))
                 }
             }
         }
         if ($lastError) { throw $lastError }
-        [System.Threading.Thread]::Sleep(120)
+        Wait-TranslationDelay 120
     }
 
     $translated = [string]::Join("", $translatedChunks)
@@ -1639,25 +1686,11 @@ function Remove-InvalidXmlChars([string]$Text) {
 }
 
 function Test-PathologicalTranslation([string]$Text) {
-    if ([string]::IsNullOrEmpty($Text)) { return $false }
-    if ($Text -match "(\r?\n\s*){8,}") { return $true }
-    if ($Text -match "(\\u000a\s*){8,}") { return $true }
-
-    $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($Text, "\r?\n").Count
-    if ($newlineCount -ge 20 -and $Text.Length -lt 4000) { return $true }
-
-    return $false
+    return Test-RimWorldPathologicalTranslation $Text
 }
 
 function Get-InvalidKoreanParticleNotations([string]$Text) {
-    $result = New-Object "System.Collections.Generic.List[string]"
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $result.ToArray() }
-    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
-    $pattern = '(은\(는\)|는\(은\)|이\(가\)|가\(이\)|을\(를\)|를\(을\)|과\(와\)|와\(과\)|으로\(로\)|로\(으로\)|(?:\[[^\]\r\n]+\]|\{[^}\r\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:으로|은|는|이|가|을|를|과|와|로)(?=$|[\s.,!?…:;，。！？、]))'
-    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)) {
-        if ($seen.Add($match.Value)) { [void]$result.Add($match.Value) }
-    }
-    return $result.ToArray()
+    return @(Get-RimWorldInvalidKoreanParticleNotations $Text)
 }
 
 function Escape-XmlText([string]$Text) {
@@ -1681,7 +1714,7 @@ function Write-Utf8TextAtomic([string]$Path, [string]$Text) {
             $stream.Dispose()
         }
         if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
-            [System.IO.File]::Replace($temporaryPath, $fullPath, $null, $true)
+            [System.IO.File]::Replace($temporaryPath, $fullPath, "$fullPath.bak", $true)
         } else {
             [System.IO.File]::Move($temporaryPath, $fullPath)
         }
@@ -1733,11 +1766,100 @@ function Write-AuditFile([string]$Path, [object[]]$Rows) {
 }
 
 function Write-CsvFile([string]$Path, [object[]]$Rows) {
-    $dir = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $csv = @($Rows | ConvertTo-Csv -NoTypeInformation)
+    Write-Utf8LinesAtomic -Path $Path -Lines $csv
+}
+
+function Write-TranslationCheckpoint(
+    [string]$AuditBase,
+    [object]$TranslatedRows,
+    [object]$ComparisonRows,
+    [object]$Warnings,
+    [int]$CompletedBatches,
+    [int]$TotalBatches,
+    [bool]$Complete
+) {
+    $translatedArray = @(foreach ($row in $TranslatedRows) { $row })
+    $comparisonArray = @(foreach ($row in $ComparisonRows) { $row })
+    $warningArray = @(foreach ($row in $Warnings) { $row })
+    Write-AuditFile -Path "$AuditBase-translated.json" -Rows $translatedArray
+    Write-AuditFile -Path "$AuditBase-comparison.json" -Rows $comparisonArray
+    Write-CsvFile -Path "$AuditBase-comparison.csv" -Rows $comparisonArray
+    Write-AuditFile -Path "$AuditBase-token-warnings.json" -Rows $warningArray
+    Write-AuditFile -Path "$AuditBase-progress.json" -Rows @([pscustomobject]@{
+        version = 1
+        completedBatches = $CompletedBatches
+        totalBatches = $TotalBatches
+        complete = $Complete
+        updatedAt = [DateTime]::UtcNow.ToString("o")
+    })
+}
+
+function Copy-FileFlushed([string]$SourcePath, [string]$DestinationPath) {
+    $bytes = [System.IO.File]::ReadAllBytes($SourcePath)
+    $stream = [System.IO.FileStream]::new($DestinationPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
     }
-    $Rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+}
+
+function Restore-TranslationTransactionFile([object]$Entry) {
+    $path = [string]$Entry.Path
+    if (-not [bool]$Entry.Existed) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+        return
+    }
+    $directory = [System.IO.Path]::GetDirectoryName($path)
+    $restorePath = Join-Path $directory (".{0}.{1}.restore.tmp" -f [System.IO.Path]::GetFileName($path), [Guid]::NewGuid().ToString("N"))
+    $discardPath = Join-Path $directory (".{0}.{1}.failed.tmp" -f [System.IO.Path]::GetFileName($path), [Guid]::NewGuid().ToString("N"))
+    try {
+        Copy-FileFlushed -SourcePath ([string]$Entry.SnapshotPath) -DestinationPath $restorePath
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            [System.IO.File]::Replace($restorePath, $path, $discardPath, $true)
+        } else {
+            [System.IO.File]::Move($restorePath, $path)
+        }
+    } finally {
+        foreach ($temporaryPath in @($restorePath, $discardPath)) {
+            if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Write-TranslationFilesTransaction([hashtable]$OutputGroups, [switch]$Overwrite) {
+    $journal = New-Object "System.Collections.Generic.List[object]"
+    try {
+        foreach ($targetPath in ($OutputGroups.Keys | Sort-Object)) {
+            $existed = Test-Path -LiteralPath $targetPath -PathType Leaf
+            $snapshotPath = ""
+            if ($existed) {
+                $directory = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($targetPath))
+                $snapshotPath = Join-Path $directory (".{0}.{1}.transaction.bak" -f [System.IO.Path]::GetFileName($targetPath), [Guid]::NewGuid().ToString("N"))
+                Copy-FileFlushed -SourcePath $targetPath -DestinationPath $snapshotPath
+            }
+            [void]$journal.Add([pscustomobject]@{ Path = $targetPath; Existed = $existed; SnapshotPath = $snapshotPath })
+            Write-LanguageFile -Path $targetPath -Entries $OutputGroups[$targetPath] -Overwrite:$Overwrite
+        }
+    } catch {
+        $writeError = $_.Exception
+        $rollbackErrors = New-Object "System.Collections.Generic.List[string]"
+        for ($index = $journal.Count - 1; $index -ge 0; $index--) {
+            try { Restore-TranslationTransactionFile $journal[$index] } catch { [void]$rollbackErrors.Add("$($journal[$index].Path): $($_.Exception.Message)") }
+        }
+        if ($rollbackErrors.Count -gt 0) {
+            throw "Translation output failed and rollback was incomplete. Write error: $($writeError.Message) Rollback errors: $([string]::Join(' | ', $rollbackErrors))"
+        }
+        throw "Translation output failed; all files written by this run were rolled back. $($writeError.Message)"
+    } finally {
+        foreach ($entry in $journal) {
+            if ($entry.SnapshotPath -and (Test-Path -LiteralPath ([string]$entry.SnapshotPath) -PathType Leaf)) {
+                Remove-Item -LiteralPath ([string]$entry.SnapshotPath) -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Test-ContainsKorean([string]$Text) {
@@ -1774,6 +1896,7 @@ function Invoke-TranslationBatchWithSplit([object[]]$Batch, [string]$Label, [int
 
     $lastError = $null
     for ($attempt = 1; $attempt -le $script:RequestMaxRetries; $attempt++) {
+        Assert-TranslationNotCancelled
         try {
             $response = Invoke-OpenAICompatibleChat `
                 -ChatUrl $chatUrl `
@@ -1783,7 +1906,8 @@ function Invoke-TranslationBatchWithSplit([object[]]$Batch, [string]$Label, [int
                 -InputTokensPerMinutePerKey $InputTokensPerMinutePerKey `
                 -DailyTokenBudgetPerKey $DailyTokenBudgetPerKey `
                 -TimeoutSec $script:RequestTimeoutSec `
-                -MaxRetries $script:RequestMaxRetries
+                -MaxRetries 1
+            Assert-TranslationNotCancelled
             $map = ConvertTo-TranslationMap $response
             $missingIds = @($batch | Where-Object { -not $map.ContainsKey($_.Id) })
             if ($missingIds.Count -eq 0) { return $map }
@@ -1791,10 +1915,11 @@ function Invoke-TranslationBatchWithSplit([object[]]$Batch, [string]$Label, [int
             $sampleMissing = [string]::Join(", ", @($missingIds | Select-Object -First 5 | ForEach-Object { $_.Id }))
             throw "Model response missed $($missingIds.Count) ids in $Label. Missing sample: $sampleMissing"
         } catch {
+            if (Test-TranslationCancellationRequested -or $_.Exception -is [System.OperationCanceledException]) { throw }
             $lastError = $_
             if ($attempt -lt $script:RequestMaxRetries) {
                 Write-Warning "Batch $Label failed on attempt $attempt; retrying. $(Format-CompactError $_)"
-                Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
+                Wait-TranslationDelay ([Math]::Min(30000, 2000 * $attempt))
             }
         }
     }
@@ -1827,6 +1952,11 @@ function New-ReviewRunRoot([string]$BaseRoot, [string]$ModFullPath, [string]$Sta
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $modFull = Resolve-FullPath $ModRoot
+$script:CancellationFileFull = if ($CancellationFile) { Get-FullPathAllowMissing $CancellationFile } else { "" }
+if ($script:CancellationFileFull -and (Test-Path -LiteralPath $script:CancellationFileFull -PathType Container)) {
+    throw "CancellationFile must be a file path, not a directory."
+}
+Assert-TranslationNotCancelled
 Assert-SafePathSegment -Value $LanguageFolderName -Name "LanguageFolderName"
 Assert-SafePathSegment -Value $OutputFilePrefix -Name "OutputFilePrefix"
 $languageRoot = Join-Path (Join-Path $modFull "Languages") $LanguageFolderName
@@ -1899,10 +2029,10 @@ if ($SourceOnly) {
 
 $usesChatApi = $script:ActiveTranslationProvider -in @("Cerebras", "OpenAICompatible")
 if ($usesChatApi) {
-    Assert-HttpsUri -Value $BaseUrl -Name "BaseUrl"
+    Assert-ApiUri -Value $BaseUrl -Name "BaseUrl" -AllowLoopbackHttp:$AllowInsecureLoopback
     $chatUrl = Get-ChatCompletionsUrl $BaseUrl
 } elseif ($script:ActiveTranslationProvider -eq "Google") {
-    Assert-HttpsUri -Value $GoogleTranslateUrl -Name "GoogleTranslateUrl"
+    Assert-ApiUri -Value $GoogleTranslateUrl -Name "GoogleTranslateUrl" -AllowLoopbackHttp:$AllowInsecureLoopback
 }
 
 if ($usesChatApi) {
@@ -1927,6 +2057,7 @@ $auditBase = Join-Path $auditRoot "$auditProvider-$auditStamp"
 
 Write-Host "Mod root: $modFull"
 Write-Host "Output language: $outputLanguageRoot"
+if ($ReviewOnly) { Write-Host "Review output: $reviewRunRoot" }
 Write-Host "Existing translation root: $existingLanguageFull"
 foreach ($referenceRoot in $referenceLanguageFull) { Write-Host "Reference translation root: $referenceRoot" }
 if ($referenceSourceWorkbookFull) { Write-Host "RMK source history workbook: $referenceSourceWorkbookFull" }
@@ -1956,33 +2087,40 @@ if ($SourceOnly) {
 
 $rmkHistoryMap = Get-RmkWorkbookHistoryMap $referenceSourceWorkbookFull
 if ($referenceSourceWorkbookFull) { Write-Host "RMK source history entries: $($rmkHistoryMap.Count)" }
-$existingKeys = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
 $existingMap = @{}
 $existingOriginMap = @{}
 $existingTranslationUpdatedAtMap = @{}
+$existingTargetMap = @{}
+$legacyExistingMap = @{}
+$legacyExistingOriginMap = @{}
+$legacyExistingTranslationUpdatedAtMap = @{}
 foreach ($referenceRoot in $referenceLanguageFull) {
     $referenceMap = Get-ExistingLanguageMap $referenceRoot
-    foreach ($key in $referenceMap.Keys) {
-        if (-not $existingMap.ContainsKey($key)) {
-            $existingMap[$key] = [string]$referenceMap[$key]
-            $existingOriginMap[$key] = "rmk"
+    foreach ($identity in $referenceMap.Keys) {
+        if (-not $existingMap.ContainsKey($identity)) {
+            $existingMap[$identity] = [string]$referenceMap[$identity].Text
+            $existingOriginMap[$identity] = "rmk"
         }
-        [void]$existingKeys.Add([string]$key)
     }
 }
 foreach ($history in $rmkHistoryMap.Values) {
     $key = ([string]$history.Key).Trim()
+    $namespace = ([string]$history.ClassName).Trim()
+    if (-not $namespace -and $history.Identifier) {
+        $separator = ([string]$history.Identifier).IndexOf('+')
+        if ($separator -gt 0) { $namespace = ([string]$history.Identifier).Substring(0, $separator) }
+    }
+    $identity = Get-LocalizationIdentity -Namespace $namespace -Key $key
     $translation = ConvertTo-FlatString $history.Translation
-    if (-not (Test-ValidXmlElementName $key) -or [string]::IsNullOrWhiteSpace($translation) -or $existingMap.ContainsKey($key)) { continue }
-    $existingMap[$key] = $translation
-    $existingOriginMap[$key] = "rmk"
-    [void]$existingKeys.Add($key)
+    if (-not $identity -or -not (Test-ValidXmlElementName $key) -or [string]::IsNullOrWhiteSpace($translation) -or $existingMap.ContainsKey($identity)) { continue }
+    $existingMap[$identity] = $translation
+    $existingOriginMap[$identity] = "rmk"
 }
 $primaryExistingMap = Get-ExistingLanguageMap $existingLanguageFull
-foreach ($key in $primaryExistingMap.Keys) {
-    $existingMap[$key] = [string]$primaryExistingMap[$key]
-    $existingOriginMap[$key] = "mod"
-    [void]$existingKeys.Add([string]$key)
+foreach ($identity in $primaryExistingMap.Keys) {
+    $existingMap[$identity] = [string]$primaryExistingMap[$identity].Text
+    $existingOriginMap[$identity] = "mod"
+    $existingTargetMap[$identity] = [string]$primaryExistingMap[$identity].RelativePath
 }
 $preservedTranslationCount = 0
 if ($preserveTranslationFull) {
@@ -1991,17 +2129,73 @@ if ($preserveTranslationFull) {
         $key = ([string]$item.key).Trim()
         $text = ConvertTo-FlatString $item.text
         if (-not (Test-ValidXmlElementName $key) -or [string]::IsNullOrWhiteSpace($text)) { continue }
-        $existingMap[$key] = $text
-        $existingOriginMap[$key] = if ($item.PSObject.Properties["origin"] -and $item.origin) { [string]$item.origin } else { "local" }
-        if ($item.PSObject.Properties["translationUpdatedAt"] -and $item.translationUpdatedAt) {
-            $existingTranslationUpdatedAtMap[$key] = [string]$item.translationUpdatedAt
+        $namespace = if ($item.PSObject.Properties["namespace"] -and $item.namespace) {
+            [string]$item.namespace
+        } elseif ($item.PSObject.Properties["kind"] -and [string]$item.kind -eq "Keyed") {
+            "Keyed"
+        } elseif ($item.PSObject.Properties["defClass"] -and $item.defClass) {
+            [string]$item.defClass
+        } elseif ($item.PSObject.Properties["target"] -and $item.target) {
+            Get-LocalizationNamespaceFromRelativePath ([string]$item.target)
+        } else { "" }
+        $identity = Get-LocalizationIdentity -Namespace $namespace -Key $key
+        $origin = if ($item.PSObject.Properties["origin"] -and $item.origin) { [string]$item.origin } else { "local" }
+        $updatedAt = if ($item.PSObject.Properties["translationUpdatedAt"] -and $item.translationUpdatedAt) { [string]$item.translationUpdatedAt } else { "" }
+        if ($identity) {
+            $existingMap[$identity] = $text
+            $existingOriginMap[$identity] = $origin
+            if ($item.PSObject.Properties["target"] -and $item.target) { $existingTargetMap[$identity] = [string]$item.target }
+            if ($updatedAt) { $existingTranslationUpdatedAtMap[$identity] = $updatedAt }
+        } else {
+            $legacyExistingMap[$key] = $text
+            $legacyExistingOriginMap[$key] = $origin
+            if ($updatedAt) { $legacyExistingTranslationUpdatedAtMap[$key] = $updatedAt }
         }
-        [void]$existingKeys.Add($key)
         $preservedTranslationCount++
     }
     Write-Host "Preserved review translations: $preservedTranslationCount"
 }
 $sourceEntries = Import-SourceEntries -ModRoot $modFull -OutputFilePrefix $OutputFilePrefix -SourceLanguageFolder $SourceLanguageFolder -IncludePatches:$IncludePatches
+$sourceNamespacesByKey = @{}
+foreach ($entry in $sourceEntries) {
+    $key = [string]$entry.Key
+    if (-not $sourceNamespacesByKey.ContainsKey($key)) {
+        $sourceNamespacesByKey[$key] = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    $namespace = if ([string]$entry.Kind -eq "Keyed") { "Keyed" } else { [string]$entry.TypeName }
+    if ($namespace) { [void]$sourceNamespacesByKey[$key].Add($namespace) }
+}
+
+function Get-ExistingEntryInfo([object]$Entry) {
+    $identity = Get-EntryLocalizationIdentity $Entry
+    $key = [string]$Entry.Key
+    if ($identity -and $existingMap.ContainsKey($identity)) {
+        return [pscustomobject]@{
+            Present = $true
+            Text = [string]$existingMap[$identity]
+            Origin = if ($existingOriginMap.ContainsKey($identity)) { [string]$existingOriginMap[$identity] } else { "" }
+            TranslationUpdatedAt = if ($existingTranslationUpdatedAtMap.ContainsKey($identity)) { [string]$existingTranslationUpdatedAtMap[$identity] } else { "" }
+            TargetRelativePath = if ($existingTargetMap.ContainsKey($identity)) { [string]$existingTargetMap[$identity] } else { "" }
+        }
+    }
+    if ($legacyExistingMap.ContainsKey($key) -and $sourceNamespacesByKey.ContainsKey($key) -and $sourceNamespacesByKey[$key].Count -eq 1) {
+        return [pscustomobject]@{
+            Present = $true
+            Text = [string]$legacyExistingMap[$key]
+            Origin = if ($legacyExistingOriginMap.ContainsKey($key)) { [string]$legacyExistingOriginMap[$key] } else { "" }
+            TranslationUpdatedAt = if ($legacyExistingTranslationUpdatedAtMap.ContainsKey($key)) { [string]$legacyExistingTranslationUpdatedAtMap[$key] } else { "" }
+            TargetRelativePath = ""
+        }
+    }
+    return [pscustomobject]@{ Present = $false; Text = ""; Origin = ""; TranslationUpdatedAt = ""; TargetRelativePath = "" }
+}
+
+function Get-EntryOutputRelativePath([object]$Entry, [object]$ExistingInfo) {
+    if ($ExistingInfo -and [string]$ExistingInfo.Origin -in @("mod", "local") -and -not [string]::IsNullOrWhiteSpace([string]$ExistingInfo.TargetRelativePath)) {
+        return [string]$ExistingInfo.TargetRelativePath
+    }
+    return [string]$Entry.TargetRelativePath
+}
 $rmkCurrentSourceMap = @{}
 if ($rmkHistoryMap.Count -gt 0 -and $script:RmkWorkbookSourceLanguage) {
     $selectedSourceNames = @($script:DetectedSourceLanguageRoots | ForEach-Object { [string]$_.Name })
@@ -2036,15 +2230,20 @@ $skippedExisting = 0
 $skippedDuplicate = 0
 
 foreach ($entry in $sourceEntries) {
-    $identity = $entry.Key
+    $identity = Get-EntryLocalizationIdentity $entry
+    if (-not $identity) {
+        $skippedDuplicate++
+        continue
+    }
     if (-not $dedupe.Add($identity)) {
         $skippedDuplicate++
         continue
     }
     if ($Limit -gt 0 -and $reviewEntries.Count -ge $Limit) { break }
-    $hasExistingKey = $existingKeys.Contains($entry.Key)
-    $hasExistingTranslation = $existingMap.ContainsKey($entry.Key) -and -not [string]::IsNullOrWhiteSpace([string]$existingMap[$entry.Key])
-    $existingOrigin = if ($existingOriginMap.ContainsKey($entry.Key)) { [string]$existingOriginMap[$entry.Key] } else { "" }
+    $existingInfo = Get-ExistingEntryInfo $entry
+    $hasExistingKey = [bool]$existingInfo.Present
+    $hasExistingTranslation = $hasExistingKey -and -not [string]::IsNullOrWhiteSpace([string]$existingInfo.Text)
+    $existingOrigin = [string]$existingInfo.Origin
     $rmkIdentifier = Get-RmkEntryIdentifier $entry
     $rmkStaleTranslation = $false
     if ($existingOrigin -eq "rmk" -and $rmkIdentifier -and $rmkHistoryMap.ContainsKey($rmkIdentifier) -and $rmkCurrentSourceMap.ContainsKey($rmkIdentifier)) {
@@ -2097,9 +2296,10 @@ Write-AuditFile -Path "$auditBase-skipped-internal-identifiers.json" -Rows $scri
 if ($SourceOnly) {
     $comparisonRows = New-Object "System.Collections.Generic.List[object]"
     foreach ($entry in $reviewEntries) {
-        $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
-        $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingOriginMap $existingOriginMap -ExistingTranslationUpdatedAtMap $existingTranslationUpdatedAtMap -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
-        $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
+        $existingInfo = Get-ExistingEntryInfo $entry
+        $existingTranslation = [string]$existingInfo.Text
+        $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingInfo $existingInfo -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
+        $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath (Get-EntryOutputRelativePath -Entry $entry -ExistingInfo $existingInfo)
         [void]$comparisonRows.Add([pscustomobject]@{
             id = $entry.Id
             key = $entry.Key
@@ -2162,9 +2362,10 @@ foreach ($entry in $pending) { [void]$pendingIds.Add([string]$entry.Id) }
 
 foreach ($entry in $reviewEntries) {
     if ($pendingIds.Contains([string]$entry.Id)) { continue }
-    $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
-    $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingOriginMap $existingOriginMap -ExistingTranslationUpdatedAtMap $existingTranslationUpdatedAtMap -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
-    $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
+    $existingInfo = Get-ExistingEntryInfo $entry
+    $existingTranslation = [string]$existingInfo.Text
+    $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingInfo $existingInfo -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
+    $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath (Get-EntryOutputRelativePath -Entry $entry -ExistingInfo $existingInfo)
     [void]$comparisonRows.Add([pscustomobject]@{
         id = $entry.Id
         key = $entry.Key
@@ -2197,7 +2398,10 @@ foreach ($entry in $reviewEntries) {
     })
 }
 
+Write-TranslationCheckpoint -AuditBase $auditBase -TranslatedRows $translatedRows -ComparisonRows $comparisonRows -Warnings $warnings -CompletedBatches 0 -TotalBatches $batches.Count -Complete $false
+
 for ($i = 0; $i -lt $batches.Count; $i++) {
+    Assert-TranslationNotCancelled
     $batch = @($batches[$i])
     Write-Host ("Translating batch {0}/{1} ({2} entries)..." -f ($i + 1), $batches.Count, $batch.Count)
     $map = Invoke-TranslationBatchWithSplit -Batch $batch -Label ("{0}/{1}" -f ($i + 1), $batches.Count)
@@ -2257,9 +2461,10 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
             })
         }
 
-        $existingTranslation = if ($existingMap.ContainsKey($entry.Key)) { [string]$existingMap[$entry.Key] } else { "" }
-        $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingOriginMap $existingOriginMap -ExistingTranslationUpdatedAtMap $existingTranslationUpdatedAtMap -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
-        $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath $entry.TargetRelativePath
+        $existingInfo = Get-ExistingEntryInfo $entry
+        $existingTranslation = [string]$existingInfo.Text
+        $referenceInfo = Get-ComparisonReferenceInfo -Entry $entry -ExistingInfo $existingInfo -RmkHistoryMap $rmkHistoryMap -RmkCurrentSourceMap $rmkCurrentSourceMap -RmkWorkbook $referenceSourceWorkbookFull
+        $targetPath = Get-PathInsideRoot -Root $outputLanguageRoot -RelativePath (Get-EntryOutputRelativePath -Entry $entry -ExistingInfo $existingInfo)
         $candidateHasKorean = Test-ContainsKorean $translated
         $candidateSameAsSource = [string]::Equals($translated, [string]$entry.Text, [System.StringComparison]::Ordinal)
         $safeToWrite = -not $isBlankCandidate -and -not $isPathologicalCandidate -and $missingTokens.Count -eq 0 -and $unexpectedTokens.Count -eq 0 -and $tokenCountMismatches.Count -eq 0 -and -not $tokenIssues.GrammarPrefixMoved -and $invalidKoreanParticles.Count -eq 0 -and $candidateHasKorean -and -not $candidateSameAsSource
@@ -2317,16 +2522,13 @@ for ($i = 0; $i -lt $batches.Count; $i++) {
             safeToApply = $safeToWrite
         })
     }
+    Write-TranslationCheckpoint -AuditBase $auditBase -TranslatedRows $translatedRows -ComparisonRows $comparisonRows -Warnings $warnings -CompletedBatches ($i + 1) -TotalBatches $batches.Count -Complete $false
 }
 
-foreach ($targetPath in ($outputGroups.Keys | Sort-Object)) {
-    Write-LanguageFile -Path $targetPath -Entries $outputGroups[$targetPath] -Overwrite:$Overwrite
-}
+Assert-TranslationNotCancelled
+Write-TranslationFilesTransaction -OutputGroups $outputGroups -Overwrite:$Overwrite
 
-Write-AuditFile -Path "$auditBase-translated.json" -Rows $translatedRows
-Write-AuditFile -Path "$auditBase-comparison.json" -Rows $comparisonRows
-Write-CsvFile -Path "$auditBase-comparison.csv" -Rows $comparisonRows
-Write-AuditFile -Path "$auditBase-token-warnings.json" -Rows $warnings
+Write-TranslationCheckpoint -AuditBase $auditBase -TranslatedRows $translatedRows -ComparisonRows $comparisonRows -Warnings $warnings -CompletedBatches $batches.Count -TotalBatches $batches.Count -Complete $true
 
 $writtenFiles = @($outputGroups.Keys | Sort-Object)
 Write-Host "Done."

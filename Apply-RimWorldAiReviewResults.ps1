@@ -13,6 +13,9 @@
 )
 
 $ErrorActionPreference = "Stop"
+$validationScriptPath = Join-Path $PSScriptRoot "RimWorldAiTranslator.Validation.ps1"
+if (-not (Test-Path -LiteralPath $validationScriptPath -PathType Leaf)) { throw "Translation validation component was not found: $validationScriptPath" }
+. $validationScriptPath
 try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -112,13 +115,7 @@ function Test-DecisionSourceChanged([object]$Item, [object]$Row) {
 }
 
 function Get-ProtectedTokenCounts([string]$Text) {
-    $counts = New-Object "System.Collections.Generic.Dictionary[string,int]" ([System.StringComparer]::Ordinal)
-    $pattern = '(\\r\\n|\\[nrt]|\{[^}\r\n]+\}|\[[A-Za-z0-9_.:;''" -]+\]|</?[A-Za-z][^>\r\n]*>|\$[A-Za-z_][A-Za-z0-9_]*\$?|%[0-9.]*[sdif]|\b[A-Z]{2,}_[A-Z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*->)'
-    foreach ($match in [System.Text.RegularExpressions.Regex]::Matches([string]$Text, $pattern)) {
-        $token = [string]$match.Value
-        if ($counts.ContainsKey($token)) { $counts[$token]++ } else { $counts[$token] = 1 }
-    }
-    return $counts
+    return Get-RimWorldProtectedTokenCounts $Text
 }
 
 function Test-JsonWithBackupExists([string]$Path) {
@@ -141,13 +138,7 @@ function Read-JsonWithBackup([string]$Path) {
 }
 
 function Test-ProtectedTokenStructure([string]$Source, [string]$Translation) {
-    $sourceCounts = Get-ProtectedTokenCounts $Source
-    $targetCounts = Get-ProtectedTokenCounts $Translation
-    if ($sourceCounts.Count -ne $targetCounts.Count) { return $false }
-    foreach ($token in $sourceCounts.Keys) {
-        if (-not $targetCounts.ContainsKey($token) -or [int]$targetCounts[$token] -ne [int]$sourceCounts[$token]) { return $false }
-    }
-    return $true
+    return Test-RimWorldProtectedTokenStructure -Source $Source -Translation $Translation
 }
 
 function Test-InternalLocalizationIdentifierRow([object]$Row) {
@@ -166,8 +157,7 @@ function Test-InternalLocalizationIdentifierRow([object]$Row) {
 }
 
 function Test-InvalidKoreanParticleNotation([string]$Text) {
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
-    return $Text -match '(은\(는\)|는\(은\)|이\(가\)|가\(이\)|을\(를\)|를\(을\)|과\(와\)|와\(과\)|으로\(로\)|로\(으로\)|(?:\[[^\]\r\n]+\]|\{[^}\r\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:으로|은|는|이|가|을|를|과|와|로)(?=$|[\s.,!?…:;，。！？、]))'
+    return @(Get-RimWorldInvalidKoreanParticleNotations $Text).Count -gt 0
 }
 
 function Test-TranslationStructureSafe([object]$Row, [string]$Translation) {
@@ -176,12 +166,8 @@ function Test-TranslationStructureSafe([object]$Row, [string]$Translation) {
     if (Test-InternalLocalizationIdentifierRow $Row) { return $false }
     if ([string]::IsNullOrWhiteSpace($translationText)) { return $false }
     if (Test-InvalidKoreanParticleNotation $translationText) { return $false }
-    if ($translationText -match "(\r?\n\s*){8,}" -or $translationText -match "(\\u000a\s*){8,}") { return $false }
-    $newlineCount = [System.Text.RegularExpressions.Regex]::Matches($translationText, "\r?\n").Count
-    if ($newlineCount -ge 20 -and $translationText.Length -lt 4000) { return $false }
+    if (Test-RimWorldPathologicalTranslation $translationText) { return $false }
     if (-not (Test-ProtectedTokenStructure -Source $source -Translation $translationText)) { return $false }
-    $grammarPrefix = [System.Text.RegularExpressions.Regex]::Match($source, '^\s*([A-Za-z][A-Za-z0-9_]*->)')
-    if ($grammarPrefix.Success -and -not [System.Text.RegularExpressions.Regex]::IsMatch($translationText, ('^\s*' + [regex]::Escape($grammarPrefix.Groups[1].Value)))) { return $false }
     return $true
 }
 

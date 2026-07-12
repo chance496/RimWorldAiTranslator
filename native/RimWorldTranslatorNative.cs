@@ -234,6 +234,21 @@ public static class RimWorldTranslatorRmkXlsxReader
         return false;
     }
 
+    private static bool ContextuallyExcludedDefPath(IList<string> path, string typeName)
+    {
+        if (path.Count == 0) return false;
+        string leaf = path[path.Count - 1].ToLowerInvariant();
+        string full = String.Join(".", path.ToArray()).ToLowerInvariant();
+        if (!String.IsNullOrWhiteSpace(typeName) && typeName.IndexOf("PawnRenderTreeDef", StringComparison.OrdinalIgnoreCase) >= 0)
+            return true;
+        if (leaf == "name" && (full.IndexOf("alienrace.", StringComparison.Ordinal) >= 0 ||
+            Regex.IsMatch(full, "(^|\\.)(colorchannels|bodyaddons|powermodes)(\\.|$)")))
+            return true;
+        if (Regex.IsMatch(full, "(^|\\.)(graphicpaths?|rendernodes?|rendertree)(\\.|$)"))
+            return true;
+        return false;
+    }
+
     private static void AddDefLeaves(
         XElement node,
         List<string> path,
@@ -256,8 +271,12 @@ public static class RimWorldTranslatorRmkXlsxReader
                 excluded.Add(entry);
                 return;
             }
-            if (!TranslatableDefPath(path)) return;
-            entries.Add(entry);
+            if (TranslatableDefPath(path))
+            {
+                entries.Add(entry);
+                return;
+            }
+            if (ContextuallyExcludedDefPath(path, typeName)) excluded.Add(entry);
             return;
         }
 

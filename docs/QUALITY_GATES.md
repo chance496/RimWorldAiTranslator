@@ -10,7 +10,7 @@
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-RegressionTests.ps1 -Suite All
 ```
 
-테스트는 합성 fixture를 고유한 `%TEMP%` 폴더에 복제하며 실제 사용자 프로젝트와 네트워크를 사용하지 않는다. 작업 중에는 `-Suite Harness`, `Syntax`, `StateStore`, `SecretHandling`, `SourceExtraction`, `LocalApply`, `LocalRollback`, `RmkExport`처럼 가장 좁은 suite부터 실행한다.
+테스트는 합성 fixture를 고유한 `%TEMP%` 폴더에 복제하며 실제 사용자 프로젝트와 외부 네트워크를 사용하지 않는다. API 회귀는 루프백 TCP 가짜 서버를 쓴다. 작업 중에는 `-Suite Harness`, `Syntax`, `StateStore`, `SecretHandling`, `ProjectCleanup`, `DryRun`, `DefSafety`, `DuplicateIdentity`, `TokenSafety`, `ApiResilience`, `DirectOutput`, `LocalApply`, `LocalRollback`, `RmkExport`, `RmkHistory`처럼 가장 좁은 suite부터 실행한다.
 
 ### 실행
 
@@ -129,6 +129,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 
 ## 이번 점검 실행 결과
 
-- 오프라인 회귀: 8/8 PASS (`Harness`, `Syntax`, `StateStore`, `SecretHandling`, `SourceExtraction`, `LocalApply`, `LocalRollback`, `RmkExport`).
+- 오프라인 회귀: 16/16 PASS. 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했다.
 - 패키지 빌드: PASS. 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS.
 - 네트워크, 실제 API, Workshop, RMK 구독본과 `%LOCALAPPDATA%\RimWorldAiTranslator` 쓰기: 실행하지 않음.
