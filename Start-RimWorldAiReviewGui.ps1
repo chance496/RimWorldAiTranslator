@@ -87,6 +87,11 @@ if (-not (Test-Path -LiteralPath $translationMemoryScriptPath -PathType Leaf)) {
     throw "Translation memory component was not found: $translationMemoryScriptPath"
 }
 . $translationMemoryScriptPath
+$diagnosticsScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.Diagnostics.ps1"
+if (-not (Test-Path -LiteralPath $diagnosticsScriptPath -PathType Leaf)) {
+    throw "Diagnostic component was not found: $diagnosticsScriptPath"
+}
+. $diagnosticsScriptPath
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $script:powershellExe = $systemPowerShell
@@ -5391,6 +5396,37 @@ function Resize-RmkSettingsLayout {
     $lblDashboardRmkNote.SetBounds($noteX, $noteY, [Math]::Max(280, $width - $noteX), 34)
 }
 
+function Export-DiagnosticBundle {
+    $dialog = [System.Windows.Forms.SaveFileDialog]::new()
+    $dialog.Title = "진단 번들 저장"
+    $dialog.Filter = "ZIP 파일 (*.zip)|*.zip"
+    $dialog.DefaultExt = "zip"
+    $dialog.AddExtension = $true
+    $dialog.OverwritePrompt = $true
+    $dialog.FileName = "RimWorldAiTranslator-diagnostics-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".zip"
+    try {
+        if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $result = New-RimWorldDiagnosticBundle `
+            -OutputPath $dialog.FileName `
+            -AppDataRoot $script:appDataRoot `
+            -ProductRoot $scriptRoot `
+            -RuntimeLogLines @($txtLog.Lines) `
+            -Force
+        Add-Log "진단 번들을 생성했습니다. 원문·번역문·키·API 키·원시 로그는 포함하지 않았습니다."
+        [System.Windows.Forms.MessageBox]::Show(
+            "진단 번들을 저장했습니다.`r`n`r`n$($result.Path)`r`n`r`n원문, 번역문, 번역 키, API 키, 전체 경로와 원시 로그는 포함하지 않습니다.",
+            "진단 번들",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+    } catch {
+        Add-Log "진단 번들 생성 실패: $($_.Exception.GetType().Name)"
+        [System.Windows.Forms.MessageBox]::Show("진단 번들을 만들지 못했습니다.`r`n$($_.Exception.Message)", "진단 번들", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    } finally {
+        $dialog.Dispose()
+    }
+}
+
 function Resize-DashboardSettingsLayout {
     if (-not $dashSettingsPage -or $dashSettingsPage.ClientSize.Width -le 0) { return }
     $width = $dashSettingsPage.ClientSize.Width
@@ -6432,7 +6468,10 @@ $chkDashboardAutoSave = [System.Windows.Forms.CheckBox]::new()
 $chkDashboardAutoSave.Text = "편집 내용 자동 저장"
 $chkDashboardAutoSave.SetBounds(0, 224, 210, 26)
 $chkDashboardAutoSave.BackColor = [System.Drawing.Color]::Transparent
-$pnlAppearanceSettings.Controls.AddRange(@($lblDashAppearance, $lblDashTheme, $cmbDashboardTheme, $lblDashTextSize, $cmbDashboardTextSize, $chkDashboardHighContrast, $chkDashboardAutoSave))
+$btnExportDiagnostics = New-Button "진단 번들 저장" ([System.Drawing.Color]::FromArgb(72, 86, 100))
+$btnExportDiagnostics.ForeColor = [System.Drawing.Color]::White
+$btnExportDiagnostics.SetBounds(0, 260, 170, 32)
+$pnlAppearanceSettings.Controls.AddRange(@($lblDashAppearance, $lblDashTheme, $cmbDashboardTheme, $lblDashTextSize, $cmbDashboardTextSize, $chkDashboardHighContrast, $chkDashboardAutoSave, $btnExportDiagnostics))
 
 $pnlRmkSettings = [System.Windows.Forms.Panel]::new()
 $pnlRmkSettings.SetBounds(28, 536, 1098, 190)
@@ -6681,7 +6720,7 @@ function Apply-AppTheme {
     $btnApplyTranslated.Text = "전체 적용"
     $btnApplyTranslated.SetBounds(($actionX + $actionWidths[0] + $actionGap + $actionWidths[1] + $actionGap + $actionWidths[2] + $actionGap + $actionWidths[3] + $actionGap), 21, $actionWidths[4], 36)
 
-    foreach ($button in @($btnHome, $btnSave, $btnOpenFolder, $btnLoad, $btnDashboardChooseMod, $btnDashboardRefreshMods, $btnDashboardRmkAuto, $btnDashboardRmkChoose, $btnDashboardRmkOpen, $btnRmkRefresh, $btnRmkOpen, $btnDashActivity, $btnDashSettings)) {
+    foreach ($button in @($btnHome, $btnSave, $btnOpenFolder, $btnLoad, $btnDashboardChooseMod, $btnDashboardRefreshMods, $btnDashboardRmkAuto, $btnDashboardRmkChoose, $btnDashboardRmkOpen, $btnRmkRefresh, $btnRmkOpen, $btnDashActivity, $btnDashSettings, $btnExportDiagnostics)) {
         if ($button) {
             $button.BackColor = $headerButton
             $button.ForeColor = $headerText
@@ -6973,6 +7012,7 @@ Set-AccessibleControl $txtLog "작업 로그" "원문 로드, 번역과 적용 �
 Set-AccessibleControl $btnDashProjects "프로젝트 탭" "로컬 번역 프로젝트를 표시합니다." 0
 Set-AccessibleControl $btnDashActivity "활동 탭" "최근 번역과 검토 활동을 표시합니다." 1
 Set-AccessibleControl $btnDashSettings "설정 탭" "API와 화면 설정을 표시합니다." 2
+Set-AccessibleControl $btnExportDiagnostics "진단 번들 저장" "원문, 번역문, 키, API 키, 전체 경로와 원시 로그를 제외한 로컬 진단 ZIP을 저장합니다." 6
 Set-AccessibleControl $txtDashboardSearch "프로젝트 검색" "모드 이름, Workshop ID 또는 패키지 ID를 검색합니다." 0
 Set-AccessibleControl $cmbDashboardMods "프로젝트 대상 모드" "자동으로 찾은 RimWorld 모드 중 프로젝트로 만들 모드를 선택합니다." 1
 Set-AccessibleControl $btnDashboardAddMod "프로젝트 만들기" "선택한 모드로 로컬 번역 프로젝트를 만듭니다." 2
@@ -7114,6 +7154,7 @@ $btnSave.Add_Click({ Save-ReviewWithDuplicatePrompt })
 $btnDashProjects.Add_Click({ Show-Dashboard "projects" })
 $btnDashActivity.Add_Click({ Show-Dashboard "activity" })
 $btnDashSettings.Add_Click({ Show-Dashboard "settings" })
+$btnExportDiagnostics.Add_Click({ Export-DiagnosticBundle })
 $txtDashboardSearch.Add_TextChanged({
     $dashboardSearchTimer.Stop()
     $dashboardSearchTimer.Start()

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("All", "Harness", "Syntax", "StateStore", "SecretHandling", "ProviderValidation", "TranslationMemory", "ProjectCleanup", "DryRun", "SourceExtraction", "DefSafety", "DuplicateIdentity", "TokenSafety", "ApiResilience", "DirectOutput", "LocalApply", "LocalRollback", "RmkExport", "RmkHistory")]
+    [ValidateSet("All", "Harness", "Syntax", "StateStore", "SecretHandling", "ProviderValidation", "TranslationMemory", "Diagnostics", "ProjectCleanup", "DryRun", "SourceExtraction", "DefSafety", "DuplicateIdentity", "TokenSafety", "ApiResilience", "DirectOutput", "LocalApply", "LocalRollback", "RmkExport", "RmkHistory")]
     [string]$Suite = "All"
 )
 
@@ -1460,6 +1460,102 @@ function Test-TranslationMemorySuggestions {
     Assert-Equal 0 $caseMismatch.Count "Source matching became case-insensitive."
 }
 
+function Test-DiagnosticBundlePrivacy {
+    . (Join-Path $script:RepoRoot "RimWorldAiTranslator.Diagnostics.ps1")
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $root = New-TestWorkspace
+    try {
+        $appData = Join-Path $root "appdata"
+        $reviewRoot = Join-Path $appData "reviews\private-review"
+        [System.IO.Directory]::CreateDirectory($reviewRoot) | Out-Null
+        $secretKey = "csk-diagnostic-secret-do-not-export"
+        $secretSource = "PRIVATE_SOURCE_BODY_91f8"
+        $secretTranslation = "PRIVATE_TRANSLATION_BODY_24aa"
+        $secretProject = "PRIVATE_PROJECT_NAME_b81c"
+        $secretModel = "PRIVATE_MODEL_ID_451e"
+        $secretProvider = "PRIVATE_PROVIDER_ID_351a"
+        $secretTheme = "PRIVATE_THEME_84dc"
+        $secretLanguage = "PRIVATE_LANGUAGE_7b4a"
+        $secretStatus = "PRIVATE_STATUS_f325"
+        $secretOrigin = "PRIVATE_ORIGIN_f952"
+        $settings = [ordered]@{
+            version = 2
+            themeMode = $secretTheme
+            textSize = 11
+            highContrast = $true
+            autoSave = $true
+            rmkWorkspaceRoot = "C:\Private\RmkWorkspace"
+            rmkUseExisting = $true
+            apiProviderId = $secretProvider
+            apiProviders = [ordered]@{
+                $secretProvider = [ordered]@{ name = "Private Service"; url = "https://private.example.invalid/v1?token=$secretKey"; model = $secretModel; temperature = 0.1 }
+            }
+        }
+        Write-Utf8Text (Join-Path $appData "settings.json") ($settings | ConvertTo-Json -Depth 8)
+        $projects = [ordered]@{
+            version = 3
+            projects = @([ordered]@{ id = "private-id"; name = $secretProject; modRoot = "C:\Private\Mod"; sourceLanguage = $secretLanguage; latestReviewRoot = $reviewRoot })
+        }
+        Write-Utf8Text (Join-Path $appData "projects.json") ($projects | ConvertTo-Json -Depth 7)
+        $decisions = [ordered]@{
+            version = 5
+            items = @(
+                [ordered]@{ id = "private-row"; key = "PRIVATE_KEY"; target = "Keyed\Private.xml"; status = "approved"; text = $secretTranslation; sourceText = $secretSource; translationOrigin = "local"; sourceChanged = $false },
+                [ordered]@{ id = "private-row-2"; key = "PRIVATE_KEY_2"; target = "Keyed\Private2.xml"; status = $secretStatus; text = $secretTranslation; sourceText = $secretSource; translationOrigin = $secretOrigin; sourceChanged = $false }
+            )
+        }
+        Write-Utf8Text (Join-Path $reviewRoot "review-decisions.json") ($decisions | ConvertTo-Json -Depth 7)
+
+        $output = Join-Path $root "diagnostics.zip"
+        $result = New-RimWorldDiagnosticBundle -OutputPath $output -AppDataRoot $appData -ProductRoot $script:RepoRoot -RuntimeLogLines @(
+            "HTTP 429 for $secretKey",
+            "JSON parse failed for $secretSource"
+        )
+        Assert-True (Test-Path -LiteralPath $result.Path -PathType Leaf) "Diagnostic ZIP was not created."
+        Assert-Equal 6 ([int]$result.Entries) "Diagnostic entry count changed."
+
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($output)
+        try {
+            $content = New-Object System.Text.StringBuilder
+            $entryText = @{}
+            foreach ($entry in $archive.Entries) {
+                $reader = [System.IO.StreamReader]::new($entry.Open(), [System.Text.Encoding]::UTF8)
+                try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                $entryText[$entry.FullName] = $text
+                [void]$content.AppendLine($text)
+            }
+            foreach ($required in @("manifest.json", "settings-summary.json", "projects-summary.json", "reviews-summary.json", "errors-summary.json", "product-integrity.json")) {
+                Assert-True ($entryText.ContainsKey($required)) "Diagnostic entry is missing: $required"
+            }
+            $allText = $content.ToString()
+            foreach ($privateValue in @($secretKey, $secretSource, $secretTranslation, $secretProject, $secretModel, $secretProvider, $secretTheme, $secretLanguage, $secretStatus, $secretOrigin, "PRIVATE_KEY", "C:\Private")) {
+                Assert-True (-not $allText.Contains($privateValue)) "Diagnostic bundle leaked private content: $privateValue"
+            }
+            $manifest = $entryText["manifest.json"] | ConvertFrom-Json
+            Assert-True (-not [bool]$manifest.privacy.includesSourceText -and -not [bool]$manifest.privacy.includesApiKeys -and -not [bool]$manifest.privacy.includesRawLogs) "Diagnostic privacy manifest changed."
+            $errors = $entryText["errors-summary.json"] | ConvertFrom-Json
+            Assert-Equal 1 ([int]$errors.rateLimit) "Rate-limit diagnostic classification changed."
+            Assert-Equal 1 ([int]$errors.json) "JSON diagnostic classification changed."
+            $reviews = $entryText["reviews-summary.json"] | ConvertFrom-Json
+            Assert-Equal 2 ([int]$reviews.items) "Review aggregate count changed."
+            Assert-Equal 1 ([int]$reviews.statuses.approved) "Review status aggregate changed."
+            Assert-Equal 1 ([int]$reviews.statuses.other) "Unknown review status was not privacy-bucketed."
+        } finally {
+            $archive.Dispose()
+        }
+
+        $overwriteBlocked = $false
+        try { [void](New-RimWorldDiagnosticBundle -OutputPath $output -AppDataRoot $appData -ProductRoot $script:RepoRoot) } catch { $overwriteBlocked = $true }
+        Assert-True $overwriteBlocked "Diagnostic output was overwritten without Force."
+        [void](New-RimWorldDiagnosticBundle -OutputPath $output -AppDataRoot $appData -ProductRoot $script:RepoRoot -Force)
+        Assert-True (Test-Path -LiteralPath ($output + ".bak") -PathType Leaf) "Forced diagnostic replacement did not preserve a backup."
+        [void](New-RimWorldDiagnosticBundle -OutputPath $output -AppDataRoot $appData -ProductRoot $script:RepoRoot -Force)
+        Assert-True (Test-Path -LiteralPath ($output + ".bak") -PathType Leaf) "Repeated forced diagnostic replacement lost its backup."
+    } finally {
+        Remove-TestWorkspace $root
+    }
+}
+
 $tests = @(
     [pscustomobject]@{ Name = "Harness.Isolation"; Suite = "Harness"; Body = { Test-HarnessIsolation } },
     [pscustomobject]@{ Name = "Syntax.PowerShell"; Suite = "Syntax"; Body = { Test-PowerShellSyntax } },
@@ -1467,6 +1563,7 @@ $tests = @(
     [pscustomobject]@{ Name = "Security.ApiKeyHandling"; Suite = "SecretHandling"; Body = { Test-SecretHandling } },
     [pscustomobject]@{ Name = "Settings.ProviderValidation"; Suite = "ProviderValidation"; Body = { Test-ProviderConfigurationValidation } },
     [pscustomobject]@{ Name = "Review.TranslationMemory"; Suite = "TranslationMemory"; Body = { Test-TranslationMemorySuggestions } },
+    [pscustomobject]@{ Name = "Diagnostics.Privacy"; Suite = "Diagnostics"; Body = { Test-DiagnosticBundlePrivacy } },
     [pscustomobject]@{ Name = "Project.CleanupBoundary"; Suite = "ProjectCleanup"; Body = { Test-ProjectCleanupBoundary } },
     [pscustomobject]@{ Name = "Translation.DryRun"; Suite = "DryRun"; Body = { Test-TranslationDryRun } },
     [pscustomobject]@{ Name = "Source.Extraction"; Suite = "SourceExtraction"; Body = { Test-SourceExtraction } },

@@ -252,6 +252,13 @@ powershell -ExecutionPolicy Bypass -File ".\Export-RimWorldAiReviewToRmk.ps1" `
   -ApplyStatus ApprovedOnly
 ```
 
+설정의 `진단 번들 저장`은 문제 보고용 ZIP을 로컬에 만듭니다. 원문, 번역문, 번역 키, API 키, 전체 경로와 원시 로그는 포함하지 않습니다. CLI에서도 같은 개인정보 보호 형식을 만들 수 있습니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ".\Export-RimWorldAiTranslatorDiagnostics.ps1" `
+  -OutputPath ".\RimWorldAiTranslator-diagnostics.zip"
+```
+
 ## 패키지 빌드
 
 ```powershell

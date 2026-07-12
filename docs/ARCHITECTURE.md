@@ -7,12 +7,14 @@ RimWorldAiTranslator.exe
   -> Windows PowerShell
      -> Start-RimWorldAiReviewGui.ps1
         -> 프로젝트/설정/검수 상태 (%LOCALAPPDATA%)
+        -> Storage / Validation / ProviderValidation / TranslationMemory / Diagnostics 모듈
         -> Run-RimWorldAiTranslation.ps1
            -> Invoke-RimWorldAiTranslation.ps1
               -> Google 또는 OpenAI 호환 번역 API
               -> RimWorldTranslator.Native.dll (XML/Defs/RMK XLSX)
         -> Apply-RimWorldAiReviewResults.ps1 (로컬 Korean)
         -> Export-RimWorldAiReviewToRmk.ps1 (RMK 작업 클론 + XLSX)
+        -> Export-RimWorldAiTranslatorDiagnostics.ps1 (본문 없는 로컬 진단 ZIP)
 ```
 
 ## 실행과 UI
@@ -20,6 +22,7 @@ RimWorldAiTranslator.exe
 - `launcher/RimWorldAiTranslatorLauncher.cs`가 패키지 EXE다. Windows 기본 PowerShell을 숨은 프로세스로 시작하고 WinForms 메인 창이 나타날 때까지 준비 창을 표시한다.
 - `Start-RimWorldAiTranslatorGui.cmd`와 `Start-RimWorldAiTranslatorGui.ps1`는 소스 실행 경로다.
 - `Start-RimWorldAiReviewGui.ps1`가 대시보드, 프로젝트, 모드 탐색, 제공자 설정, 검수 편집기, 저장, RMK와 자식 프로세스 제어를 모두 담당한다.
+- 저장·검증·프로젝트 정리·제공자 설정 점검·동일 원문 번역 메모리·진단 집계는 독립 PowerShell 모듈로 분리되어 GUI와 CLI에서 공유한다.
 
 ## 데이터 흐름
 
@@ -29,6 +32,7 @@ RimWorldAiTranslator.exe
 4. AI 번역은 검수 run에 후보만 만들며 원본 모드에 즉시 쓰지 않는다. 키는 환경 변수로 자식 프로세스에 전달된다.
 5. UI는 `review-decisions.json`에 희소 결정, 상태, 출처, 시각, 원문 해시와 이전 원문을 저장한다.
 6. 적용 시 별도 스크립트가 검수 상태와 안전 조건을 다시 검사해 로컬 Korean 또는 RMK 작업 클론에 병합한다.
+7. 진단 번들은 원문·번역문·키·API 키·절대 경로·원시 로그를 전달하지 않고 설정/상태 개수와 오류 분류만 로컬 ZIP에 쓴다.
 
 ## 저장 경계
 
@@ -59,6 +63,6 @@ RimWorldAiTranslator.exe
 ## 주요 기술 부채
 
 - UI와 애플리케이션 계층이 하나의 390KB+ PowerShell 파일에 결합되어 있다.
-- 자동 회귀/CI가 없어 데이터 경계가 수동 검증에 의존한다.
+- 오프라인 회귀와 UI/성능 runner는 있으나 원격 CI workflow는 없다.
 - PowerShell과 native C#에 Def/토큰/안전 규칙이 중복되어 동기화 회귀 위험이 있다.
 - 빌드와 패키징이 한 스크립트에 결합되어 빠른 build-only/verify-only 경로가 없다.
