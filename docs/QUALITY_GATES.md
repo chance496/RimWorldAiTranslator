@@ -40,11 +40,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-package.ps1
 
 ### PowerShell 정적 구문 검사
 
-운영 지침에 요구되어 있고 이번 점검에서 실제 실행해 8개 스크립트 모두 통과한 명령:
+운영 지침에 요구되어 있고 이번 최종 점검에서 실제 실행해 소스·테스트 18개 스크립트 모두 통과한 명령:
 
 ```powershell
 $failed = $false
-Get-ChildItem -LiteralPath . -File -Filter '*.ps1' | Sort-Object Name | ForEach-Object {
+Get-ChildItem -LiteralPath . -Recurse -File -Filter '*.ps1' |
+Where-Object { $_.FullName -notlike '*\dist\*' } |
+Sort-Object FullName | ForEach-Object {
     $tokens = $null
     $errors = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
@@ -124,10 +126,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 
 ## 존재하지 않는 게이트
 
-- Pester 또는 다른 단위/통합 테스트: 없음
+- Pester 테스트 프레임워크: 없음. 저장소 소유 `Run-RegressionTests.ps1` 통합 runner를 사용한다.
 - 린터/formatter: 없음
 - CI workflow: 없음
-- 패키지 ZIP 압축 해제 후 GUI smoke test: 없음. CLI 원문 추출 smoke는 빌드에 연결됨.
+- 패키지 ZIP 압축 해제 후 GUI smoke의 자동 빌드 연결: 없음. CLI 원문 추출은 빌드에 연결했고, 최종 점검에서는 패키지 스크립트와 EXE를 격리 앱 데이터로 별도 실행했다.
 - 125/150/200% 실제 DPI 자동 감사: 없음. 현재 runner는 실행 환경의 실제 DPI를 기록하지만 Windows 디스플레이 배율을 바꾸지 않는다.
 
 `testdata/SampleMod`의 기대 원문 7개, 내부 식별자 제외 1개, 로컬/RMK 적용과 롤백 기대값이 회귀 runner에 정의되어 있다.
@@ -152,8 +154,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 
 ## 이번 점검 실행 결과
 
-- 오프라인 회귀: 19/19 PASS(최종 패키지 게이트 40.744초). 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했고 제공자 설정·번역 메모리·진단 privacy도 포함한다.
-- 패키지 빌드: PASS. native 검증 컴파일, 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS.
-- UI 감사: 5/5 PASS. 5,000행 검색 결과 295/5,000개 및 상태 필터 2,667/2,333개 일치, 동일 원문 메모리 화면 포함, 잘림 0건, 접근성 이름 누락 0건.
-- RMK benchmark: 5,000행 생성 7,289.464ms, 갱신 중앙 8,640.982ms/최악 9,039.086ms, 최대 working set 323.01MB.
+- 오프라인 회귀: 19/19 PASS(독립 실행 41.618초, 최종 패키지 게이트 40.870초). 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했고 제공자 설정·번역 메모리·진단 privacy도 포함한다.
+- 패키지 빌드: PASS. native 검증 컴파일, 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS. 패키지 스크립트 14개의 소스 SHA-256 일치, 필수 EXE·DLL과 ZIP 23개 항목을 확인했다.
+- UI 감사: 5/5 PASS. 5,000행 검색 결과 295/5,000개 및 상태 필터 2,667/2,333개 일치, 동일 원문 메모리 화면 포함, 잘림 0건, 접근성 이름 누락 0건. 로드 1,088.478ms, 검색 중앙 1,164.046ms, 다음 36.549ms, 저장 582.474ms, 무변경 저장 0.155ms, working set 228.19MB다.
+- RMK benchmark: 5,000행 생성 7,089.816ms, 갱신 중앙 8,983.882ms/최악 9,429.046ms, 최대 working set 323.02MB.
+- 패키지 실행: 격리 앱 데이터로 패키지 스크립트와 EXE 설정 화면을 각각 1280×720에서 렌더링했다. EXE `ExitCode=0`, 보이는 상호작용 컨트롤 29개, 잘림·접근성 이름 누락 0건이다.
 - 네트워크, 실제 API, Workshop, RMK 구독본과 `%LOCALAPPDATA%\RimWorldAiTranslator` 쓰기: 실행하지 않음.

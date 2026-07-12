@@ -6,11 +6,11 @@
 
 - 제품 Git 루트: `C:\Users\wjdck\Documents\Rimworld\tools\RimWorldAiTranslator`
 - 원격: `https://github.com/chance496/RimWorldAiTranslator.git`
-- 현재 작업 브랜치: `codex/autonomous/20260712-073630`. 기준 백업은 `aff52cc`, P0 `2ef9488`, P1 `7e49808`, P2 `e63c404`, P3 제공자 `db01309`, 번역 메모리 `d2e0429` 체크포인트를 보존한다.
-- 기존 수정 파일: `Apply-RimWorldAiReviewResults.ps1`, `Export-RimWorldAiReviewToRmk.ps1`, `Invoke-RimWorldAiTranslation.ps1`, `PACKAGE_README.txt`, `README.md`, `Start-RimWorldAiReviewGui.ps1`, `build-package.ps1`, `native/RimWorldTranslatorNative.cs`
-- 기존 새 파일: `rimworld-def-field-rules.txt`
-- 기존 제품 변경 규모: 8개 추적 파일에서 +752/-199줄. 이번 운영 체계 정리 전부터 존재한 사용자 작업이며 검증·커밋되지 않았다.
-- 자동 테스트, 린터, CI workflow, 프로젝트 파일(`.sln`/`.csproj`)은 없다. `testdata/SampleMod`만 존재한다.
+- 현재 작업 브랜치: `codex/autonomous/20260712-073630`. 기준 백업 `aff52cc`, P0 `2ef9488`, P1 `7e49808`, P2 `e63c404`, P3 제공자 `db01309`, 번역 메모리 `d2e0429`, 진단 `844955e`, 통합 리뷰 수정 `88b1a4b` 체크포인트를 보존한다.
+- 시작 당시 수정 파일: `Apply-RimWorldAiReviewResults.ps1`, `Export-RimWorldAiReviewToRmk.ps1`, `Invoke-RimWorldAiTranslation.ps1`, `PACKAGE_README.txt`, `README.md`, `Start-RimWorldAiReviewGui.ps1`, `build-package.ps1`, `native/RimWorldTranslatorNative.cs`
+- 시작 당시 새 파일: `rimworld-def-field-rules.txt`
+- 시작 당시 제품 변경 규모는 8개 추적 파일에서 +752/-199줄이었다. 사용자 선행 작업으로 취급해 기준 백업 `aff52cc`에 보존한 뒤 현재 게이트로 검증했다.
+- 저장소 소유 오프라인 회귀·UI 감사·RMK benchmark는 있다. Pester, 린터, CI workflow와 프로젝트 파일(`.sln`/`.csproj`)은 없다.
 
 ## AGENTS 용량 점검
 
@@ -43,7 +43,7 @@
 
 ## 미완성 또는 미검증
 
-- P0/P1 저장·적용·Def 안전·원문 변경·토큰·취소·재시도·재개 경로는 16개 오프라인 회귀와 패키지 smoke를 통과했다.
+- P0/P1 저장·적용·Def 안전·원문 변경·토큰·취소·재시도·재개 경로는 19개 오프라인 회귀와 패키지 smoke를 통과했다.
 - 실제 125/150/200% DPI는 Windows 디스플레이 배율 변경 없이 자동 재현할 수 없어 96 DPI 감사만 완료했다. 900×600/1280×720/1920×1080, 밝음/어두움/고대비와 글자 10/12에서는 잘림과 접근성 이름 누락이 0건이다.
 - 제공자 모델의 실제 온라인 가용성과 최신 제한은 API 호출 없이 검증하지 않는다. 내장 프로필 또는 사용자가 입력한 값을 표시하되 온라인 미확인 상태를 유지한다.
 - UI, 프로젝트 상태, RMK, 번역 프로세스 오케스트레이션이 큰 `Start-RimWorldAiReviewGui.ps1`에 남아 있다. 저장·검증·삭제 경계와 성능 runner는 독립 파일로 분리했으며, 무리한 전면 재작성은 하지 않는다.
@@ -53,13 +53,14 @@
 | 우선도 | 문제 | 영향과 근거 |
 |---|---|---|
 | 해결됨 | 손상 프로젝트 저장소의 조용한 빈 목록 대체, 로컬/RMK 부분 적용, 복구 백업 부재와 자식 로그 API 키 노출 가능성은 P0 회귀로 차단했다. | `StateStore.Recovery`, `Security.ApiKeyHandling`, `Apply.LocalRollback`, `Export.RmkTransaction` |
-| 해결됨 | 자동 오프라인 회귀 부재, 직접 실행기 인코딩, 내부 식별자·중복 namespace, 토큰·원문 변경·RMK XLSX 보존, 취소·재시도·직접 출력 롤백을 P1 게이트로 고정했다. | `tests/Run-RegressionTests.ps1` 16개 suite 사례 |
+| 해결됨 | 자동 오프라인 회귀 부재, 직접 실행기 인코딩, 내부 식별자·중복 namespace, 토큰·원문 변경·RMK XLSX 보존, 취소·재시도·직접 출력 롤백을 P1 게이트로 고정했다. | `tests/Run-RegressionTests.ps1` 19개 사례 |
 | 명시적 차단 | 실제 125/150/200% DPI 자동 감사가 없다. | Windows 디스플레이 설정 변경은 현재 자율 작업의 시스템 변경 금지 범위다. runner는 실제 DPI를 기록해 다른 환경에서 같은 명령으로 보완할 수 있다. |
 | 잔여 부채 | 큰 WinForms 스크립트에 여러 책임이 남아 있다. | 저장·검증·정리·benchmark는 분리됐지만 추가 분리는 동작 보존 회귀를 동반한 작은 단계로만 진행해야 한다. |
 
 ## 이번 점검에서 확인한 결과
 
-- 전체 오프라인 회귀 19/19, 패키지 C# 빌드, 패키지 PowerShell Parser와 ZIP 새 폴더 원문 추출 7행 smoke가 통과했다.
-- UI 5,000행 기준: 로드 1,558.896→993.706ms, 검색 중앙 3,071.292→1,191.644ms, 다음 항목 50.234→37.266ms, 실제 저장 1,925.418→546.736ms, working set 259.48→224.62MB. 변경 없는 저장은 중앙 0.111ms다.
-- RMK 5,000행 기준: 생성 13,144.655→7,289.464ms, 갱신 중앙 14,919.371→8,640.982ms(최악 9,039.086ms), 최종 최대 working set 323.01MB다.
+- 전체 오프라인 회귀 19/19(독립 실행 41.618초, 최종 패키지 게이트 40.870초), 소스 PowerShell 18개 Parser, C# 빌드, 패키지 Parser와 ZIP 새 폴더 원문 추출 7행 smoke가 통과했다.
+- UI 5,000행 최종 기준: 로드 1,558.896→1,088.478ms, 검색 중앙 3,071.292→1,164.046ms, 다음 항목 50.234→36.549ms, 실제 저장 1,925.418→582.474ms, working set 259.48→228.19MB. 변경 없는 저장은 중앙 0.155ms다. 5개 화면에서 잘림·접근성 이름 누락은 0건이다.
+- RMK 5,000행 최종 기준: 생성 13,144.655→7,089.816ms, 갱신 중앙 14,919.371→8,983.882ms(최악 9,429.046ms), 최대 working set 323.02MB다.
+- 패키지의 14개 PowerShell 파일은 소스와 SHA-256이 일치하고 필수 EXE·DLL을 포함한다. 격리 앱 데이터로 EXE 실행기를 시작해 설정 화면을 렌더링하고 `ExitCode=0`, 잘림·접근성 누락 0건을 확인했다.
 - 외부 네트워크와 실제 API, Workshop/RMK 구독본, `%LOCALAPPDATA%` 사용자 데이터는 사용하지 않았다. API 동작은 로컬 TCP 가짜 서버로 검증했다.
