@@ -10,7 +10,7 @@
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-RegressionTests.ps1 -Suite All
 ```
 
-테스트는 합성 fixture를 고유한 `%TEMP%` 폴더에 복제하며 실제 사용자 프로젝트와 외부 네트워크를 사용하지 않는다. API 회귀는 루프백 TCP 가짜 서버를 쓴다. 작업 중에는 `-Suite Harness`, `Syntax`, `StateStore`, `SecretHandling`, `ProviderValidation`, `ProjectCleanup`, `DryRun`, `DefSafety`, `DuplicateIdentity`, `TokenSafety`, `ApiResilience`, `DirectOutput`, `LocalApply`, `LocalRollback`, `RmkExport`, `RmkHistory`처럼 가장 좁은 suite부터 실행한다.
+테스트는 합성 fixture를 고유한 `%TEMP%` 폴더에 복제하며 실제 사용자 프로젝트와 외부 네트워크를 사용하지 않는다. API 회귀는 루프백 TCP 가짜 서버를 쓴다. 작업 중에는 `-Suite Harness`, `Syntax`, `StateStore`, `SecretHandling`, `ProviderValidation`, `TranslationMemory`, `ProjectCleanup`, `DryRun`, `DefSafety`, `DuplicateIdentity`, `TokenSafety`, `ApiResilience`, `DirectOutput`, `LocalApply`, `LocalRollback`, `RmkExport`, `RmkHistory`처럼 가장 좁은 suite부터 실행한다.
 
 ### 실행
 
@@ -154,6 +154,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiRevie
 
 - 오프라인 회귀: 16/16 PASS(40.648초 최종 대상 실행, 패키지 게이트 51.992초). 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했다.
 - 패키지 빌드: PASS. native 검증 컴파일, 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS.
-- UI 감사: 4/4 PASS. 5,000행, 검색 결과 295/5,000개 및 상태 필터 2,667/2,333개 일치, 잘림 0건, 접근성 이름 누락 0건.
+- UI 감사: 5/5 PASS. 5,000행 검색 결과 295/5,000개 및 상태 필터 2,667/2,333개 일치, 동일 원문 메모리 화면 포함, 잘림 0건, 접근성 이름 누락 0건.
 - RMK benchmark: 5,000행 생성 7,289.464ms, 갱신 중앙 8,640.982ms/최악 9,039.086ms, 최대 working set 323.01MB.
 - 네트워크, 실제 API, Workshop, RMK 구독본과 `%LOCALAPPDATA%\RimWorldAiTranslator` 쓰기: 실행하지 않음.

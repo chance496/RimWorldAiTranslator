@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("All", "Harness", "Syntax", "StateStore", "SecretHandling", "ProviderValidation", "ProjectCleanup", "DryRun", "SourceExtraction", "DefSafety", "DuplicateIdentity", "TokenSafety", "ApiResilience", "DirectOutput", "LocalApply", "LocalRollback", "RmkExport", "RmkHistory")]
+    [ValidateSet("All", "Harness", "Syntax", "StateStore", "SecretHandling", "ProviderValidation", "TranslationMemory", "ProjectCleanup", "DryRun", "SourceExtraction", "DefSafety", "DuplicateIdentity", "TokenSafety", "ApiResilience", "DirectOutput", "LocalApply", "LocalRollback", "RmkExport", "RmkHistory")]
     [string]$Suite = "All"
 )
 
@@ -1438,12 +1438,35 @@ function Test-ProviderConfigurationValidation {
     Assert-Contains @($google.WarningCodes) "GooglePromptFeaturesUnavailable" "Google feature limitation was not reported."
 }
 
+function Test-TranslationMemorySuggestions {
+    . (Join-Path $script:RepoRoot "RimWorldAiTranslator.TranslationMemory.ps1")
+    $entries = @(
+        [pscustomobject]@{ Source = "Same source"; Translation = "Local approved"; Identity = "local"; Status = "approved"; Origin = "local"; SourceChanged = $false; SafeToApply = $true; UpdatedAt = "2026-01-01T00:00:00Z"; Target = "Keyed\A.xml" },
+        [pscustomobject]@{ Source = "Same source"; Translation = "RMK approved"; Identity = "rmk"; Status = "approved"; Origin = "rmk"; SourceChanged = $false; SafeToApply = $true; UpdatedAt = "2026-06-01T00:00:00Z"; Target = "Keyed\B.xml" },
+        [pscustomobject]@{ Source = "Same source"; Translation = "Local approved"; Identity = "duplicate"; Status = "translated"; Origin = "local"; SourceChanged = $false; SafeToApply = $true; UpdatedAt = "2026-07-01T00:00:00Z"; Target = "Keyed\C.xml" },
+        [pscustomobject]@{ Source = "Same source"; Translation = "AI translated"; Identity = "ai"; Status = "translated"; Origin = "ai"; SourceChanged = $false; SafeToApply = $true; UpdatedAt = "2026-07-02T00:00:00Z"; Target = "Keyed\D.xml" },
+        [pscustomobject]@{ Source = "Same source"; Translation = "Unsafe"; Identity = "unsafe"; Status = "approved"; Origin = "local"; SourceChanged = $false; SafeToApply = $false; UpdatedAt = ""; Target = "Keyed\E.xml" },
+        [pscustomobject]@{ Source = "Same source"; Translation = "Changed"; Identity = "changed"; Status = "approved"; Origin = "local"; SourceChanged = $true; SafeToApply = $true; UpdatedAt = ""; Target = "Keyed\F.xml" },
+        [pscustomobject]@{ Source = "Different source"; Translation = "Wrong source"; Identity = "other"; Status = "approved"; Origin = "local"; SourceChanged = $false; SafeToApply = $true; UpdatedAt = ""; Target = "Keyed\G.xml" }
+    )
+    $suggestions = @(Select-RimWorldTranslationMemorySuggestions -Entries $entries -Source "Same source" -Maximum 5)
+    Assert-Equal 3 $suggestions.Count "Translation memory filtering or deduplication changed."
+    Assert-Equal "Local approved" ([string]$suggestions[0].Text) "Reviewed local translation did not rank first."
+    Assert-Equal "RMK approved" ([string]$suggestions[1].Text) "Reviewed RMK translation did not rank second."
+    Assert-Equal "AI translated" ([string]$suggestions[2].Text) "AI translation ranking changed."
+    $excluded = @(Select-RimWorldTranslationMemorySuggestions -Entries $entries -Source "Same source" -ExcludeIdentity "local" -Maximum 5)
+    Assert-Equal "RMK approved" ([string]$excluded[0].Text) "Current row identity was not excluded from suggestions."
+    $caseMismatch = @(Select-RimWorldTranslationMemorySuggestions -Entries $entries -Source "same source" -Maximum 5)
+    Assert-Equal 0 $caseMismatch.Count "Source matching became case-insensitive."
+}
+
 $tests = @(
     [pscustomobject]@{ Name = "Harness.Isolation"; Suite = "Harness"; Body = { Test-HarnessIsolation } },
     [pscustomobject]@{ Name = "Syntax.PowerShell"; Suite = "Syntax"; Body = { Test-PowerShellSyntax } },
     [pscustomobject]@{ Name = "StateStore.Recovery"; Suite = "StateStore"; Body = { Test-StateStoreRecovery } },
     [pscustomobject]@{ Name = "Security.ApiKeyHandling"; Suite = "SecretHandling"; Body = { Test-SecretHandling } },
     [pscustomobject]@{ Name = "Settings.ProviderValidation"; Suite = "ProviderValidation"; Body = { Test-ProviderConfigurationValidation } },
+    [pscustomobject]@{ Name = "Review.TranslationMemory"; Suite = "TranslationMemory"; Body = { Test-TranslationMemorySuggestions } },
     [pscustomobject]@{ Name = "Project.CleanupBoundary"; Suite = "ProjectCleanup"; Body = { Test-ProjectCleanupBoundary } },
     [pscustomobject]@{ Name = "Translation.DryRun"; Suite = "DryRun"; Body = { Test-TranslationDryRun } },
     [pscustomobject]@{ Name = "Source.Extraction"; Suite = "SourceExtraction"; Body = { Test-SourceExtraction } },

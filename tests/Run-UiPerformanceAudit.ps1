@@ -103,19 +103,44 @@ try {
     Write-Utf8Text (Join-Path $auditRoot "synthetic-comparison.json") ($rowsList.ToArray() | ConvertTo-Json -Depth 6 -Compress)
     Write-Utf8Text (Join-Path $auditRoot "synthetic-skipped-internal-identifiers.json") "[]"
 
+    $memoryReviewRoot = Join-Path $workspace "memory-review"
+    $memoryAuditRoot = Join-Path $memoryReviewRoot "_TranslationAudit"
+    $memoryTarget = Join-Path $memoryReviewRoot "Languages\Korean\Keyed\Memory.xml"
+    [System.IO.Directory]::CreateDirectory($memoryAuditRoot) | Out-Null
+    $memorySource = "Repeated source for local memory"
+    $memoryTranslation = ConvertFrom-Json '"\uB85C\uCEEC \uBA54\uBAA8\uB9AC \uBC88\uC5ED"'
+    $memoryRows = @(
+        [pscustomobject]@{ id = "M000002"; key = "Memory.Two"; kind = "Keyed"; defClass = "Keyed"; node = "Memory.Two"; field = "text"; target = $memoryTarget; source = $memorySource; existing = ""; candidate = ""; translationOrigin = ""; rmkSourceChanged = $false },
+        [pscustomobject]@{ id = "M000001"; key = "Memory.One"; kind = "Keyed"; defClass = "Keyed"; node = "Memory.One"; field = "text"; target = $memoryTarget; source = $memorySource; existing = ""; candidate = $memoryTranslation; translationOrigin = "local"; rmkSourceChanged = $false }
+    )
+    $memoryComparison = Join-Path $memoryAuditRoot "memory-comparison.json"
+    Write-Utf8Text $memoryComparison ($memoryRows | ConvertTo-Json -Depth 6 -Compress)
+    Write-Utf8Text (Join-Path $memoryAuditRoot "memory-skipped-internal-identifiers.json") "[]"
+    $memoryDecisions = [ordered]@{
+        version = 5
+        sparse = $true
+        reviewRoot = $memoryReviewRoot
+        comparison = $memoryComparison
+        updatedAt = [DateTime]::UtcNow.ToString("o")
+        items = @([ordered]@{ id = "M000001"; key = "Memory.One"; target = "Keyed\Memory.xml"; status = "approved"; text = $memoryTranslation; translationOrigin = "local"; sourceText = $memorySource; sourceChanged = $false })
+    }
+    Write-Utf8Text (Join-Path $memoryReviewRoot "review-decisions.json") ($memoryDecisions | ConvertTo-Json -Depth 7 -Compress)
+
     $scenarios = @(
         [pscustomobject]@{ Name = "minimum-light-large-text"; Width = 900; Height = 600; Theme = "Light"; TextSize = 12; HighContrast = $false; Measure = $false },
         [pscustomobject]@{ Name = "notebook-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $true },
         [pscustomobject]@{ Name = "desktop-dark"; Width = 1920; Height = 1080; Theme = "Dark"; TextSize = 10; HighContrast = $false; Measure = $false },
-        [pscustomobject]@{ Name = "notebook-dark-high-contrast"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 12; HighContrast = $true; Measure = $false }
+        [pscustomobject]@{ Name = "notebook-dark-high-contrast"; Width = 1280; Height = 720; Theme = "Dark"; TextSize = 12; HighContrast = $true; Measure = $false },
+        [pscustomobject]@{ Name = "translation-memory-light"; Width = 1280; Height = 720; Theme = "Light"; TextSize = 10; HighContrast = $false; Measure = $false; ReviewRoot = $memoryReviewRoot; SideTab = "terms" }
     )
     $results = New-Object "System.Collections.Generic.List[object]"
     foreach ($scenario in $scenarios) {
         $snapshotPath = Join-Path $outputFull ($scenario.Name + ".png")
         $appDataRoot = Join-Path $workspace ("appdata-" + $scenario.Name)
+        $scenarioReviewRoot = if ($scenario.PSObject.Properties["ReviewRoot"] -and $scenario.ReviewRoot) { [string]$scenario.ReviewRoot } else { $reviewRoot }
         $arguments = @(
             "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $repoRoot "Start-RimWorldAiReviewGui.ps1"),
-            "-ReviewRoot", $reviewRoot,
+            "-ReviewRoot", $scenarioReviewRoot,
             "-LayoutSnapshotPath", $snapshotPath,
             "-LayoutSnapshotWidth", $scenario.Width,
             "-LayoutSnapshotHeight", $scenario.Height,
@@ -124,6 +149,7 @@ try {
             "-AppDataRoot", $appDataRoot,
             "-DisableBackgroundDiscovery"
         )
+        if ($scenario.PSObject.Properties["SideTab"] -and $scenario.SideTab) { $arguments += @("-InitialWorkspaceSideTab", [string]$scenario.SideTab) }
         $performancePath = ""
         if ($scenario.Measure) {
             $performancePath = Join-Path $outputFull "performance.json"

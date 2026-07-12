@@ -4,6 +4,7 @@
     [int]$LayoutSnapshotWidth = 0,
     [int]$LayoutSnapshotHeight = 0,
     [string]$InitialDashboardTab = "",
+    [string]$InitialWorkspaceSideTab = "",
     [string]$PreviewTheme = "",
     [int]$PreviewTextSize = 0,
     [switch]$PreviewHighContrast,
@@ -28,6 +29,7 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
     if ($LayoutSnapshotWidth -gt 0) { $relaunchArguments += @("-LayoutSnapshotWidth", [string]$LayoutSnapshotWidth) }
     if ($LayoutSnapshotHeight -gt 0) { $relaunchArguments += @("-LayoutSnapshotHeight", [string]$LayoutSnapshotHeight) }
     if ($InitialDashboardTab) { $relaunchArguments += @("-InitialDashboardTab", "`"$InitialDashboardTab`"") }
+    if ($InitialWorkspaceSideTab) { $relaunchArguments += @("-InitialWorkspaceSideTab", "`"$InitialWorkspaceSideTab`"") }
     if ($PreviewTheme) { $relaunchArguments += @("-PreviewTheme", "`"$PreviewTheme`"") }
     if ($PreviewTextSize -gt 0) { $relaunchArguments += @("-PreviewTextSize", [string]$PreviewTextSize) }
     if ($PreviewHighContrast) { $relaunchArguments += "-PreviewHighContrast" }
@@ -80,6 +82,11 @@ if (-not (Test-Path -LiteralPath $providerValidationScriptPath -PathType Leaf)) 
     throw "API provider validation component was not found: $providerValidationScriptPath"
 }
 . $providerValidationScriptPath
+$translationMemoryScriptPath = Join-Path $scriptRoot "RimWorldAiTranslator.TranslationMemory.ps1"
+if (-not (Test-Path -LiteralPath $translationMemoryScriptPath -PathType Leaf)) {
+    throw "Translation memory component was not found: $translationMemoryScriptPath"
+}
+. $translationMemoryScriptPath
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $script:powershellExe = $systemPowerShell
@@ -137,6 +144,7 @@ $script:glossary = @()
 $script:glossaryLoaded = $false
 $script:glossaryIndexedTerms = @()
 $script:glossaryPrefixIndex = @{}
+$script:translationMemoryCache = @{}
 $script:DisplayLocalizationFieldPattern = '^(label|labelshort|description|jobstring|reportstring|deathmessage|deathmessagefemale|deathmessagemale|letterlabel|lettertext|header|headertip|summary|formatstring|formatstringunfinalized|fixedname|reason|text|slateref)$'
 $script:TechnicalLocalizationFieldPattern = '^(defname|parentname|classname|class|thingclass|workerclass|compclass|hediffclass|thoughtclass|abilityclass|worldobjectclass|nodeclass|debuglabel|tagdef|texpath|texname|graphicpath|shader|sound|sounddef|iconpath|packageid|xpath|operation|colorchannel|rendernode|rendertree|rendertreedef|bodypart|bodypartdef|bodytype|headtype|racedef|thingdef|pawnkinddef|jobdef|statdef|skilldef|hediffdef|genedef)$'
 $script:DeniedLocalizationFields = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
@@ -2762,6 +2770,7 @@ function Set-DecisionStatus([object]$Row, [string]$Status) {
     }
     $decision.updatedAt = (Get-Date).ToString("o")
     $script:dirty = $true
+    Invalidate-TranslationMemoryCache
 }
 
 function Find-ComparisonFile([string]$Root) {
@@ -3173,6 +3182,7 @@ function Save-CurrentEdit {
         }
         $decision.updatedAt = (Get-Date).ToString("o")
         $script:dirty = $true
+        Invalidate-TranslationMemoryCache
         $lblSave.Text = "저장 필요"
         if ($before) {
             $after = Get-DecisionStateSnapshot $row
@@ -3256,6 +3266,7 @@ function Apply-TranslationToDuplicateRows([int[]]$RowIndexes, [string]$Translati
     }
     if ($changed -gt 0) {
         $script:dirty = $true
+        Invalidate-TranslationMemoryCache
         $lblSave.Text = "저장 필요"
     }
     return $changed
@@ -3824,14 +3835,74 @@ function Update-RenderedItemCard([int]$RowIndex) {
     return $true
 }
 
+function Invalidate-TranslationMemoryCache {
+    $script:translationMemoryCache = @{}
+}
+
+function Get-TranslationMemorySuggestionsForRow([object]$Row) {
+    $source = ConvertTo-FlatString $Row.source
+    if ([string]::IsNullOrWhiteSpace($source)) { return @() }
+    if (-not $script:sourceRowIndex) { Build-SourceRowIndex }
+    if (-not $script:sourceRowIndex.ContainsKey($source)) { return @() }
+    if (-not $script:translationMemoryCache.ContainsKey($source)) {
+        $entries = New-Object "System.Collections.Generic.List[object]"
+        foreach ($rowIndex in $script:sourceRowIndex[$source]) {
+            $memoryRow = $script:rows[[int]$rowIndex]
+            $decision = Get-ExistingDecision $memoryRow
+            if ($decision) {
+                $translation = ConvertTo-FlatString $decision.text
+                $status = [string]$decision.status
+                $origin = [string]$decision.translationOrigin
+                $sourceChanged = ConvertTo-BoolValue $decision.sourceChanged
+                $updatedAt = if ($decision.translationUpdatedAt) { [string]$decision.translationUpdatedAt } else { [string]$decision.updatedAt }
+            } else {
+                $translation = Get-DefaultTranslationForRow $memoryRow
+                $origin = Get-DefaultTranslationOriginForRow $memoryRow
+                $sourceChanged = $origin -ne "ai" -and $memoryRow.PSObject.Properties["rmkSourceChanged"] -and (ConvertTo-BoolValue $memoryRow.rmkSourceChanged)
+                $status = if ([string]::IsNullOrWhiteSpace($translation) -or $sourceChanged) { "pending" } else { "translated" }
+                $updatedAt = Get-OptionalRowText -Row $memoryRow -Names @("translationUpdatedAt")
+            }
+            if ($status -notin @("approved", "translated") -or [string]::IsNullOrWhiteSpace($translation) -or $sourceChanged) { continue }
+            $validation = Get-CachedTranslationValidation -Row $memoryRow -Translation $translation
+            [void]$entries.Add([pscustomobject]@{
+                Source = $source
+                Translation = $translation
+                Identity = Get-RowIdentity $memoryRow
+                Status = $status
+                Origin = $origin
+                SourceChanged = $sourceChanged
+                SafeToApply = [bool]$validation.SafeToApply
+                UpdatedAt = $updatedAt
+                Target = Get-RelativeTarget $memoryRow
+            })
+        }
+        $script:translationMemoryCache[$source] = $entries.ToArray()
+    }
+    return @(Select-RimWorldTranslationMemorySuggestions -Entries @($script:translationMemoryCache[$source]) -Source $source -ExcludeIdentity (Get-RowIdentity $Row) -Maximum 5)
+}
+
 function Update-TermsForRow([object]$Row) {
+    if ($tabs -and $tabTerms -and $tabs.SelectedTab -ne $tabTerms) { return }
+    $output = New-Object "System.Collections.Generic.List[string]"
+    $memorySuggestions = @(Get-TranslationMemorySuggestionsForRow $Row)
+    if ($memorySuggestions.Count -gt 0) {
+        [void]$output.Add("로컬 번역 메모리 · 동일 원문")
+        foreach ($suggestion in $memorySuggestions) {
+            $origin = Get-TranslationOriginText ([string]$suggestion.Origin)
+            $status = Get-StatusText ([string]$suggestion.Status)
+            $file = Split-Path -Leaf ([string]$suggestion.Target)
+            [void]$output.Add("[$status · $origin · $file]")
+            [void]$output.Add([string]$suggestion.Text)
+            [void]$output.Add("")
+        }
+    }
     if (-not $script:glossaryLoaded) {
-        $txtTerms.Clear()
+        $txtTerms.Text = if ($output.Count -gt 0) { [string]::Join("`r`n", $output.ToArray()) } else { "관련 용어 또는 번역 메모리 없음" }
         return
     }
     $text = ((ConvertTo-FlatString $Row.source) + "`n" + (ConvertTo-FlatString $Row.candidate)).ToLowerInvariant()
     if ($text.Length -lt 3) {
-        $txtTerms.Text = "관련 용어 없음"
+        $txtTerms.Text = if ($output.Count -gt 0) { [string]::Join("`r`n", $output.ToArray()) } else { "관련 용어 또는 번역 메모리 없음" }
         return
     }
     $prefixes = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
@@ -3854,11 +3925,11 @@ function Update-TermsForRow([object]$Row) {
         }
         if ($hits.Count -ge 60) { break }
     }
-    if ($hits.Count -eq 0) {
-        $txtTerms.Text = "관련 용어 없음"
-    } else {
-        $txtTerms.Text = [string]::Join("`r`n", $hits.ToArray())
+    if ($hits.Count -gt 0) {
+        if ($output.Count -gt 0) { [void]$output.Add("용어집") }
+        foreach ($hit in $hits) { [void]$output.Add([string]$hit) }
     }
+    $txtTerms.Text = if ($output.Count -gt 0) { [string]::Join("`r`n", $output.ToArray()) } else { "관련 용어 또는 번역 메모리 없음" }
 }
 
 function Move-Selection([int]$Delta) {
@@ -3968,6 +4039,7 @@ function Approve-AllSafeTranslations {
         $decision.updatedAt = $updatedAt
     }
     $script:dirty = $true
+    Invalidate-TranslationMemoryCache
     Save-Decisions
     Refresh-FileList
     Refresh-ItemList -SelectRowIndex $script:currentRowIndex
@@ -4021,6 +4093,7 @@ function Load-ReviewRoot([string]$Root, [switch]$SkipPreviousDecisions) {
         $script:rows = $includedRows.ToArray()
     }
     $script:sourceRowIndex = $null
+    Invalidate-TranslationMemoryCache
     if ($excludedInternalCount -gt 0) { Add-Log "내부 식별자 ${excludedInternalCount}개를 검수 목록에서 제외했습니다." }
     [void]$loadStages.Add(("필터 {0:n0}ms" -f $stageStopwatch.Elapsed.TotalMilliseconds)); $stageStopwatch.Restart()
     if ($script:validationCache.Count -gt 20000) { $script:validationCache = @{} }
@@ -6888,7 +6961,7 @@ Set-AccessibleControl $txtExisting "기존 번역" "모드 또는 RMK에서 가�
 Set-AccessibleControl $txtCandidate "AI 번역 후보" "AI 또는 Google이 만든 초벌 번역입니다." 15
 Set-AccessibleControl $tabs "참고 정보 탭" "역사, 용어, 메모, RMK, 문제와 로그를 전환합니다." 0
 Set-AccessibleControl $txtHistory "번역 역사" "원문, 기존 번역, AI 후보와 현재 검수 번역을 보여줍니다." 0
-Set-AccessibleControl $txtTerms "관련 용어" "현재 문자열과 관련된 RimWorld 용어를 보여줍니다." 0
+Set-AccessibleControl $txtTerms "관련 용어와 로컬 번역 메모리" "현재 문자열과 관련된 RimWorld 용어와 동일 원문의 안전한 기존 번역을 출처와 함께 보여줍니다. 자동 적용하지 않습니다." 0
 Set-AccessibleControl $txtMemo "검수 메모" "현재 문자열에 대한 로컬 메모를 편집합니다." 0
 Set-AccessibleControl $txtRmkDetails "RMK 연결 정보" "현재 프로젝트의 RMK 번역 경로, 버전과 Git 작업 상태를 보여줍니다." 0
 Set-AccessibleControl $btnRmkRefresh "RMK 상태 갱신" "RMK 구독본과 작업 클론에서 현재 프로젝트를 다시 찾습니다." 1
@@ -7125,10 +7198,11 @@ $tabs.Add_SelectedIndexChanged({
         Refresh-RmkPanel
         return
     }
-    if ($tabs.SelectedTab -ne $tabTerms -or $script:glossaryLoaded) { return }
+    if ($tabs.SelectedTab -ne $tabTerms) { return }
     $form.UseWaitCursor = $true
     try {
-        Load-Glossary
+        Save-CurrentEdit
+        if (-not $script:glossaryLoaded) { Load-Glossary }
         if ($script:currentRowIndex -ge 0 -and $script:currentRowIndex -lt $script:rows.Count) {
             Update-TermsForRow $script:rows[$script:currentRowIndex]
         }
@@ -7494,6 +7568,13 @@ $form.Add_Shown({
         if ($script:initialReviewRoot) {
             Load-ReviewRoot $script:initialReviewRoot
             Show-Workspace
+            switch ($InitialWorkspaceSideTab.ToLowerInvariant()) {
+                "terms" { $tabs.SelectedTab = $tabTerms }
+                "memo" { $tabs.SelectedTab = $tabMemo }
+                "issues" { $tabs.SelectedTab = $tabIssues }
+                "log" { $tabs.SelectedTab = $tabLog }
+                default { }
+            }
         } else {
             $initialTab = if ($InitialDashboardTab -in @("projects", "activity", "settings")) { $InitialDashboardTab } else { "projects" }
             Show-Dashboard $initialTab
