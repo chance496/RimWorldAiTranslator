@@ -13,7 +13,3 @@ _TranslationAudit/
 api-keys.txt
 glossary.ko.json
 glossary.generated.ko.conflicts.csv
-bin/
-obj/
-*.csproj.user
-artifacts/

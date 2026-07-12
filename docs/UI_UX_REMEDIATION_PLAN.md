@@ -4,7 +4,7 @@
 
 ## 기준 화면과 확인된 문제
 
-기준 캡처 루트: `%TEMP%\RimWorldAiTranslator-ui-remediation-baseline-*`.
+기준 캡처 루트: `C:\Users\wjdck\AppData\Local\Temp\RimWorldAiTranslator-ui-remediation-baseline-d0064d1bb9a543ee8c86fa334d4a5b08`.
 
 | 영역 | 기준선 문제 | 사용자 영향 |
 |---|---|---|
@@ -48,8 +48,8 @@
 - 공통 테마 토큰, 시작 작업실, 실제 프로젝트 카드, 번역 사전 점검, 개척지 스캔 작업 오버레이, 결과 Diff, 품질 센터, 개인정보 보호 보고서와 명령 팔레트를 실제 데이터 흐름에 연결했다.
 - 오버레이는 실제 로그 단계와 배치 수를 해석하며 수치를 알 수 없을 때 가짜 백분율을 표시하지 않는다. 오류에서는 재시도, 취소·완료에서는 검수 프로젝트 복귀와 닫기를 제공한다.
 - 품질 센터는 번역 결정을 만들지 않는 읽기 전용 계산과 가상 목록을 사용한다. 5,000행 상태 화면은 초기 구현 21.6초에서 최종 12.7초로 줄었고 내부 품질 계산은 최종 캡처에서 5.6초였다.
-- 기준 캡처: `%TEMP%\RimWorldAiTranslator-ui-remediation-baseline-*`.
-- 최종 15개 상태 감사: `%TEMP%\RimWorldAiTranslator-ui-remediation-final-*`.
-- 캡처 안정화 후 5,000행 품질 화면: `%TEMP%\RimWorldAiTranslator-quality-visual-final-*`.
-- 실제 패키지 EXE 시작 화면: `%TEMP%\RimWorldAiTranslator-package-ui-*`.
+- 기준 캡처: `C:\Users\wjdck\AppData\Local\Temp\RimWorldAiTranslator-ui-remediation-baseline-d0064d1bb9a543ee8c86fa334d4a5b08`.
+- 최종 15개 상태 감사: `C:\Users\wjdck\AppData\Local\Temp\RimWorldAiTranslator-ui-remediation-final-970a4e1c42ff4f9496275d8b15a6832f`.
+- 캡처 안정화 후 5,000행 품질 화면: `C:\Users\wjdck\AppData\Local\Temp\RimWorldAiTranslator-quality-visual-final-0f826d98c48448b0998fee00f24d9104`.
+- 실제 패키지 EXE 시작 화면: `C:\Users\wjdck\AppData\Local\Temp\RimWorldAiTranslator-package-ui-0f527b3bdc4b4c9dbadbb95db17af19e`.
 - 최종 감사는 15/15 상태, 잘림 0건, 보이는 상호작용 컨트롤 접근성 이름 누락 0건을 기록했다. 실제 125/150/200% DPI는 운영체제 표시 배율 변경이 필요해 별도 외부 검증으로 남긴다.

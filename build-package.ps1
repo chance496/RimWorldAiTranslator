@@ -1,154 +1,284 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Release",
-    [ValidatePattern('^win-(x64|arm64)$')]
-    [string]$RuntimeIdentifier = "win-x64",
-    [switch]$SkipTests
+    [string]$Configuration = "Release"
 )
 
 $ErrorActionPreference = "Stop"
+Write-Verbose "Build configuration: $Configuration"
+
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$versionPath = Join-Path $projectRoot "VERSION"
-$solution = Join-Path $projectRoot "RimWorldAiTranslator.sln"
-$appProject = Join-Path $projectRoot "src\RimWorldAiTranslator.App\RimWorldAiTranslator.App.csproj"
 $distRoot = Join-Path $projectRoot "dist"
-$stagingRoot = Join-Path $distRoot "_publish-$RuntimeIdentifier"
 $packageRoot = Join-Path $distRoot "RimWorldAiTranslator"
+$zipPath = Join-Path $distRoot "RimWorldAiTranslator.zip"
+$launcherBuildRoot = Join-Path $distRoot "_launcher-build"
+$launcherSource = Join-Path $projectRoot "launcher\RimWorldAiTranslatorLauncher.cs"
+$launcherExe = Join-Path $launcherBuildRoot "RimWorldAiTranslator.exe"
+$projectLauncherExe = Join-Path $projectRoot "RimWorldAiTranslator.exe"
+$nativeSource = Join-Path $projectRoot "native\RimWorldTranslatorNative.cs"
+$nativeDll = Join-Path $launcherBuildRoot "RimWorldAiTranslator.Native.dll"
+$projectNativeDll = Join-Path $projectRoot "RimWorldAiTranslator.Native.dll"
+$versionPath = Join-Path $projectRoot "VERSION"
+$powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$regressionScript = Join-Path $projectRoot "tests\Run-RegressionTests.ps1"
 
 if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) { throw "VERSION file was not found: $versionPath" }
-$version = [System.IO.File]::ReadAllText($versionPath, [System.Text.Encoding]::ASCII).Trim()
-if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION must use major.minor.patch: $version" }
-$zipPath = Join-Path $distRoot "RimWorldAiTranslator-v$version.zip"
+$productVersion = [System.IO.File]::ReadAllText($versionPath, [System.Text.Encoding]::ASCII).Trim()
+if ($productVersion -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION must use major.minor.patch: $productVersion" }
+$fileVersion = "$productVersion.0"
 
 function Assert-SafeBuildPath([string]$Path) {
-    $root = [System.IO.Path]::GetFullPath($projectRoot).TrimEnd("\", "/")
-    $full = [System.IO.Path]::GetFullPath($Path)
-    $prefix = $root + [System.IO.Path]::DirectorySeparatorChar
-    if (-not $full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to use a build path outside the repository: $full"
+    $projectFull = [System.IO.Path]::GetFullPath($projectRoot).TrimEnd("\", "/")
+    $pathFull = [System.IO.Path]::GetFullPath($Path)
+    $prefix = $projectFull + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $pathFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to use a build path outside the project root: $pathFull"
     }
-    if (Test-Path -LiteralPath $full) {
-        $item = Get-Item -LiteralPath $full -Force
+    if (Test-Path -LiteralPath $pathFull) {
+        $item = Get-Item -LiteralPath $pathFull -Force
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Refusing to use a reparse-point build path: $full"
+            throw "Refusing to use a reparse-point build path: $pathFull"
         }
     }
 }
 
-function Reset-BuildDirectory([string]$Path) {
-    Assert-SafeBuildPath $Path
-    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }
-    [System.IO.Directory]::CreateDirectory($Path) | Out-Null
+Assert-SafeBuildPath $distRoot
+Assert-SafeBuildPath $packageRoot
+Assert-SafeBuildPath $launcherBuildRoot
+
+if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+    throw "Windows PowerShell was not found: $powerShellExe"
+}
+if (-not (Test-Path -LiteralPath $regressionScript -PathType Leaf)) {
+    throw "Regression test runner was not found: $regressionScript"
 }
 
-foreach ($path in @($distRoot, $stagingRoot, $packageRoot)) { Assert-SafeBuildPath $path }
-if (-not (Test-Path -LiteralPath $distRoot)) { [System.IO.Directory]::CreateDirectory($distRoot) | Out-Null }
-
-Write-Host "Building C# solution..."
-& dotnet build $solution -c $Configuration
-if ($LASTEXITCODE -ne 0) { throw "dotnet build failed with exit code $LASTEXITCODE." }
-
-if (-not $SkipTests) {
-    Write-Host "Running C# regression tests..."
-    & dotnet run --project (Join-Path $projectRoot "tests\RimWorldAiTranslator.Tests\RimWorldAiTranslator.Tests.csproj") -c $Configuration --no-build
-    if ($LASTEXITCODE -ne 0) { throw "C# regression tests failed with exit code $LASTEXITCODE." }
+Write-Host "Running offline regression gates..."
+& $powerShellExe -NoProfile -ExecutionPolicy Bypass -File $regressionScript -Suite All
+if ($LASTEXITCODE -ne 0) {
+    throw "Offline regression gates failed with exit code $LASTEXITCODE. Existing package output was not replaced."
 }
 
-Reset-BuildDirectory $stagingRoot
-Reset-BuildDirectory $packageRoot
+if (Test-Path -LiteralPath $launcherBuildRoot) {
+    Get-ChildItem -LiteralPath $launcherBuildRoot -Force | Remove-Item -Recurse -Force
+} else {
+    New-Item -ItemType Directory -Force -Path $launcherBuildRoot | Out-Null
+}
 
-Write-Host "Publishing self-contained $RuntimeIdentifier application..."
-& dotnet publish $appProject `
-    -c $Configuration `
-    -r $RuntimeIdentifier `
-    --self-contained true `
-    -o $stagingRoot `
-    -p:PublishSingleFile=true `
-    -p:IncludeNativeLibrariesForSelfExtract=true `
-    -p:EnableCompressionInSingleFile=true `
-    -p:PublishTrimmed=false `
-    -p:DebugType=None `
-    -p:DebugSymbols=false
-if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
-
-$runtimeFiles = @(
-    "RimWorldAiTranslator.exe",
-    "glossary.generated.ko.json",
-    "rimworld-def-field-rules.txt"
+$cscCandidates = @(
+    (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
+    (Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe")
 )
-foreach ($name in $runtimeFiles) {
-    $source = Join-Path $stagingRoot $name
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Published runtime file is missing: $name" }
-    Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $name) -Force
+
+$csc = $cscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $csc) {
+    throw "Could not find .NET Framework csc.exe. Install .NET Framework Developer Pack or build the launcher manually."
 }
 
-foreach ($name in @("PACKAGE_README.txt", "RELEASE_NOTES.md", "sample-glossary.txt", "VERSION", "LICENSE")) {
-    $source = Join-Path $projectRoot $name
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Package documentation is missing: $name" }
-    Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $name) -Force
+& $csc `
+    /nologo `
+    /target:winexe `
+    /platform:anycpu `
+    /codepage:65001 `
+    /reference:System.Windows.Forms.dll `
+    /reference:System.Drawing.dll `
+    /out:$launcherExe `
+    $launcherSource
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Launcher build failed with exit code $LASTEXITCODE."
 }
 
-$unexpectedRuntime = Get-ChildItem -LiteralPath $packageRoot -Recurse -File | Where-Object {
-    $_.Extension -in ".ps1", ".psm1", ".cmd", ".bat" -or $_.Name -match '(?i)^powershell\.exe$|^pwsh\.exe$'
-}
-if ($unexpectedRuntime) {
-    throw "PowerShell runtime files entered the package: $([string]::Join(', ', @($unexpectedRuntime.Name)))"
+& $csc `
+    /nologo `
+    /target:library `
+    /optimize+ `
+    /platform:anycpu `
+    /codepage:65001 `
+    /reference:System.dll `
+    /reference:System.Core.dll `
+    /reference:System.Xml.dll `
+    /reference:System.Xml.Linq.dll `
+    /reference:System.IO.Compression.dll `
+    /reference:System.IO.Compression.FileSystem.dll `
+    /out:$nativeDll `
+    $nativeSource
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Native reader build failed with exit code $LASTEXITCODE."
 }
 
-$exe = Join-Path $packageRoot "RimWorldAiTranslator.exe"
-$versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
-if ([string]$versionInfo.ProductVersion -ne $version -or [string]$versionInfo.FileVersion -ne "$version.0") {
-    throw "Published executable version mismatch: file=$($versionInfo.FileVersion), product=$($versionInfo.ProductVersion), expected=$version.0/$version"
+foreach ($binary in @($launcherExe, $nativeDll)) {
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
+    if ([string]$versionInfo.FileVersion -ne $fileVersion -or [string]$versionInfo.ProductVersion -ne $productVersion) {
+        throw "Built binary version mismatch: $binary (file=$($versionInfo.FileVersion), product=$($versionInfo.ProductVersion), expected=$fileVersion/$productVersion)"
+    }
 }
 
-if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
-
-$smokeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("RimWorldAiTranslator-package-smoke-" + [Guid]::NewGuid().ToString("N"))
-$tempPrefix = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
-$smokeFull = [System.IO.Path]::GetFullPath($smokeRoot)
-if (-not $smokeFull.StartsWith($tempPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
-    -not [System.IO.Path]::GetFileName($smokeFull).StartsWith("RimWorldAiTranslator-package-smoke-", [System.StringComparison]::Ordinal)) {
-    throw "Refusing to use an unverified smoke-test path: $smokeFull"
+$cacheSmokeJob = Start-Job -ArgumentList $nativeDll -ScriptBlock {
+    param([string]$AssemblyPath)
+    $ErrorActionPreference = "Stop"
+    Add-Type -LiteralPath $AssemblyPath -ErrorAction Stop
+    $cacheStore = [RimWorldTranslatorRowRuntimeCacheStore]::new()
+    $cacheRow = [pscustomobject]@{ id = "cache-smoke" }
+    $firstCache = $cacheStore.Get($cacheRow)
+    $secondCache = $cacheStore.Get($cacheRow)
+    if (-not [object]::ReferenceEquals($firstCache, $secondCache)) {
+        throw "Native row cache did not return a stable entry."
+    }
+    if ($cacheRow.PSObject.Properties["_runtimeCache"]) {
+        throw "Native row cache mutated the source row."
+    }
+    $cacheStore.Reset()
+    $resetCache = $cacheStore.Get($cacheRow)
+    if ([object]::ReferenceEquals($firstCache, $resetCache)) {
+        throw "Native row cache reset did not discard the previous entry."
+    }
+}
+try {
+    $cacheSmokeJob | Wait-Job | Out-Null
+    if ($cacheSmokeJob.State -ne "Completed") {
+        $reason = $cacheSmokeJob.ChildJobs[0].JobStateInfo.Reason
+        throw "Native row cache smoke failed: $reason"
+    }
+    $cacheSmokeJob | Receive-Job -ErrorAction Stop | Out-Null
+} finally {
+    if ($cacheSmokeJob.State -eq "Running") { $cacheSmokeJob | Stop-Job | Out-Null }
+    $cacheSmokeJob | Remove-Job -Force -ErrorAction SilentlyContinue
 }
 
 try {
-    $extractRoot = Join-Path $smokeFull "package"
-    $dataRoot = Join-Path $smokeFull "appdata"
-    [System.IO.Directory]::CreateDirectory($extractRoot) | Out-Null
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot -Force
-    $smokeExe = Join-Path $extractRoot "RimWorldAiTranslator.exe"
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new($smokeExe)
-    $startInfo.UseShellExecute = $false
-    $startInfo.Environment["RIMWORLD_TRANSLATOR_DATA_ROOT"] = $dataRoot
-    $process = [System.Diagnostics.Process]::Start($startInfo)
-    if (-not $process) { throw "Packaged application did not start." }
-    $deadline = [DateTime]::UtcNow.AddSeconds(25)
-    while ([DateTime]::UtcNow -lt $deadline -and -not $process.HasExited -and $process.MainWindowHandle -eq [IntPtr]::Zero) {
-        Start-Sleep -Milliseconds 100
-        $process.Refresh()
+    Copy-Item -LiteralPath $launcherExe -Destination $projectLauncherExe -Force -ErrorAction Stop
+} catch {
+    Write-Warning "The development launcher is currently in use and was not replaced. The packaged launcher is still current."
+}
+try {
+    Copy-Item -LiteralPath $nativeDll -Destination $projectNativeDll -Force -ErrorAction Stop
+} catch {
+    Write-Warning "The development native reader is currently in use and was not replaced. The packaged reader is still current."
+}
+
+if (Test-Path -LiteralPath $packageRoot) {
+    Get-ChildItem -LiteralPath $packageRoot -Force | Remove-Item -Recurse -Force
+} else {
+    New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+}
+
+$packageFiles = @(
+    "RimWorldAiTranslator.exe",
+    "RimWorldAiTranslator.Native.dll",
+    "Start-RimWorldAiTranslatorGui.ps1",
+    "Start-RimWorldAiTranslatorGui.cmd",
+    "Start-RimWorldAiReviewGui.ps1",
+    "RimWorldAiTranslator.Storage.ps1",
+    "RimWorldAiTranslator.Validation.ps1",
+    "RimWorldAiTranslator.ProviderValidation.ps1",
+    "RimWorldAiTranslator.TranslationMemory.ps1",
+    "RimWorldAiTranslator.Diagnostics.ps1",
+    "RimWorldAiTranslator.ProjectCleanup.ps1",
+    "RimWorldAiTranslator.UiSystem.ps1",
+    "RimWorldAiTranslator.UiAudit.ps1",
+    "RimWorldAiTranslator.Quality.ps1",
+    "Invoke-RimWorldAiTranslation.ps1",
+    "Run-RimWorldAiTranslation.ps1",
+    "Apply-RimWorldAiReviewResults.ps1",
+    "Export-RimWorldAiReviewToRmk.ps1",
+    "Export-RimWorldAiTranslatorDiagnostics.ps1",
+    "Build-RimWorldGlossary.ps1",
+    "glossary.generated.ko.json",
+    "sample-glossary.txt",
+    "rimworld-def-field-rules.txt",
+    "README.md",
+    "PACKAGE_README.txt",
+    "RELEASE_NOTES.md",
+    "VERSION",
+    "LICENSE"
+)
+
+foreach ($file in $packageFiles) {
+    $source = if ($file -eq "RimWorldAiTranslator.exe") {
+        $launcherExe
+    } elseif ($file -eq "RimWorldAiTranslator.Native.dll") {
+        $nativeDll
+    } else {
+        Join-Path $projectRoot $file
     }
-    if ($process.HasExited) { throw "Packaged application exited during startup with code $($process.ExitCode)." }
-    if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw "Packaged application did not expose a main window within 25 seconds." }
-    $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($process.Id)" -ErrorAction SilentlyContinue)
-    $powerShellChildren = @($children | Where-Object { $_.Name -match '^(powershell|pwsh)\.exe$' })
-    if ($powerShellChildren.Count -gt 0) { throw "Packaged application started a PowerShell child process." }
-    [void]$process.CloseMainWindow()
-    if (-not $process.WaitForExit(10000)) {
-        $process.Kill($true)
-        throw "Packaged application did not exit within 10 seconds."
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "Missing package file: $file"
     }
-    if ($process.ExitCode -ne 0) { throw "Packaged application smoke test exited with code $($process.ExitCode)." }
-} finally {
-    if ($process -and -not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
-    if ($smokeFull.StartsWith($tempPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $smokeFull)) {
-        Remove-Item -LiteralPath $smokeFull -Recurse -Force
+    Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $file) -Force
+}
+
+Write-Host "Validating packaged PowerShell syntax..."
+foreach ($scriptFile in Get-ChildItem -LiteralPath $packageRoot -File -Filter "*.ps1" | Sort-Object Name) {
+    $tokens = $null
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($scriptFile.FullName, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) {
+        $detail = [string]::Join(" | ", @($parseErrors | ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Message)" }))
+        throw "Packaged PowerShell syntax validation failed for $($scriptFile.Name): $detail"
     }
 }
 
-$hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
-$zip = Get-Item -LiteralPath $zipPath
-Write-Host "Package: $($zip.FullName)"
-Write-Host "Bytes:   $($zip.Length)"
-Write-Host "SHA-256: $($hash.Hash)"
+if (Test-Path -LiteralPath $zipPath) {
+    Remove-Item -LiteralPath $zipPath -Force
+}
+$archiveCreated = $false
+for ($attempt = 1; $attempt -le 4; $attempt++) {
+    try {
+        Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -Force -ErrorAction Stop
+        $archiveCreated = $true
+        break
+    } catch {
+        if ($attempt -ge 4) { throw }
+        if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds (300 * $attempt)
+    }
+}
+if (-not $archiveCreated) { throw "Package archive was not created." }
+
+$smokeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("RimWorldAiTranslator-package-smoke-" + [System.Guid]::NewGuid().ToString("N"))
+$smokePrefix = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
+$smokeFull = [System.IO.Path]::GetFullPath($smokeRoot)
+if (-not $smokeFull.StartsWith($smokePrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+    -not ([System.IO.Path]::GetFileName($smokeFull)).StartsWith("RimWorldAiTranslator-package-smoke-", [System.StringComparison]::Ordinal)) {
+    throw "Refusing to use an unverified package smoke-test path: $smokeFull"
+}
+try {
+    $extractedRoot = Join-Path $smokeFull "package"
+    $sampleRoot = Join-Path $smokeFull "SampleMod"
+    $reviewRoot = Join-Path $smokeFull "reviews"
+    [System.IO.Directory]::CreateDirectory($smokeFull) | Out-Null
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractedRoot -Force
+    Copy-Item -LiteralPath (Join-Path $projectRoot "testdata\SampleMod") -Destination $sampleRoot -Recurse
+    $packagedTranslator = Join-Path $extractedRoot "Invoke-RimWorldAiTranslation.ps1"
+    & $powerShellExe -NoProfile -ExecutionPolicy Bypass -File $packagedTranslator `
+        -ModRoot $sampleRoot `
+        -SourceLanguageFolder "English" `
+        -SourceOnly `
+        -ReviewOnly `
+        -ReviewRoot $reviewRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "Extracted package smoke test failed with exit code $LASTEXITCODE."
+    }
+    $comparisonFiles = @(Get-ChildItem -LiteralPath $reviewRoot -Recurse -File -Filter "*-comparison.json" -ErrorAction Stop)
+    if ($comparisonFiles.Count -ne 1) {
+        throw "Extracted package smoke test expected one comparison JSON, found $($comparisonFiles.Count)."
+    }
+    $parsedSmokeRows = [System.IO.File]::ReadAllText($comparisonFiles[0].FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    $smokeRows = @(foreach ($row in $parsedSmokeRows) { $row })
+    if ($smokeRows.Count -ne 7) {
+        throw "Extracted package smoke test expected 7 source rows, found $($smokeRows.Count)."
+    }
+} finally {
+    if (Test-Path -LiteralPath $smokeFull) {
+        Remove-Item -LiteralPath $smokeFull -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Get-ChildItem -LiteralPath $launcherBuildRoot -Force | Remove-Item -Recurse -Force
+Remove-Item -LiteralPath $launcherBuildRoot -Force
+
+Write-Host "Package folder: $packageRoot"
+Write-Host "Package zip:    $zipPath"
