@@ -10,15 +10,6 @@ public static class PathSafety
 {
     internal const long MaximumTrustedLeafBytes = 256L * 1024 * 1024;
     internal const long MaximumTrustedBoundaryBytes = 2L * 1024 * 1024 * 1024;
-    internal static Action<string>? AfterAtomicLeafLockReleasedTestHook { get; set; }
-    internal static Action<string>? AfterAtomicFinalEvidenceReleasedTestHook { get; set; }
-    internal static Action<string>? BeforeAtomicRollbackHandleMoveTestHook { get; set; }
-    internal static Action<string>? AfterAtomicCommitBeforeEvidencePinnedTestHook { get; set; }
-    internal static Action<string>? AfterAtomicEvidencePinnedTestHook { get; set; }
-    internal static Action<string>? AfterAtomicTargetDisplacedTestHook { get; set; }
-    internal static Action<string>? AfterAtomicBackupDisplacedTestHook { get; set; }
-    internal static Action<string>? BeforeTrustedDirectoryCreationTestHook { get; set; }
-    internal static Action<string>? BeforeTrustedBoundaryRootLockTestHook { get; set; }
 
     private static readonly HashSet<string> WindowsReservedNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -294,12 +285,7 @@ public static class PathSafety
         string root,
         IEnumerable<string> targetFiles,
         CancellationToken cancellationToken = default) =>
-        AcquireTrustedBoundary(
-            root,
-            targetFiles,
-            [],
-            createDirectoryGuards: true,
-            cancellationToken);
+        AcquireTrustedBoundary(root, targetFiles, [], createTargetDirectories: true, cancellationToken);
 
     public static IDisposable AcquireTrustedDirectoryCreationBoundary(
         string directory,
@@ -319,7 +305,6 @@ public static class PathSafety
             existingAncestor = parent;
         }
 
-        BeforeTrustedDirectoryCreationTestHook?.Invoke(fullDirectory);
         var unusedLeaf = Path.Combine(
             fullDirectory,
             $".rimworld-ai-translator-directory-boundary-{Guid.NewGuid():N}.unused");
@@ -334,35 +319,27 @@ public static class PathSafety
         IEnumerable<string> targetFiles,
         IEnumerable<string> protectedFiles,
         CancellationToken cancellationToken = default) =>
-        AcquireTrustedBoundary(
-            root,
-            targetFiles,
-            protectedFiles,
-            createDirectoryGuards: true,
-            cancellationToken);
+        AcquireTrustedBoundary(root, targetFiles, protectedFiles, createTargetDirectories: true, cancellationToken);
 
     internal static TrustedWriteBoundary AcquireTrustedReadBoundary(
         string root,
         IEnumerable<string> protectedFiles,
         CancellationToken cancellationToken = default) =>
-        AcquireTrustedBoundary(
-            root,
-            [],
-            protectedFiles,
-            createDirectoryGuards: false,
-            cancellationToken);
+        AcquireTrustedBoundary(root, [], protectedFiles, createTargetDirectories: false, cancellationToken);
 
     private static TrustedWriteBoundary AcquireTrustedBoundary(
         string root,
         IEnumerable<string> targetFiles,
         IEnumerable<string> protectedFiles,
-        bool createDirectoryGuards,
+        bool createTargetDirectories,
         CancellationToken cancellationToken)
     {
-        if (!OperatingSystem.IsWindows())
-            throw new PlatformNotSupportedException("Trusted writable directory locking requires Windows.");
         var fullRoot = Normalize(root);
-
+        if (!Directory.Exists(fullRoot))
+            throw new DirectoryNotFoundException("The trusted output root does not exist.");
+        if (IsNetworkPath(fullRoot))
+            throw new InvalidDataException("Writable output roots must use a local filesystem.");
+        EnsureNoReparsePointsToVolumeRoot(fullRoot);
         var targets = targetFiles
             .Select(Normalize)
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -371,276 +348,38 @@ public static class PathSafety
             .Select(Normalize)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { fullRoot };
-        var creatableDirectories = createDirectoryGuards
-            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var target in targets)
         {
-            var fullTarget = target;
-            if (!IsStrictlyInside(fullTarget, fullRoot))
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsStrictlyInside(target, fullRoot))
                 throw new InvalidDataException("A write target is outside the trusted root.");
-            var parent = Path.GetDirectoryName(fullTarget)
+            var parent = Path.GetDirectoryName(target)
                 ?? throw new InvalidDataException("A write target has no parent directory.");
-            AddBoundaryDirectories(fullRoot, parent, directories, creatableDirectories);
+            if (!Directory.Exists(parent))
+            {
+                if (!createTargetDirectories)
+                    throw new DirectoryNotFoundException("A write target parent directory does not exist.");
+                Directory.CreateDirectory(parent);
+            }
+            EnsureNoReparsePoints(parent, fullRoot);
         }
         foreach (var input in inputs)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!IsStrictlyInside(input, fullRoot))
                 throw new InvalidDataException("A protected input is outside the trusted root.");
             var parent = Path.GetDirectoryName(input)
                 ?? throw new InvalidDataException("A protected input has no parent directory.");
-            AddBoundaryDirectories(fullRoot, parent, directories, null);
+            if (!Directory.Exists(parent))
+                throw new DirectoryNotFoundException("A protected input directory is missing.");
+            if (!File.Exists(input) || Directory.Exists(input))
+                throw new FileNotFoundException("A protected input file is missing.", input);
+            EnsureNoReparsePoints(parent, fullRoot);
         }
 
-        var locks = new List<SafeFileHandle>();
-        var guardFiles = new List<FileStream>();
-        var leafLocks = new Dictionary<string, TrustedLeaf>(StringComparer.OrdinalIgnoreCase);
-        long aggregateLeafBytes = 0;
-        try
-        {
-            BeforeTrustedBoundaryRootLockTestHook?.Invoke(fullRoot);
-            foreach (var directory in directories
-                         .OrderBy(value => value.Count(character => character is '\\' or '/'))
-                         .ThenBy(value => value, StringComparer.OrdinalIgnoreCase))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!Directory.Exists(directory))
-                {
-                    if (!creatableDirectories.Contains(directory))
-                        throw new DirectoryNotFoundException("A protected input directory disappeared before it could be locked.");
-                    Directory.CreateDirectory(directory);
-                }
-
-                SafeFileHandle? handle = null;
-                try
-                {
-                    handle = WindowsPathHandle.OpenDirectoryWithoutDeleteSharing(directory);
-                    var canonical = Normalize(WindowsPathHandle.GetFinalPath(handle));
-                    var lockedIdentity = WindowsPathHandle.GetIdentity(handle);
-                    if (!canonical.Equals(Normalize(directory), StringComparison.OrdinalIgnoreCase)
-                        || !canonical.Equals(fullRoot, StringComparison.OrdinalIgnoreCase)
-                           && !IsStrictlyInside(canonical, fullRoot)
-                        || lockedIdentity.FileIndex == 0
-                        || (lockedIdentity.FileAttributes
-                            & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device))
-                           != FileAttributes.Directory)
-                    {
-                        throw new InvalidDataException(
-                            "A writable directory resolved outside its exact regular-directory path.");
-                    }
-                    locks.Add(handle);
-                    handle = null;
-                }
-                finally
-                {
-                    handle?.Dispose();
-                }
-
-                if (createDirectoryGuards)
-                {
-                    var guardPath = Path.Combine(
-                        directory,
-                        $".rimworld-ai-translator-write-boundary-{Guid.NewGuid():N}.lock");
-                    var guard = new FileStream(
-                        guardPath,
-                        FileMode.CreateNew,
-                        FileAccess.ReadWrite,
-                        FileShare.None,
-                        4096,
-                        FileOptions.DeleteOnClose | FileOptions.WriteThrough);
-                    guardFiles.Add(guard);
-                    var guardCanonical = Normalize(WindowsPathHandle.GetFinalPath(guard.SafeFileHandle));
-                    var guardParent = Path.GetDirectoryName(guardCanonical)
-                        ?? throw new InvalidDataException("The writable directory guard has no parent path.");
-                    if (!Normalize(guardParent).Equals(Normalize(directory), StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException("A writable directory guard resolved outside its expected directory.");
-                }
-            }
-
-            foreach (var target in targets)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                CaptureLeaf(target, isWriteTarget: true, leafLocks, ref aggregateLeafBytes, cancellationToken);
-                CaptureLeaf(target + ".bak", isWriteTarget: true, leafLocks, ref aggregateLeafBytes, cancellationToken);
-            }
-            foreach (var input in inputs)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                CaptureLeaf(input, isWriteTarget: false, leafLocks, ref aggregateLeafBytes, cancellationToken);
-                if (!leafLocks[input].ExpectedExists)
-                    throw new FileNotFoundException("A protected input disappeared before it could be locked.", input);
-            }
-            return new TrustedWriteBoundary(locks, guardFiles, leafLocks);
-        }
-        catch
-        {
-            foreach (var leaf in leafLocks.Values) leaf.Dispose();
-            for (var index = locks.Count - 1; index >= 0; index--) locks[index].Dispose();
-            for (var index = guardFiles.Count - 1; index >= 0; index--) guardFiles[index].Dispose();
-            throw;
-        }
+        return TrustedWriteBoundary.Capture(fullRoot, targets, inputs, cancellationToken);
     }
-
-    private static void AddBoundaryDirectories(
-        string fullRoot,
-        string parent,
-        ISet<string> directories,
-        ISet<string>? creatableDirectories)
-    {
-        var relative = Path.GetRelativePath(fullRoot, parent);
-        if (relative.Equals(".", StringComparison.Ordinal)) return;
-        var current = fullRoot;
-        foreach (var segment in relative.Split(
-                     [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
-                     StringSplitOptions.RemoveEmptyEntries))
-        {
-            if (segment is "." or "..")
-                throw new InvalidDataException("A boundary path contains an unsafe directory segment.");
-            current = Path.Combine(current, segment);
-            directories.Add(current);
-            creatableDirectories?.Add(current);
-        }
-    }
-
-    private static void CaptureLeaf(
-        string path,
-        bool isWriteTarget,
-        IDictionary<string, TrustedLeaf> leaves,
-        ref long aggregateLeafBytes,
-        CancellationToken cancellationToken)
-    {
-        if (leaves.TryGetValue(path, out var existing))
-        {
-            if (isWriteTarget) existing.IsWriteTarget = true;
-            return;
-        }
-        if (Directory.Exists(path))
-        {
-            if (!isWriteTarget)
-                throw new InvalidDataException("A protected input file path resolves to a directory.");
-            var directoryHandle = WindowsPathHandle.OpenDirectoryWithoutDeleteSharing(path);
-            try
-            {
-                var directoryIdentity = ValidateDirectoryLeafHandle(directoryHandle, path);
-                leaves.Add(path, new TrustedLeaf(
-                    path,
-                    isWriteTarget,
-                    expectedExists: false,
-                    expectedDirectory: true,
-                    directoryHandle,
-                    directoryIdentity,
-                    null));
-                return;
-            }
-            catch
-            {
-                directoryHandle.Dispose();
-                throw;
-            }
-        }
-        if (!File.Exists(path))
-        {
-            leaves.Add(path, new TrustedLeaf(
-                path,
-                isWriteTarget,
-                expectedExists: false,
-                expectedDirectory: false,
-                null,
-                default,
-                null));
-            return;
-        }
-
-        var handle = WindowsPathHandle.OpenFileWithoutWriteOrDeleteSharing(path);
-        try
-        {
-            var identity = ValidateRegularLeafHandle(handle, path);
-            var length = RandomAccess.GetLength(handle);
-            if (length < 0 || length > MaximumTrustedLeafBytes)
-                throw new InvalidDataException(
-                    $"Protected file exceeds the {MaximumTrustedLeafBytes:N0}-byte boundary limit: {Path.GetFileName(path)}");
-            aggregateLeafBytes = checked(aggregateLeafBytes + length);
-            if (aggregateLeafBytes > MaximumTrustedBoundaryBytes)
-                throw new InvalidDataException(
-                    $"Protected files exceed the {MaximumTrustedBoundaryBytes:N0}-byte aggregate boundary limit.");
-            var contentHash = ComputeContentHash(handle, MaximumTrustedLeafBytes, cancellationToken);
-            leaves.Add(path, new TrustedLeaf(
-                path,
-                isWriteTarget,
-                expectedExists: true,
-                expectedDirectory: false,
-                handle,
-                identity,
-                contentHash));
-        }
-        catch
-        {
-            handle.Dispose();
-            throw;
-        }
-    }
-
-    private static WindowsPathHandle.FileIdentity ValidateRegularLeafHandle(
-        SafeFileHandle handle,
-        string expectedPath)
-    {
-        var identity = WindowsPathHandle.GetIdentity(handle);
-        if (identity.FileIndex == 0
-            || identity.NumberOfLinks != 1
-            || (identity.FileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
-        {
-            throw new InvalidDataException("Protected files must be regular, single-link files.");
-        }
-        var canonical = Normalize(WindowsPathHandle.GetFinalPath(handle));
-        if (!canonical.Equals(Normalize(expectedPath), StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("A protected file resolved outside its expected leaf path.");
-        return identity;
-    }
-
-    private static WindowsPathHandle.FileIdentity ValidateDirectoryLeafHandle(
-        SafeFileHandle handle,
-        string expectedPath)
-    {
-        var identity = WindowsPathHandle.GetIdentity(handle);
-        if (identity.FileIndex == 0
-            || (identity.FileAttributes & FileAttributes.Directory) == 0
-            || (identity.FileAttributes & (FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
-        {
-            throw new InvalidDataException("A protected directory leaf must be a regular directory.");
-        }
-        var canonical = Normalize(WindowsPathHandle.GetFinalPath(handle));
-        if (!canonical.Equals(Normalize(expectedPath), StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("A protected directory leaf resolved outside its expected path.");
-        return identity;
-    }
-
-    private static byte[] ComputeContentHash(
-        SafeFileHandle handle,
-        long maximumBytes = MaximumTrustedLeafBytes,
-        CancellationToken cancellationToken = default)
-    {
-        var length = RandomAccess.GetLength(handle);
-        if (length < 0 || length > maximumBytes)
-            throw new InvalidDataException($"Protected file exceeds the {maximumBytes:N0}-byte hash limit.");
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var buffer = new byte[64 * 1024];
-        long offset = 0;
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var read = RandomAccess.Read(handle, buffer, offset);
-            if (read == 0) break;
-            hash.AppendData(buffer, 0, read);
-            offset += read;
-            if (offset > maximumBytes)
-                throw new InvalidDataException($"Protected file grew beyond the {maximumBytes:N0}-byte hash limit.");
-        }
-        return hash.GetHashAndReset();
-    }
-
-    private static string FormatIdentity(WindowsPathHandle.FileIdentity identity) =>
-        $"{identity.VolumeSerialNumber:x8}:{identity.FileIndex:x16}";
 
     public static bool IsWorkshopContentPath(string path)
     {
@@ -919,132 +658,80 @@ public static class PathSafety
             long LastWriteTimeUtcTicks);
     }
 
-    internal sealed class TrustedLeaf(
-        string path,
-        bool isWriteTarget,
-        bool expectedExists,
-        bool expectedDirectory,
-        SafeFileHandle? handle,
-        WindowsPathHandle.FileIdentity identity,
-        byte[]? contentHash) : IDisposable
+
+    internal sealed class TrustedWriteBoundary : IDisposable
     {
-        private SafeFileHandle? handle = handle;
+        private readonly string root;
+        private readonly Dictionary<string, SimpleLeafState> leaves;
+        private bool disposed;
 
-        public string Path { get; } = path;
-        public bool IsWriteTarget { get; set; } = isWriteTarget;
-        public bool ExpectedExists { get; private set; } = expectedExists;
-        public bool ExpectedDirectory { get; private set; } = expectedDirectory;
-        public WindowsPathHandle.FileIdentity Identity { get; private set; } = identity;
-        public byte[]? ContentHash { get; private set; } = contentHash;
-        public SafeFileHandle? Handle => handle;
-
-        public void Adopt(
-            SafeFileHandle adoptedHandle,
-            SnapshotLeafFingerprint expectedFingerprint)
+        private TrustedWriteBoundary(
+            string root,
+            Dictionary<string, SimpleLeafState> leaves)
         {
-            ArgumentNullException.ThrowIfNull(adoptedHandle);
-            try
-            {
-                if (expectedFingerprint.Kind != SnapshotLeafKind.File
-                    || expectedFingerprint.Sha256 is not { Length: 32 }
-                    || !expectedFingerprint.VolumeSerialNumber.HasValue
-                    || !expectedFingerprint.FileIndex.HasValue)
-                {
-                    throw new InvalidDataException("Adopted leaf evidence must identify one exact regular file.");
-                }
-                var adoptedIdentity = ValidateRegularLeafHandle(adoptedHandle, Path);
-                var adoptedHash = ComputeContentHash(adoptedHandle);
-                if (adoptedIdentity.VolumeSerialNumber != expectedFingerprint.VolumeSerialNumber.Value
-                    || adoptedIdentity.FileIndex != expectedFingerprint.FileIndex.Value
-                    || RandomAccess.GetLength(adoptedHandle) != expectedFingerprint.Length
-                    || !CryptographicOperations.FixedTimeEquals(adoptedHash, expectedFingerprint.Sha256))
-                {
-                    throw new ConcurrentLeafChangeException(
-                        "The committed leaf did not match its exact prepared evidence.",
-                        Path);
-                }
-                if (Interlocked.CompareExchange(ref handle, adoptedHandle, null) is not null)
-                    throw new InvalidOperationException("The protected leaf already owns a lock handle.");
-                Identity = adoptedIdentity;
-                ContentHash = adoptedHash;
-                ExpectedExists = true;
-                ExpectedDirectory = false;
-            }
-            catch
-            {
-                adoptedHandle.Dispose();
-                throw;
-            }
+            this.root = root;
+            this.leaves = leaves;
         }
 
-        public void Release() => Interlocked.Exchange(ref handle, null)?.Dispose();
-        public void Dispose() => Release();
-    }
-
-    internal sealed class TrustedWriteBoundary(
-        List<SafeFileHandle> handles,
-        List<FileStream> guardFiles,
-        Dictionary<string, TrustedLeaf> leaves) : IDisposable
-    {
-        private List<SafeFileHandle>? handles = handles;
-        private List<FileStream>? guardFiles = guardFiles;
-        private Dictionary<string, TrustedLeaf>? leaves = leaves;
-
-        internal IReadOnlySet<string> ActiveGuardPaths
+        internal static TrustedWriteBoundary Capture(
+            string root,
+            IReadOnlyList<string> targetFiles,
+            IReadOnlyList<string> protectedFiles,
+            CancellationToken cancellationToken)
         {
-            get
+            var leaves = new Dictionary<string, SimpleLeafState>(StringComparer.OrdinalIgnoreCase);
+            long aggregateBytes = 0;
+            foreach (var target in targetFiles)
             {
-                var ownedGuards = guardFiles
-                    ?? throw new ObjectDisposedException(nameof(TrustedWriteBoundary));
-                return ownedGuards
-                    .Select(guard => Normalize(guard.Name))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                CaptureLeaf(target, isWriteTarget: true);
+                CaptureLeaf(target + ".bak", isWriteTarget: true);
+            }
+            foreach (var input in protectedFiles)
+            {
+                CaptureLeaf(input, isWriteTarget: false);
+                if (leaves[input].Initial.Kind != SnapshotLeafKind.File)
+                    throw new FileNotFoundException("A protected input file is missing.", input);
+            }
+            return new TrustedWriteBoundary(root, leaves);
+
+            void CaptureLeaf(string path, bool isWriteTarget)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (leaves.TryGetValue(path, out var existing))
+                {
+                    existing.IsWriteTarget |= isWriteTarget;
+                    return;
+                }
+                var fingerprint = CaptureFingerprint(path, cancellationToken);
+                aggregateBytes = checked(aggregateBytes + fingerprint.Length);
+                if (aggregateBytes > MaximumTrustedBoundaryBytes)
+                    throw new InvalidDataException(
+                        $"Protected files exceed the {MaximumTrustedBoundaryBytes:N0}-byte aggregate boundary limit.");
+                leaves.Add(path, new SimpleLeafState(path, isWriteTarget, fingerprint));
             }
         }
 
         public void VerifyUnchanged()
         {
-            var ownedLeaves = leaves ?? throw new ObjectDisposedException(nameof(TrustedWriteBoundary));
-            foreach (var leaf in ownedLeaves.Values) VerifyLeaf(leaf);
+            ObjectDisposedException.ThrowIf(disposed, this);
+            foreach (var leaf in leaves.Values)
+                VerifyLeaf(leaf, CancellationToken.None);
         }
 
         public bool TargetExisted(string path)
         {
-            var leaf = GetWriteLeaf(path);
-            VerifyLeaf(leaf);
-            return leaf.ExpectedExists;
+            var leaf = RequireLeaf(path, requireWriteTarget: true);
+            VerifyLeaf(leaf, CancellationToken.None);
+            return leaf.Initial.Kind == SnapshotLeafKind.File;
         }
 
         internal SnapshotLeafFingerprint CaptureCurrentWriteFingerprint(
             string path,
             CancellationToken cancellationToken = default)
         {
-            var leaf = GetWriteLeaf(path);
-            if (leaf.ExpectedDirectory)
-                throw new IOException("A protected output leaf is occupied by a directory.");
-            if (!leaf.ExpectedExists)
-            {
-                if (File.Exists(leaf.Path) || Directory.Exists(leaf.Path))
-                    throw new ConcurrentLeafChangeException(
-                        "A protected missing leaf appeared before commit resolution.",
-                        leaf.Path);
-                return new SnapshotLeafFingerprint(SnapshotLeafKind.Missing);
-            }
-
-            var handle = leaf.Handle
-                ?? throw new InvalidOperationException("A committed leaf has no active evidence handle.");
-            var identity = ValidateRegularLeafHandle(handle, leaf.Path);
-            var length = RandomAccess.GetLength(handle);
-            var hash = ComputeContentHash(handle, MaximumTrustedLeafBytes, cancellationToken);
-            if (!SameFile(identity, leaf.Identity)
-                || leaf.ContentHash is not { Length: 32 }
-                || !CryptographicOperations.FixedTimeEquals(hash, leaf.ContentHash))
-            {
-                throw new ConcurrentLeafChangeException(
-                    "A committed leaf changed before durable resolution.",
-                    leaf.Path);
-            }
-            return CreateFileFingerprint(identity, length, hash);
+            var leaf = RequireLeaf(path, requireWriteTarget: true);
+            VerifyLeaf(leaf, cancellationToken);
+            return CaptureFingerprint(leaf.Path, cancellationToken);
         }
 
         internal byte[] ReadCurrentWriteBytes(
@@ -1053,979 +740,242 @@ public static class PathSafety
             CancellationToken cancellationToken = default)
         {
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumBytes);
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(maximumBytes, MaximumTrustedLeafBytes);
-            var leaf = GetWriteLeaf(path);
-            if (!leaf.ExpectedExists || leaf.ExpectedDirectory)
-                throw new FileNotFoundException("The protected committed file is not available.", leaf.Path);
-            var handle = leaf.Handle
-                ?? throw new InvalidOperationException("A committed leaf has no active evidence handle.");
-            var identity = ValidateRegularLeafHandle(handle, leaf.Path);
-            var length = RandomAccess.GetLength(handle);
-            if (length < 0 || length > maximumBytes)
+            var leaf = RequireLeaf(path, requireWriteTarget: true);
+            VerifyLeaf(leaf, cancellationToken);
+            using var stream = new FileStream(
+                leaf.Path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                64 * 1024,
+                FileOptions.SequentialScan);
+            if (stream.Length > maximumBytes)
                 throw new InvalidDataException(
-                    $"The protected committed file exceeds the {maximumBytes:N0}-byte read limit.");
-            var bytes = new byte[checked((int)length)];
-            var offset = 0;
-            while (offset < bytes.Length)
+                    $"File exceeds the {maximumBytes:N0}-byte read limit: {Path.GetFileName(path)}");
+            using var memory = new MemoryStream((int)Math.Min(stream.Length, int.MaxValue));
+            var buffer = new byte[64 * 1024];
+            long total = 0;
+            while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var read = RandomAccess.Read(handle, bytes.AsSpan(offset), offset);
-                if (read <= 0)
-                    throw new EndOfStreamException("The protected committed file ended before its recorded length.");
-                offset = checked(offset + read);
+                var read = stream.Read(buffer, 0, buffer.Length);
+                if (read == 0) break;
+                total = checked(total + read);
+                if (total > maximumBytes)
+                    throw new InvalidDataException("A file grew beyond its read limit.");
+                memory.Write(buffer, 0, read);
             }
-            var hash = SHA256.HashData(bytes);
-            if (!SameFile(identity, leaf.Identity)
-                || leaf.ContentHash is not { Length: 32 }
-                || !CryptographicOperations.FixedTimeEquals(hash, leaf.ContentHash))
-            {
-                throw new ConcurrentLeafChangeException(
-                    "The protected committed file changed before its pinned readback.",
-                    leaf.Path);
-            }
-            return bytes;
+            VerifyLeaf(leaf, cancellationToken);
+            return memory.ToArray();
         }
 
         public void CopyTargetToNew(
             string path,
             string destinationPath,
-            CancellationToken cancellationToken = default)
-            => _ = CopyTargetToNewPinned(path, destinationPath, cancellationToken);
+            CancellationToken cancellationToken = default) =>
+            _ = CopyTargetToNewPinned(path, destinationPath, cancellationToken);
 
         internal SnapshotLeafFingerprint CopyTargetToNewPinned(
             string path,
             string destinationPath,
             CancellationToken cancellationToken = default)
         {
-            var leaf = GetWriteLeaf(path);
-            VerifyLeaf(leaf);
-            if (!leaf.ExpectedExists)
-                throw new FileNotFoundException("The protected target did not exist when its boundary was acquired.", leaf.Path);
-
+            var leaf = RequireLeaf(path, requireWriteTarget: true);
+            VerifyLeaf(leaf, cancellationToken);
+            if (leaf.Expected.Kind != SnapshotLeafKind.File)
+                throw new FileNotFoundException("The requested source file is missing.", leaf.Path);
             var destination = Normalize(destinationPath);
-            var parent = Path.GetDirectoryName(destination)
-                ?? throw new InvalidDataException("A prepared file has no parent directory.");
-            var expectedParent = Path.GetDirectoryName(leaf.Path)!;
-            if (!parent.Equals(expectedParent, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("Prepared files must be created beside their protected target.");
-
-            using var sourceHandle = WindowsPathHandle.OpenFileWithoutWriteOrDeleteSharing(leaf.Path);
-            var sourceIdentity = ValidateRegularLeafHandle(sourceHandle, leaf.Path);
-            if (!SameFile(sourceIdentity, leaf.Identity))
-                throw new InvalidDataException("The protected target identity changed before it was copied.");
-            using var source = new FileStream(sourceHandle, FileAccess.Read, 64 * 1024, isAsync: false);
-            uint? destinationVolume = null;
-            ulong? destinationFileIndex = null;
-            var completed = false;
-            try
-            {
-                using var destinationStream = new FileStream(
-                    destination,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None,
-                    64 * 1024,
-                    FileOptions.WriteThrough);
-                if (!AtomicTemporaryFiles.TryGetOwnedRegularFileIdentity(
-                        destinationStream.SafeFileHandle,
-                        out var volumeSerialNumber,
-                        out var fileIndex))
-                {
-                    throw new IOException("The protected-copy destination could not be identity-pinned.");
-                }
-                destinationVolume = volumeSerialNumber;
-                destinationFileIndex = fileIndex;
-                using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                var buffer = new byte[64 * 1024];
-                long copied = 0;
-                while (true)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var read = source.Read(buffer, 0, buffer.Length);
-                    if (read == 0) break;
-                    copied = checked(copied + read);
-                    if (copied > MaximumTrustedLeafBytes)
-                        throw new InvalidDataException(
-                            $"Protected target exceeds the {MaximumTrustedLeafBytes:N0}-byte copy limit.");
-                    hash.AppendData(buffer, 0, read);
-                    destinationStream.Write(buffer, 0, read);
-                }
-                destinationStream.Flush(true);
-                var contentHash = hash.GetHashAndReset();
-                if (leaf.ContentHash is not { Length: 32 }
-                    || !CryptographicOperations.FixedTimeEquals(contentHash, leaf.ContentHash))
-                {
-                    throw new InvalidDataException(
-                        "The protected target content changed while it was copied.");
-                }
-                completed = true;
-                return new SnapshotLeafFingerprint(
-                    SnapshotLeafKind.File,
-                    copied,
-                    contentHash,
-                    VolumeSerialNumber: volumeSerialNumber,
-                    FileIndex: fileIndex);
-            }
-            finally
-            {
-                if (!completed && destinationVolume.HasValue && destinationFileIndex.HasValue)
-                {
-                    _ = AtomicTemporaryFiles.TryDeleteRegularFileByHandle(
-                        destination,
-                        destinationVolume.Value,
-                        destinationFileIndex.Value);
-                }
-            }
+            if (!IsStrictlyInside(destination, root))
+                throw new InvalidDataException("A copied output is outside the trusted root.");
+            AtomicFile.CopyFlushedBounded(leaf.Path, destination, MaximumTrustedLeafBytes, cancellationToken);
+            VerifyLeaf(leaf, cancellationToken);
+            return CaptureFingerprint(destination, cancellationToken);
         }
 
-        public void CommitPreparedFile(string preparedPath, string targetPath, bool keepBackup)
-            => CommitPreparedFile(preparedPath, targetPath, keepBackup, null);
-
-        internal void CommitPreparedFile(
+        public void CommitPreparedFile(
             string preparedPath,
             string targetPath,
-            bool keepBackup,
-            AtomicCommitRecoveryPlan? recoveryPlan)
-            => CommitPreparedFile(
-                preparedPath,
-                targetPath,
-                keepBackup,
-                recoveryPlan,
-                validatedPreparedFingerprint: null);
-
-        internal void CommitPreparedFile(
-            string preparedPath,
-            string targetPath,
-            bool keepBackup,
-            AtomicCommitRecoveryPlan? recoveryPlan,
-            SnapshotLeafFingerprint? validatedPreparedFingerprint)
-        {
-            var target = GetWriteLeaf(targetPath);
-            var backup = GetWriteLeaf(Normalize(targetPath) + ".bak");
-            VerifyLeaf(target);
-            VerifyLeaf(backup);
-            if (target.ExpectedDirectory || backup.ExpectedDirectory)
-                throw new IOException("A protected output leaf is occupied by a directory.");
-
-            var prepared = Normalize(preparedPath);
-            var targetParent = Path.GetDirectoryName(target.Path)!;
-            if (!Path.GetDirectoryName(prepared)!.Equals(targetParent, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("A prepared file must be committed from the protected target directory.");
-            ValidateRecoveryPlan(recoveryPlan, prepared, target.Path, backup.Path, keepBackup);
-            WindowsPathHandle.FileIdentity preparedIdentity;
-            long preparedLength;
-            byte[] preparedHash;
-            using (var preparedHandle = WindowsPathHandle.OpenFileWithoutWriteOrDeleteSharing(prepared))
-            {
-                preparedIdentity = ValidateRegularLeafHandle(preparedHandle, prepared);
-                preparedLength = RandomAccess.GetLength(preparedHandle);
-                preparedHash = ComputeContentHash(preparedHandle);
-            }
-            var preparedFingerprint = CreateFileFingerprint(
-                preparedIdentity,
-                preparedLength,
-                preparedHash);
-            ValidateValidatedPreparedFingerprint(
-                validatedPreparedFingerprint,
-                prepared,
-                preparedIdentity,
-                preparedLength,
-                preparedHash);
-            ValidatePreparedRecoveryFingerprint(
-                recoveryPlan,
-                preparedIdentity,
-                preparedLength,
-                preparedHash);
-            var targetFingerprint = CaptureTrustedFingerprint(target);
-            AfterAtomicLeafLockReleasedTestHook?.Invoke(prepared);
-            if (!target.ExpectedExists)
-            {
-                AfterAtomicLeafLockReleasedTestHook?.Invoke(target.Path);
-                if (File.Exists(target.Path) || Directory.Exists(target.Path))
-                    throw new ConcurrentLeafChangeException(
-                        "A previously absent protected target appeared before commit.",
-                        target.Path);
-                using (var preparedEvidence = TryOpenEvidence(prepared, preparedIdentity, preparedHash))
-                {
-                    if (preparedEvidence is null)
-                        throw new InvalidDataException(
-                            "The prepared file changed after validation and was not committed.");
-                }
-                try
-                {
-                    var expectedPrepared = recoveryPlan?.PreparedFingerprint
-                        ?? preparedFingerprint;
-                    if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                            prepared,
-                            target.Path,
-                            expectedPrepared,
-                            out var committedHandle))
-                    {
-                        throw new ConcurrentLeafChangeException(
-                            "The prepared output changed before handle-bound commit.",
-                            prepared,
-                            target.Path);
-                    }
-                    try
-                    {
-                        AfterAtomicCommitBeforeEvidencePinnedTestHook?.Invoke(target.Path);
-                        target.Adopt(committedHandle!, expectedPrepared);
-                        committedHandle = null;
-                    }
-                    catch
-                    {
-                        committedHandle?.Dispose();
-                        if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                                target.Path,
-                                prepared,
-                                expectedPrepared))
-                        {
-                            throw new ConcurrentLeafChangeException(
-                                "The absent-target commit failed and its exact output could not be quarantined away from the canonical target.",
-                                target.Path,
-                                prepared);
-                        }
-                        throw;
-                    }
-                }
-                catch (IOException exception) when (
-                    exception is not ConcurrentLeafChangeException
-                    && (File.Exists(target.Path) || Directory.Exists(target.Path)))
-                {
-                    throw new ConcurrentLeafChangeException(
-                        "A protected target appeared during commit.",
-                        exception,
-                        target.Path);
-                }
-                AfterAtomicEvidencePinnedTestHook?.Invoke(target.Path);
-                return;
-            }
-
-            var displacedTarget = recoveryPlan?.DisplacedPath ?? Path.Combine(
-                targetParent,
-                $".{Path.GetFileName(target.Path)}.{Guid.NewGuid():N}.displaced.tmp");
-            var rejectedOutput = recoveryPlan?.RejectedPath ?? Path.Combine(
-                targetParent,
-                $".{Path.GetFileName(target.Path)}.{Guid.NewGuid():N}.rejected.tmp");
-            var targetReplaced = false;
-            var preserveRecoveryLeaves = false;
-            SafeFileHandle? targetReplaceEvidence = null;
-            if (recoveryPlan is null)
-            {
-                targetReplaceEvidence = OpenAtomicReplaceEvidence(
-                    target.Path,
-                    target.Identity,
-                    targetFingerprint.Length,
-                    target.ContentHash!);
-            }
-            target.Release();
-            AfterAtomicLeafLockReleasedTestHook?.Invoke(target.Path);
-            try
-            {
-                using (var preparedEvidence = TryOpenEvidence(prepared, preparedIdentity, preparedHash))
-                {
-                    if (preparedEvidence is null)
-                        throw new InvalidDataException(
-                            "The prepared file changed after validation and was not committed.");
-                }
-                if (recoveryPlan is not null)
-                {
-                    if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                            target.Path,
-                            displacedTarget,
-                            recoveryPlan.TargetBefore))
-                    {
-                        throw new ConcurrentLeafChangeException(
-                            "The protected target changed before handle-bound displacement.",
-                            target.Path,
-                            displacedTarget);
-                    }
-                    targetReplaced = true;
-                    AfterAtomicTargetDisplacedTestHook?.Invoke(target.Path);
-                    if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                            prepared,
-                            target.Path,
-                            recoveryPlan.PreparedFingerprint!))
-                    {
-                        throw new ConcurrentLeafChangeException(
-                            "The prepared output changed before handle-bound replacement.",
-                            prepared,
-                            target.Path,
-                            displacedTarget);
-                    }
-                }
-                else
-                {
-                    try
-                    {
-                        using (OpenAtomicReplaceEvidence(
-                                   prepared,
-                                   preparedIdentity,
-                                   preparedLength,
-                                   preparedHash))
-                        {
-                            AfterAtomicFinalEvidenceReleasedTestHook?.Invoke(prepared);
-                        }
-                        try
-                        {
-                            File.Replace(
-                                prepared,
-                                target.Path,
-                                displacedTarget,
-                                ignoreMetadataErrors: true);
-                        }
-                        finally
-                        {
-                            targetReplaceEvidence?.Dispose();
-                            targetReplaceEvidence = null;
-                        }
-                    }
-                    catch (IOException exception) when (!PathHasEvidence(target.Path, target.Identity, target.ContentHash!))
-                    {
-                        throw new ConcurrentLeafChangeException(
-                            "The protected target changed before atomic replacement.",
-                            exception,
-                            target.Path);
-                    }
-                }
-                targetReplaced = true;
-                AfterAtomicCommitBeforeEvidencePinnedTestHook?.Invoke(target.Path);
-                var committedHandle = TryOpenEvidence(target.Path, preparedIdentity, preparedHash);
-                var displacedMatchesTarget = PathHasEvidence(
-                    displacedTarget,
-                    target.Identity,
-                    target.ContentHash!);
-                if (committedHandle is null || !displacedMatchesTarget)
-                {
-                    committedHandle?.Dispose();
-                    if (committedHandle is null)
-                    {
-                        preserveRecoveryLeaves = true;
-                        targetReplaced = false;
-                        if (displacedMatchesTarget)
-                        {
-                            try
-                            {
-                                var concurrentTarget = FileSnapshotJournal.CaptureRecoveryFingerprint(
-                                    target.Path);
-                                RestoreOwnedLeaf(
-                                    displacedTarget,
-                                    targetFingerprint,
-                                    target.Path,
-                                    rejectedOutput,
-                                    concurrentTarget);
-                            }
-                            catch (Exception repairException) when (repairException is IOException or UnauthorizedAccessException)
-                            {
-                                throw new ConcurrentLeafChangeException(
-                                    "The forged committed target could not be fully quarantined; every known recovery leaf was preserved.",
-                                    repairException,
-                                    target.Path,
-                                    displacedTarget,
-                                    rejectedOutput);
-                            }
-                            throw new ConcurrentLeafChangeException(
-                                $"The forged committed target was quarantined at '{rejectedOutput}' and the original target was restored.",
-                                target.Path,
-                                rejectedOutput);
-                        }
-                        QuarantineCurrentLeaf(
-                            target.Path,
-                            rejectedOutput,
-                            displacedTarget);
-                        throw new ConcurrentLeafChangeException(
-                            "The committed target and displaced leaf both diverged; the canonical target was quarantined and every known recovery leaf was preserved.",
-                            target.Path,
-                            displacedTarget,
-                            rejectedOutput);
-                    }
-                    if (recoveryPlan is not null)
-                    {
-                        preserveRecoveryLeaves = true;
-                        targetReplaced = false;
-                        throw new ConcurrentLeafChangeException(
-                            "The displaced target identity changed during handle-bound commit; all leaves were preserved.",
-                            target.Path,
-                            displacedTarget);
-                    }
-                    var concurrentDisplaced = FileSnapshotJournal.CaptureRecoveryFingerprint(
-                        displacedTarget);
-                    RestoreOwnedLeaf(
-                        displacedTarget,
-                        concurrentDisplaced,
-                        target.Path,
-                        rejectedOutput,
-                        preparedFingerprint);
-                    targetReplaced = false;
-                    preserveRecoveryLeaves = true;
-                    throw new ConcurrentLeafChangeException(
-                        $"The concurrently displaced target was restored and the rejected output was preserved at '{rejectedOutput}'.",
-                        target.Path,
-                        rejectedOutput);
-                }
-                target.Adopt(
-                    committedHandle,
-                    recoveryPlan?.PreparedFingerprint ?? preparedFingerprint);
-                AfterAtomicEvidencePinnedTestHook?.Invoke(target.Path);
-
-                if (keepBackup)
-                {
-                    CommitDeterministicBackup(
-                        displacedTarget,
-                        target,
-                        backup,
-                        rejectedOutput,
-                        recoveryPlan,
-                        targetFingerprint,
-                        preparedFingerprint);
-                    targetReplaced = false;
-                }
-                else
-                {
-                    DeleteOwnedLeaf(
-                        displacedTarget,
-                        targetFingerprint);
-                    targetReplaced = false;
-                }
-            }
-            catch
-            {
-                if (targetReplaced && File.Exists(displacedTarget))
-                {
-                    target.Release();
-                    try
-                    {
-                        RestoreOwnedLeaf(
-                            displacedTarget,
-                            recoveryPlan?.TargetBefore ?? targetFingerprint,
-                            target.Path,
-                            rejectedOutput,
-                            recoveryPlan?.PreparedFingerprint ?? preparedFingerprint);
-                    }
-                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-                    {
-                        preserveRecoveryLeaves = true;
-                        System.Diagnostics.Trace.TraceError(
-                            $"Atomic target rollback failed ({exception.GetType().Name}); displaced data was preserved.");
-                    }
-                }
-                throw;
-            }
-            finally
-            {
-                targetReplaceEvidence?.Dispose();
-                if (!preserveRecoveryLeaves)
-                {
-                    DeleteOwnedLeaf(rejectedOutput, preparedFingerprint);
-                    DeleteOwnedLeaf(displacedTarget, targetFingerprint);
-                }
-            }
-        }
-
-        private static void CommitDeterministicBackup(
-            string displacedTarget,
-            TrustedLeaf target,
-            TrustedLeaf backup,
-            string rejectedOutput,
-            AtomicCommitRecoveryPlan? recoveryPlan,
-            SnapshotLeafFingerprint targetFingerprint,
-            SnapshotLeafFingerprint preparedFingerprint)
-        {
-            var priorBackup = recoveryPlan?.PriorBackupPath ?? Path.Combine(
-                Path.GetDirectoryName(backup.Path)!,
-                $".{Path.GetFileName(backup.Path)}.{Guid.NewGuid():N}.prior.tmp");
-            var originalRecovery = recoveryPlan?.OriginalRecoveryPath ?? Path.Combine(
-                Path.GetDirectoryName(backup.Path)!,
-                $".{Path.GetFileName(backup.Path)}.{Guid.NewGuid():N}.original.tmp");
-            var preservePriorBackup = false;
-            var preserveOriginalRecovery = false;
-            var backupFingerprint = CaptureTrustedFingerprint(backup);
-            var priorBackupDisplaced = false;
-            var originalInstalledAsBackup = false;
-            backup.Release();
-            try
-            {
-                if (backup.ExpectedExists)
-                {
-                    if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                            backup.Path,
-                            priorBackup,
-                            recoveryPlan?.BackupBefore ?? backupFingerprint))
-                    {
-                        throw new ConcurrentLeafChangeException(
-                            "The deterministic backup changed before handle-bound displacement.",
-                            backup.Path,
-                            priorBackup);
-                    }
-                    priorBackupDisplaced = true;
-                    AfterAtomicLeafLockReleasedTestHook?.Invoke(backup.Path);
-                    AfterAtomicBackupDisplacedTestHook?.Invoke(backup.Path);
-                }
-                else
-                {
-                    AfterAtomicLeafLockReleasedTestHook?.Invoke(backup.Path);
-                    if (File.Exists(backup.Path) || Directory.Exists(backup.Path))
-                    {
-                        throw new ConcurrentLeafChangeException(
-                            "A previously absent deterministic backup appeared before commit.",
-                            backup.Path);
-                    }
-                }
-
-                if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                        displacedTarget,
-                        backup.Path,
-                        recoveryPlan?.TargetBefore ?? targetFingerprint,
-                        out var committedBackupHandle))
-                {
-                    throw new ConcurrentLeafChangeException(
-                        "The displaced target changed before handle-bound backup commit.",
-                        displacedTarget,
-                        backup.Path,
-                        priorBackup);
-                }
-                originalInstalledAsBackup = true;
-                backup.Adopt(
-                    committedBackupHandle!,
-                    recoveryPlan?.TargetBefore ?? targetFingerprint);
-                committedBackupHandle = null;
-                AfterAtomicCommitBeforeEvidencePinnedTestHook?.Invoke(backup.Path);
-                AfterAtomicEvidencePinnedTestHook?.Invoke(backup.Path);
-
-                if (priorBackupDisplaced)
-                {
-                    DeleteOwnedLeaf(priorBackup, backupFingerprint);
-                    priorBackupDisplaced = false;
-                }
-            }
-            catch (Exception operationException)
-            {
-                backup.Release();
-                try
-                {
-                    var originalPath = originalInstalledAsBackup
-                        ? backup.Path
-                        : displacedTarget;
-                    if (File.Exists(originalPath))
-                    {
-                        target.Release();
-                        RestoreOwnedLeaf(
-                            originalPath,
-                            targetFingerprint,
-                            target.Path,
-                            rejectedOutput,
-                            preparedFingerprint);
-                        originalInstalledAsBackup = false;
-                    }
-                    if (priorBackupDisplaced)
-                    {
-                        if (File.Exists(backup.Path) || Directory.Exists(backup.Path))
-                        {
-                            preservePriorBackup = true;
-                        }
-                        else if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                                     priorBackup,
-                                     backup.Path,
-                                     backupFingerprint))
-                        {
-                            preservePriorBackup = true;
-                            throw new ConcurrentLeafChangeException(
-                                "The prior deterministic backup could not be restored by its exact handle evidence.",
-                                priorBackup,
-                                backup.Path);
-                        }
-                        else
-                        {
-                            priorBackupDisplaced = false;
-                        }
-                    }
-                }
-                catch (Exception recoveryException) when (recoveryException is IOException or UnauthorizedAccessException)
-                {
-                    preservePriorBackup |= File.Exists(priorBackup);
-                    preserveOriginalRecovery |= File.Exists(originalRecovery);
-                    throw new ConcurrentLeafChangeException(
-                        "The deterministic backup commit failed and exact rollback was incomplete; all known recovery leaves were preserved.",
-                        new AggregateException(operationException, recoveryException),
-                        target.Path,
-                        backup.Path,
-                        displacedTarget,
-                        rejectedOutput,
-                        priorBackup,
-                        originalRecovery);
-                }
-                throw;
-            }
-            finally
-            {
-                if (!preservePriorBackup)
-                    DeleteOwnedLeaf(priorBackup, backupFingerprint);
-                if (!preserveOriginalRecovery)
-                    DeleteOwnedLeaf(originalRecovery, targetFingerprint);
-            }
-        }
-
-        private static void RestoreOwnedLeaf(
-            string displacedPath,
-            SnapshotLeafFingerprint displacedFingerprint,
-            string targetPath,
-            string rejectedPath,
-            SnapshotLeafFingerprint? targetFingerprint)
-        {
-            if (File.Exists(targetPath))
-            {
-                if (targetFingerprint is null)
-                {
-                    throw new ConcurrentLeafChangeException(
-                        "Atomic rollback preserved an unknown target instead of overwriting it.",
-                        targetPath,
-                        displacedPath);
-                }
-                BeforeAtomicRollbackHandleMoveTestHook?.Invoke(targetPath);
-                if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                        targetPath,
-                        rejectedPath,
-                        targetFingerprint))
-                {
-                    throw new ConcurrentLeafChangeException(
-                        "Atomic rollback preserved an unknown target instead of overwriting it.",
-                        targetPath,
-                        displacedPath);
-                }
-            }
-            else if (Directory.Exists(targetPath))
-            {
-                throw new IOException("Atomic rollback target is occupied by a directory.");
-            }
-            BeforeAtomicRollbackHandleMoveTestHook?.Invoke(displacedPath);
-            if (!AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                    displacedPath,
-                    targetPath,
-                    displacedFingerprint))
-            {
-                throw new ConcurrentLeafChangeException(
-                    "Atomic rollback source changed before handle-bound restoration.",
-                    displacedPath,
-                    targetPath);
-            }
-        }
-
-        private static void ValidateRecoveryPlan(
-            AtomicCommitRecoveryPlan? plan,
-            string prepared,
-            string target,
-            string backup,
             bool keepBackup)
         {
-            if (plan is null) return;
-            if (!Normalize(plan.PreparedPath).Equals(prepared, StringComparison.OrdinalIgnoreCase)
-                || !Normalize(plan.TargetPath).Equals(target, StringComparison.OrdinalIgnoreCase)
-                || !Normalize(plan.BackupPath).Equals(backup, StringComparison.OrdinalIgnoreCase)
-                || plan.KeepBackup != keepBackup)
+            ObjectDisposedException.ThrowIf(disposed, this);
+            var target = RequireLeaf(targetPath, requireWriteTarget: true);
+            var backup = RequireLeaf(target.Path + ".bak", requireWriteTarget: true);
+            VerifyLeaf(target, CancellationToken.None);
+            VerifyLeaf(backup, CancellationToken.None);
+            if (target.Expected.Kind == SnapshotLeafKind.Directory)
+                throw new IOException("Refusing to replace a directory with a file.");
+            if (target.Expected.Kind == SnapshotLeafKind.File
+                && File.GetAttributes(target.Path).HasFlag(FileAttributes.ReadOnly))
             {
-                throw new InvalidDataException("The durable atomic-commit reservation does not match the protected leaf.");
+                throw new UnauthorizedAccessException("Refusing to replace a read-only file.");
             }
-            var parent = Path.GetDirectoryName(target)!;
-            var paths = new[]
-            {
-                plan.PreparedPath,
-                plan.DisplacedPath,
-                plan.RejectedPath,
-                plan.PriorBackupPath,
-                plan.OriginalRecoveryPath
-            }.Where(path => path is not null).Cast<string>().Select(Normalize).ToArray();
-            if (paths.Distinct(StringComparer.OrdinalIgnoreCase).Count() != paths.Length
-                || paths.Any(path => !Path.GetDirectoryName(path)!.Equals(parent, StringComparison.OrdinalIgnoreCase)))
-            {
-                throw new InvalidDataException("The durable atomic-commit reservation contains an escaped or duplicate path.");
-            }
-            foreach (var auxiliary in paths.Where(path => !path.Equals(prepared, StringComparison.OrdinalIgnoreCase)))
-            {
-                if (File.Exists(auxiliary) || Directory.Exists(auxiliary))
-                    throw new ConcurrentLeafChangeException(
-                        "A reserved atomic-commit intermediate appeared before mutation.",
-                        auxiliary);
-            }
-        }
 
-        private static void ValidatePreparedRecoveryFingerprint(
-            AtomicCommitRecoveryPlan? plan,
-            WindowsPathHandle.FileIdentity identity,
-            long length,
-            byte[] hash)
-        {
-            if (plan?.PreparedFingerprint is not { } expected) return;
-            if (expected.Kind != SnapshotLeafKind.File
-                || expected.VolumeSerialNumber != identity.VolumeSerialNumber
-                || expected.FileIndex != identity.FileIndex
-                || expected.Length != length
-                || expected.Sha256 is not { Length: 32 }
-                || !CryptographicOperations.FixedTimeEquals(expected.Sha256, hash))
+            var prepared = Normalize(preparedPath);
+            var targetDirectory = Path.GetDirectoryName(target.Path)
+                ?? throw new InvalidDataException("A target file has no parent directory.");
+            var preparedDirectory = Path.GetDirectoryName(prepared)
+                ?? throw new InvalidDataException("A prepared file has no parent directory.");
+            if (!preparedDirectory.Equals(targetDirectory, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("A prepared file must be a same-volume sibling of its target.");
+            var preparedFingerprint = CaptureFingerprint(prepared, CancellationToken.None);
+            if (preparedFingerprint.Kind != SnapshotLeafKind.File)
+                throw new InvalidDataException("A prepared output is not a regular file.");
+            if (target.Expected.Kind == SnapshotLeafKind.File)
             {
-                throw new ConcurrentLeafChangeException(
-                    "The prepared output changed after durable readiness was published.",
-                    plan.PreparedPath);
+                var previousTarget = target.Expected;
+                File.Replace(
+                    prepared,
+                    target.Path,
+                    keepBackup ? backup.Path : null,
+                    ignoreMetadataErrors: true);
+                FileTransactionRecoverySession.RecordApplied(target.Path, preparedFingerprint);
+                if (keepBackup)
+                    FileTransactionRecoverySession.RecordApplied(backup.Path, previousTarget);
             }
-        }
+            else
+            {
+                File.Move(prepared, target.Path);
+                FileTransactionRecoverySession.RecordApplied(target.Path, preparedFingerprint);
+            }
 
-        private static void ValidateValidatedPreparedFingerprint(
-            SnapshotLeafFingerprint? expected,
-            string path,
-            WindowsPathHandle.FileIdentity identity,
-            long length,
-            byte[] hash)
-        {
-            if (expected is null) return;
-            if (expected.Kind != SnapshotLeafKind.File
-                || expected.VolumeSerialNumber != identity.VolumeSerialNumber
-                || expected.FileIndex != identity.FileIndex
-                || expected.Length != length
-                || expected.Sha256 is not { Length: 32 }
-                || !CryptographicOperations.FixedTimeEquals(expected.Sha256, hash))
-            {
-                throw new ConcurrentLeafChangeException(
-                    "The prepared output no longer matches its validated creation evidence.",
-                    path);
-            }
-        }
-
-        private static SnapshotLeafFingerprint CaptureTrustedFingerprint(TrustedLeaf leaf)
-        {
-            if (!leaf.ExpectedExists)
-                return new SnapshotLeafFingerprint(SnapshotLeafKind.Missing);
-            if (leaf.ExpectedDirectory)
-                throw new IOException("A protected output leaf is occupied by a directory.");
-            var handle = leaf.Handle
-                ?? throw new InvalidOperationException("A protected file leaf has no active evidence handle.");
-            return CreateFileFingerprint(
-                leaf.Identity,
-                RandomAccess.GetLength(handle),
-                leaf.ContentHash
-                ?? throw new InvalidDataException("A protected file leaf has no content evidence."));
-        }
-
-        private static SnapshotLeafFingerprint CreateFileFingerprint(
-            WindowsPathHandle.FileIdentity identity,
-            long length,
-            byte[] hash) => new(
-            SnapshotLeafKind.File,
-            length,
-            hash,
-            identity.LastWriteTimeUtcTicks,
-            VolumeSerialNumber: identity.VolumeSerialNumber,
-            FileIndex: identity.FileIndex);
-
-        private static SafeFileHandle OpenAtomicReplaceEvidence(
-            string path,
-            WindowsPathHandle.FileIdentity expectedIdentity,
-            long expectedLength,
-            byte[] expectedHash)
-        {
-            SafeFileHandle? handle = null;
-            try
-            {
-                handle = WindowsPathHandle.OpenFileForAtomicReplace(path);
-                var actualIdentity = ValidateRegularLeafHandle(handle, path);
-                if (!SameFile(actualIdentity, expectedIdentity)
-                    || RandomAccess.GetLength(handle) != expectedLength
-                    || !CryptographicOperations.FixedTimeEquals(
-                        ComputeContentHash(handle),
-                        expectedHash))
-                {
-                    throw new ConcurrentLeafChangeException(
-                        "The prepared output changed before its atomic replacement handle was pinned.",
-                        path);
-                }
-                var result = handle
-                    ?? throw new InvalidOperationException("Atomic replacement evidence handle was not opened.");
-                handle = null;
-                return result;
-            }
-            finally
-            {
-                handle?.Dispose();
-            }
-        }
-
-        private static void QuarantineCurrentLeaf(
-            string path,
-            string rejectedPath,
-            params string[] recoveryPaths)
-        {
-            var current = FileSnapshotJournal.CaptureRecoveryFingerprint(path);
-            if (current.Kind == SnapshotLeafKind.Missing) return;
-            if (current.Kind == SnapshotLeafKind.File
-                && AtomicTemporaryFiles.TryMoveRegularFileByHandle(
-                    path,
-                    rejectedPath,
-                    current))
-            {
-                return;
-            }
-            throw new ConcurrentLeafChangeException(
-                "The unknown canonical leaf could not be quarantined without overwriting it.",
-                [path, rejectedPath, .. recoveryPaths]);
-        }
-
-        private static bool PathHasEvidence(
-            string path,
-            WindowsPathHandle.FileIdentity expected,
-            byte[] expectedHash)
-        {
-            if (!File.Exists(path) || Directory.Exists(path)) return false;
-            try
-            {
-                using var handle = WindowsPathHandle.OpenFileWithoutWriteOrDeleteSharing(path);
-                var actual = ValidateRegularLeafHandle(handle, path);
-                return SameFile(actual, expected)
-                    && CryptographicOperations.FixedTimeEquals(
-                        ComputeContentHash(handle),
-                        expectedHash);
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
-            {
-                return false;
-            }
-        }
-
-        private static SafeFileHandle? TryOpenEvidence(
-            string path,
-            WindowsPathHandle.FileIdentity expected,
-            byte[] expectedHash)
-        {
-            if (!File.Exists(path) || Directory.Exists(path)) return null;
-            SafeFileHandle? handle = null;
-            try
-            {
-                handle = WindowsPathHandle.OpenFileWithoutWriteOrDeleteSharing(path);
-                var actual = ValidateRegularLeafHandle(handle, path);
-                if (SameFile(actual, expected)
-                    && CryptographicOperations.FixedTimeEquals(
-                        ComputeContentHash(handle),
-                        expectedHash))
-                {
-                    return handle;
-                }
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"Committed leaf evidence could not be pinned ({exception.GetType().Name}).");
-            }
-            handle?.Dispose();
-            return null;
-        }
-
-        private static void DeleteOwnedLeaf(
-            string path,
-            SnapshotLeafFingerprint expected)
-        {
-            try
-            {
-                if (!File.Exists(path)) return;
-                if (expected.Kind != SnapshotLeafKind.File
-                    || expected.Sha256 is not { Length: 32 }
-                    || !AtomicTemporaryFiles.TryDeleteRegularFileByHandle(
-                        path,
-                        expected.VolumeSerialNumber,
-                        expected.FileIndex,
-                        expected.Length,
-                        expected.Sha256))
-                {
-                    throw new ConcurrentLeafChangeException(
-                        "Atomic replacement cleanup preserved a leaf whose exact identity was not owned.",
-                        path);
-                }
-            }
-            catch (ConcurrentLeafChangeException)
-            {
-                throw;
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-            {
-                throw new IOException(
-                    "Atomic replacement cleanup could not safely remove an owned recovery leaf.",
-                    exception);
-            }
+            target.Expected = CaptureFingerprint(target.Path, CancellationToken.None);
+            backup.Expected = CaptureFingerprint(backup.Path, CancellationToken.None);
         }
 
         public void ReleaseWriteLeafLocksForRollback()
         {
-            var ownedLeaves = leaves ?? throw new ObjectDisposedException(nameof(TrustedWriteBoundary));
-            foreach (var leaf in ownedLeaves.Values.Where(candidate => candidate.IsWriteTarget)) leaf.Release();
+            // The simplified boundary does not hold long-lived leaf or directory handles.
         }
 
-        private TrustedLeaf GetWriteLeaf(string path)
+        public void Dispose() => disposed = true;
+
+        private SimpleLeafState RequireLeaf(string path, bool requireWriteTarget)
         {
-            var fullPath = Normalize(path);
-            var ownedLeaves = leaves ?? throw new ObjectDisposedException(nameof(TrustedWriteBoundary));
-            if (!ownedLeaves.TryGetValue(fullPath, out var leaf) || !leaf.IsWriteTarget)
-                throw new InvalidOperationException("The file is not part of this trusted write boundary.");
+            ObjectDisposedException.ThrowIf(disposed, this);
+            var normalized = Normalize(path);
+            if (!leaves.TryGetValue(normalized, out var leaf)
+                || requireWriteTarget && !leaf.IsWriteTarget)
+            {
+                throw new InvalidDataException("A file is outside the captured transaction target list.");
+            }
             return leaf;
         }
 
-        private void VerifyLeaf(TrustedLeaf leaf)
+        private static void VerifyLeaf(
+            SimpleLeafState leaf,
+            CancellationToken cancellationToken)
         {
-            if (leaf.ExpectedDirectory)
+            SnapshotLeafFingerprint current;
+            try
             {
-                var directoryHandle = leaf.Handle
-                    ?? throw new InvalidOperationException("The protected directory leaf has already been released.");
-                var directoryIdentity = ValidateDirectoryLeafHandle(directoryHandle, leaf.Path);
-                if (!SameIdentity(directoryIdentity, leaf.Identity))
-                    throw new InvalidDataException("A protected directory leaf identity changed after boundary acquisition.");
-                using var directoryPathHandle = WindowsPathHandle.OpenDirectoryWithoutDeleteSharing(leaf.Path);
-                var directoryPathIdentity = ValidateDirectoryLeafHandle(directoryPathHandle, leaf.Path);
-                if (!SameIdentity(directoryPathIdentity, leaf.Identity))
-                    throw new InvalidDataException("A protected path no longer names its locked directory leaf.");
-                return;
+                current = CaptureFingerprint(leaf.Path, cancellationToken);
             }
-            if (!leaf.ExpectedExists)
+            catch (Exception exception) when (exception is IOException
+                                              or UnauthorizedAccessException
+                                              or InvalidDataException)
             {
-                if (File.Exists(leaf.Path) || Directory.Exists(leaf.Path))
-                    throw new InvalidDataException("A protected leaf appeared after the boundary was acquired.");
-                return;
+                throw new ConcurrentLeafChangeException(
+                    "A protected file could not be verified before use.",
+                    exception,
+                    leaf.Path);
             }
-
-            var handle = leaf.Handle
-                ?? throw new InvalidOperationException("The protected leaf has already entered its atomic replacement boundary.");
-            var identity = ValidateRegularLeafHandle(handle, leaf.Path);
-            if (!SameFile(identity, leaf.Identity))
-                throw new InvalidDataException("A protected leaf identity changed after the boundary was acquired.");
-            using var pathHandle = WindowsPathHandle.OpenFileWithoutWriteOrDeleteSharing(leaf.Path);
-            var pathIdentity = ValidateRegularLeafHandle(pathHandle, leaf.Path);
-            if (!SameFile(pathIdentity, leaf.Identity))
-                throw new InvalidDataException("A protected path no longer names its locked leaf.");
+            if (SameState(current, leaf.Expected)) return;
+            throw new ConcurrentLeafChangeException(
+                "A protected file was modified by another program.",
+                leaf.Path);
         }
 
-        private static bool SameFile(
-            WindowsPathHandle.FileIdentity left,
-            WindowsPathHandle.FileIdentity right) =>
-            left.VolumeSerialNumber == right.VolumeSerialNumber
-            && left.FileIndex == right.FileIndex
-            && left.NumberOfLinks == 1
-            && right.NumberOfLinks == 1;
-
-        private static bool SameIdentity(
-            WindowsPathHandle.FileIdentity left,
-            WindowsPathHandle.FileIdentity right) =>
-            left.VolumeSerialNumber == right.VolumeSerialNumber
-            && left.FileIndex == right.FileIndex;
-
-        public void Dispose()
+        private static SnapshotLeafFingerprint CaptureFingerprint(
+            string path,
+            CancellationToken cancellationToken)
         {
-            var ownedLeaves = Interlocked.Exchange(ref leaves, null);
-            if (ownedLeaves is not null)
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Directory.Exists(path))
             {
-                foreach (var leaf in ownedLeaves.Values) leaf.Dispose();
+                if (File.Exists(path))
+                    throw new InvalidDataException("A protected path is both a file and a directory.");
+                var attributes = File.GetAttributes(path);
+                if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
+                    throw new InvalidDataException("A protected directory is redirected.");
+                return new SnapshotLeafFingerprint(
+                    SnapshotLeafKind.Directory,
+                    LastWriteTimeUtcTicks: Directory.GetLastWriteTimeUtc(path).Ticks);
             }
-            var owned = Interlocked.Exchange(ref handles, null);
-            if (owned is not null)
+            if (!File.Exists(path)) return new SnapshotLeafFingerprint(SnapshotLeafKind.Missing);
+
+            var fileAttributes = File.GetAttributes(path);
+            if ((fileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
+                throw new InvalidDataException("A protected file is not a regular local file.");
+            var beforeLength = new FileInfo(path).Length;
+            var beforeWrite = File.GetLastWriteTimeUtc(path).Ticks;
+            if (beforeLength < 0 || beforeLength > MaximumTrustedLeafBytes)
+                throw new InvalidDataException(
+                    $"Protected file exceeds the {MaximumTrustedLeafBytes:N0}-byte limit: {Path.GetFileName(path)}");
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                64 * 1024,
+                FileOptions.SequentialScan);
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[64 * 1024];
+            long total = 0;
+            while (true)
             {
-                for (var index = owned.Count - 1; index >= 0; index--) owned[index].Dispose();
+                cancellationToken.ThrowIfCancellationRequested();
+                var read = stream.Read(buffer, 0, buffer.Length);
+                if (read == 0) break;
+                total = checked(total + read);
+                if (total > MaximumTrustedLeafBytes)
+                    throw new InvalidDataException("A protected file grew beyond its size limit.");
+                hash.AppendData(buffer, 0, read);
             }
-            var ownedGuards = Interlocked.Exchange(ref guardFiles, null);
-            if (ownedGuards is null) return;
-            for (var index = ownedGuards.Count - 1; index >= 0; index--) ownedGuards[index].Dispose();
+            var afterLength = new FileInfo(path).Length;
+            var afterWrite = File.GetLastWriteTimeUtc(path).Ticks;
+            if (beforeLength != afterLength || beforeWrite != afterWrite || total != afterLength)
+                throw new ConcurrentLeafChangeException(
+                    "A protected file changed while it was being read.",
+                    path);
+            return new SnapshotLeafFingerprint(
+                SnapshotLeafKind.File,
+                total,
+                hash.GetHashAndReset(),
+                afterWrite);
+        }
+
+        private static bool SameState(
+            SnapshotLeafFingerprint left,
+            SnapshotLeafFingerprint right) =>
+            left.Kind == right.Kind
+            && left.Kind switch
+            {
+                SnapshotLeafKind.Missing => true,
+                SnapshotLeafKind.Directory =>
+                    left.LastWriteTimeUtcTicks == right.LastWriteTimeUtcTicks,
+                SnapshotLeafKind.File => SameFileContent(left, right),
+                _ => false
+            };
+
+        private static bool SameFileContent(
+            SnapshotLeafFingerprint left,
+            SnapshotLeafFingerprint right) =>
+            left.Kind == SnapshotLeafKind.File
+            && right.Kind == SnapshotLeafKind.File
+            && left.Length == right.Length
+            && left.Sha256 is { Length: 32 }
+            && right.Sha256 is { Length: 32 }
+            && CryptographicOperations.FixedTimeEquals(left.Sha256, right.Sha256);
+
+        private sealed class SimpleLeafState(
+            string path,
+            bool isWriteTarget,
+            SnapshotLeafFingerprint initial)
+        {
+            public string Path { get; } = path;
+            public bool IsWriteTarget { get; set; } = isWriteTarget;
+            public SnapshotLeafFingerprint Initial { get; } = initial;
+            public SnapshotLeafFingerprint Expected { get; set; } = initial;
         }
     }
 }

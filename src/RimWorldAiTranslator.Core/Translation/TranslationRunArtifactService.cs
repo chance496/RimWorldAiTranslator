@@ -94,12 +94,10 @@ public sealed class TranslationRunArtifactService
                         root => ValidatePreservedTranslationDocument(root, document));
                     committedFingerprint = FileSnapshotJournal.CaptureRecoveryFingerprint(temporaryPath);
                     if (committedFingerprint.Kind != SnapshotLeafKind.File
-                        || committedFingerprint.VolumeSerialNumber is null
-                        || committedFingerprint.FileIndex is null
                         || committedFingerprint.Sha256 is not { Length: 32 })
                     {
                         throw new IOException(
-                            "The prepared preserved-translation artifact could not be identity-pinned.");
+                            "The prepared preserved-translation artifact could not be verified.");
                     }
                 },
                 writeBoundary,
@@ -189,18 +187,16 @@ public sealed class TranslationRunArtifactService
             }
             return;
         }
-        if (Directory.Exists(fullPath)
-            || !AtomicTemporaryFiles.TryDeleteRegularFileByHandle(
-                fullPath,
-                fingerprint.VolumeSerialNumber,
-                fingerprint.FileIndex,
-                fingerprint.Length,
-                fingerprint.Sha256))
+        var current = Directory.Exists(fullPath)
+            ? new SnapshotLeafFingerprint(SnapshotLeafKind.Directory)
+            : FileSnapshotJournal.CaptureRecoveryFingerprint(fullPath);
+        if (!FileSnapshotJournal.HasSameContent(current, fingerprint))
         {
             throw new ConcurrentLeafChangeException(
                 "The preserved-translation artifact changed after creation and was not deleted.",
                 fullPath);
         }
+        File.Delete(fullPath);
 
         lock (ownedArtifactsSync)
         {

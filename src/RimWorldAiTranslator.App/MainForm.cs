@@ -408,6 +408,7 @@ internal sealed class MainForm : Form
     {
         if (!firstFrameRevealed || closing || IsDisposed) return;
         ShowRecoveryNotices();
+        ShowInterruptedFileTransactionPrompt();
         if (!deferredStartupWorkStarted)
         {
             deferredStartupWorkStarted = true;
@@ -968,6 +969,64 @@ internal sealed class MainForm : Form
             Text,
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
+    }
+
+    private void ShowInterruptedFileTransactionPrompt()
+    {
+        var pending = services.DrainPendingFileTransactions();
+        if (pending.Count == 0) return;
+        var restorable = pending.Where(transaction => transaction.IsRestorable).ToArray();
+        var damagedCount = pending.Count - restorable.Length;
+        if (damagedCount > 0)
+        {
+            services.Logger.Warning("Interrupted save metadata was damaged; automatic restore was not attempted.");
+            MessageBox.Show(
+                this,
+                $"이전 저장 또는 적용 작업 {damagedCount:N0}건의 복구 정보가 손상되었습니다. 파일을 임의로 변경하지 않았습니다. 백업을 확인한 뒤 다시 시도하세요.",
+                Text,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        if (restorable.Length == 0) return;
+
+        var answer = MessageBox.Show(
+            this,
+            $"이전 저장 또는 적용 작업 {restorable.Length:N0}건이 완전히 끝나지 않았습니다.\n\n작업 시작 전 백업으로 되돌릴까요?\n\n'아니요'를 선택하면 현재 파일을 그대로 두며 자동으로 적용을 완료하지 않습니다.",
+            Text,
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (answer != DialogResult.Yes) return;
+        TryStartUiWorkflow(
+            "중단된 작업 백업 복구",
+            cancellationToken => RestoreInterruptedTransactionsAsync(restorable, cancellationToken));
+    }
+
+    private async Task RestoreInterruptedTransactionsAsync(
+        IReadOnlyList<PendingFileTransaction> pending,
+        CancellationToken cancellationToken)
+    {
+        await Task.Run(
+                () =>
+                {
+                    foreach (var transaction in pending)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        services.RecoveryAuthority.Restore(transaction, cancellationToken);
+                    }
+                },
+                cancellationToken)
+            .ConfigureAwait(true);
+        services.Logger.Warning($"Restored {pending.Count:N0} interrupted file transaction backup(s) after user confirmation.");
+        if (CanUpdateUi())
+        {
+            MessageBox.Show(
+                this,
+                "중단된 작업을 백업에서 복구했습니다.",
+                Text,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
     }
 
     private async Task RefreshSourceAsync(CancellationToken cancellationToken)

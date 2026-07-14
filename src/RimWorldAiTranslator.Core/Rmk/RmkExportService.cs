@@ -896,10 +896,8 @@ public sealed class RmkExportService
         {
             if (evidenceFingerprint is not null && File.Exists(evidencePath))
             {
-                _ = AtomicTemporaryFiles.TryDeleteRegularFileByHandle(
+                _ = AtomicTemporaryFiles.TryDeleteRegularFile(
                     evidencePath,
-                    evidenceFingerprint.VolumeSerialNumber,
-                    evidenceFingerprint.FileIndex,
                     evidenceFingerprint.Length,
                     evidenceFingerprint.Sha256);
             }
@@ -941,49 +939,23 @@ public sealed class RmkExportService
     {
         _ = Path.GetDirectoryName(workbookPath)
             ?? throw new InvalidDataException("RMK workbook path has no parent directory.");
-        var recoveryPlan = FileTransactionRecoverySession.ReservePreparedWrite(
-            workbookPath,
-            keepBackup: true);
-        var preparedPath = recoveryPlan?.PreparedPath
-            ?? AtomicTemporaryFiles.CreatePath(workbookPath);
-        SnapshotLeafFingerprint? preparedFingerprint = null;
+        var preparedPath = AtomicTemporaryFiles.CreatePath(workbookPath);
         try
         {
             var sourceWorkbookPath = writeBoundary.TargetExisted(workbookPath)
                 ? workbookPath
                 : null;
-            var evidence = RimWorldTranslatorRmkXlsxWriter.WritePreparedWithEvidence(
+            _ = RimWorldTranslatorRmkXlsxWriter.WritePreparedWithEvidence(
                 sourceWorkbookPath,
                 preparedPath,
                 rows,
                 sourceLanguage);
-            preparedFingerprint = new SnapshotLeafFingerprint(
-                SnapshotLeafKind.File,
-                evidence.Length,
-                Convert.FromHexString(evidence.Sha256Hex),
-                evidence.LastWriteTimeUtcTicks,
-                evidence.VolumeSerialNumber,
-                evidence.FileIndex);
             AfterWorkbookPreparedValidationTestHook?.Invoke(preparedPath);
-            FileTransactionRecoverySession.MarkPreparedWriteReady(
-                recoveryPlan,
-                preparedFingerprint);
-            writeBoundary.CommitPreparedFile(
-                preparedPath,
-                workbookPath,
-                keepBackup: true,
-                recoveryPlan,
-                preparedFingerprint);
+            writeBoundary.CommitPreparedFile(preparedPath, workbookPath, keepBackup: true);
         }
         finally
         {
-            if (preparedFingerprint is not null)
-                _ = AtomicTemporaryFiles.TryDeleteRegularFileByHandle(
-                    preparedPath,
-                    preparedFingerprint.VolumeSerialNumber,
-                    preparedFingerprint.FileIndex,
-                    preparedFingerprint.Length,
-                    preparedFingerprint.Sha256);
+            if (File.Exists(preparedPath)) File.Delete(preparedPath);
         }
     }
 

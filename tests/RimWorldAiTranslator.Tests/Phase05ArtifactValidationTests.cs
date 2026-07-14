@@ -115,31 +115,9 @@ internal static class Phase05ArtifactValidationTests
                && changedItem.GetProperty("previousSourceText").GetString() == "synthetic previous source",
             "The preserved-translation JSON lost unresolved source-change history.");
         AssertSubstitutedPreserveCleanupIsRejected(service, changedPath, swap: false);
-        var cleanupMutationBlocked = false;
-        try
-        {
-            AtomicTemporaryFiles.BeforePinnedDeleteTestHook = candidate =>
-            {
-                if (!candidate.Equals(changedPath, StringComparison.OrdinalIgnoreCase)) return;
-                try
-                {
-                    File.WriteAllText(candidate, "forged-during-owned-cleanup", StrictUtf8NoBom);
-                    throw new InvalidOperationException(
-                        "The owned preserved-translation file remained writable during pinned deletion.");
-                }
-                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-                {
-                    cleanupMutationBlocked = true;
-                }
-            };
-            service.DeletePreservedTranslations(changedPath);
-        }
-        finally
-        {
-            AtomicTemporaryFiles.BeforePinnedDeleteTestHook = null;
-        }
-        Assert(cleanupMutationBlocked && !File.Exists(changedPath),
-            "Pinned preserved-translation cleanup did not block a final rewrite or complete deletion.");
+        service.DeletePreservedTranslations(changedPath);
+        Assert(!File.Exists(changedPath),
+            "Owned preserved-translation cleanup did not remove the unchanged artifact.");
 
         var unowned = Path.Combine(
             Path.GetDirectoryName(changedPath)!,

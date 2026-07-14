@@ -407,3 +407,13 @@
 - strict Release 빌드는 경고/오류 0/0이다. `Compatibility.LegacyPowerShellProject`, `--phase08-ui-truthfulness`, `--slow-bootstrap`은 모두 PASS했고 전체 회귀는 기능·보안 82/83 PASS다. 유일한 실패는 범위 밖의 기존 `Phase08.ForcedExitRecovery` 1,000-target 성능 계약으로 85.836초/60초였으며 테스트를 완화하거나 성능 작업을 추가하지 않았다.
 - 전달용 로컬 빌드는 `artifacts/local-builds/RimWorldAiTranslator-legacy-compat-win-x64-r7/RimWorldAiTranslator.exe`, 155,589,691 bytes, SHA-256 `55EFBD6A7E5BC780E2B6EEB8FA1D1A4B2783ED826254D7327FD49B5A16456B26`이다. 고유 격리 data/discovery/profile/TEMP에서 5.512초 내 startup acknowledgement, responsive main window, 정상 close/exit 0과 임시 root 제거를 확인했다. 이 빌드는 로컬 전달본이며 RC/Release asset이 아니다.
 - 사용자 지시에 따라 C# 후보를 `main`에 병합하고 수정 커밋 `6a977a16913922313d2da7e0679e3c0983a607a9`까지 `origin/main`에 일반 push했다. `origin/main`이 후보 tip `7e0eb0addd56b41d0b3d1443911f919e7567f406`을 포함함을 확인한 뒤 원격·로컬 `codex/csharp-migration`을 삭제했다. 기존의 분리된 로컬 main은 `backup/local-main-b49f217-20260714`로 보존했다. PR, tag, Release, asset, metadata, Actions와 배포는 변경하지 않았다.
+
+## 2026-07-14 - 로컬 번역기 저장·복구 단순화
+
+- `main` 기준 저장·복구 호출 경로와 보호 목적을 먼저 표로 정리하고, 관리자·악성 로컬 프로세스의 namespace 경쟁, hardlink/file-ID/PID 재사용, 모든 강제 종료 지점 자동 판정, journal 변조와 데이터베이스 수준 다중 파일 원자성을 제품 위협 모델에서 제외했다.
+- 결과는 앱 소유 임시 작업에 만들고 flush·형식 검증한 뒤 같은 볼륨의 대상에 교체한다. 대상과 `.bak`의 시작 snapshot을 보존하고, 오류·취소 시 실제 교체 직후 내용과 같은 파일만 역순 복원한다. 일반 외부 편집이 있으면 해당 파일을 덮어쓰지 않고 충돌로 중단한다.
+- 강제 종료 흔적은 단일 manifest와 `started.marker`로 감지한다. 준비만 된 앱 소유 폴더는 정리하지만 시작된 작업은 자동 commit·자동 추론하지 않는다. 완성된 메인 화면에서 사용자에게 시작 전 백업 복구를 묻고, 복원 I/O는 UI 스레드 밖에서 실행한다. 손상 metadata는 내부 예외명·경로 없이 파일을 변경하지 않았다고 알린다.
+- `AtomicCommitRecoveryPlan`, `FileTransactionRecoveryArtifacts`, target별 reserve/intent/ready/applied/done 및 연쇄 SHA-256 artifact, 디렉터리 guard 파일, 장기 write-boundary handle, hardlink count와 임시 파일용 중복 P/Invoke identity 구현을 제거했다. 핵심 9개 파일 8,127줄·61타입·29훅은 7개 2,781줄·22타입·4훅으로 감소했다.
+- `Storage.SimpleRecoveryThreatModel`과 기존 회귀를 합쳐 새/기존 파일 저장, `.bak`, 두 번째 파일 실패·취소 rollback, 잠금·read-only, 허용 루트 밖·Workshop, XML 검증 실패, JSON 단일 정상 backup/이중 손상, 강제 종료 감지·무단 commit 금지·명시적 restore, 외부 편집 충돌, API key/원문 로그 redaction을 검증했다.
+- synthetic 100-target은 1.649초, 1,000-target은 20.673초로 기존 1,000-target 71.961초보다 71.3% 감소했다. 기존 60초 합격 계약은 제거하고 100개 소형 파일 수 초 이내를 일반 사용 관찰 기준으로 제안했다.
+- 최종 strict Release build는 경고/오류 0/0, 전체 회귀는 80/80 PASS(최종 59.025초)다. 실제 사용자 데이터·API·Workshop/RMK 구독본을 사용하지 않았고 패키지·Release·tag·PR·push·외부 배포는 수행하지 않았다.

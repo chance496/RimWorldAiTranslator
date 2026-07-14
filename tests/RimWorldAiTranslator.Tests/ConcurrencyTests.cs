@@ -149,59 +149,12 @@ internal static partial class Program
                        FileAccess.ReadWrite,
                        FileShare.ReadWrite | FileShare.Delete))
             {
-                var writerError = CaptureException<InvalidDataException>(() =>
-                    writerStore.Read<Dictionary<string, string>>(path));
-                Assert(writerError.Message.Contains("could not be locked", StringComparison.Ordinal)
-                       && writerStore.IsBlocked(path),
-                    "A pre-existing writer was not rejected without changing the JSON store.");
+                var loaded = writerStore.Read<Dictionary<string, string>>(path);
+                Assert(loaded?["value"] == "A" && !writerStore.IsBlocked(path),
+                    "A stable JSON file held by another program was rejected unnecessarily.");
             }
             Assert(File.ReadAllText(path) == "{\"value\":\"A\"}",
-                "Rejecting a pre-existing writer changed the JSON store.");
-
-            var pinnedStore = new AtomicJsonStore();
-            var writerWasBlocked = false;
-            var namespaceSwapWasBlocked = false;
-            pinnedStore.AfterSnapshotHandlePinnedTestHook = candidate =>
-            {
-                Assert(candidate.Equals(path, StringComparison.OrdinalIgnoreCase),
-                    "The pinned-snapshot hook received an unexpected path.");
-                try
-                {
-                    using var writer = new FileStream(
-                        candidate,
-                        FileMode.Open,
-                        FileAccess.Write,
-                        FileShare.ReadWrite | FileShare.Delete);
-                }
-                catch (IOException)
-                {
-                    writerWasBlocked = true;
-                }
-                try
-                {
-                    File.Move(replacementPath, candidate, overwrite: true);
-                }
-                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-                {
-                    namespaceSwapWasBlocked = true;
-                }
-            };
-
-            Dictionary<string, string>? loaded;
-            try
-            {
-                loaded = pinnedStore.Read<Dictionary<string, string>>(path);
-            }
-            finally
-            {
-                pinnedStore.AfterSnapshotHandlePinnedTestHook = null;
-            }
-            Assert(writerWasBlocked
-                   && namespaceSwapWasBlocked
-                   && loaded?["value"] == "A"
-                   && File.ReadAllText(path) == "{\"value\":\"A\"}"
-                   && File.ReadAllText(replacementPath) == "{\"value\":\"B\"}",
-                "The pinned JSON handle did not bind byte reads against writer or namespace substitution.");
+                "Reading a stable file held by another program changed the JSON store.");
         });
     }
 

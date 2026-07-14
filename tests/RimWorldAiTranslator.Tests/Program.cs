@@ -58,11 +58,9 @@ internal static partial class Program
         ("Phase07.NativeActiveContentAndLimits", Phase07NativeActiveContentAndLimits),
         ("Phase08.Reliability", Phase08Reliability),
         ("Phase08.AtomicStorageFaults", Phase08AtomicStorageFaults),
-        ("Phase08.NonDurableFinalEvidenceSubstitution", Phase08NonDurableFinalEvidenceSubstitution),
-        ("Phase08.ExportArtifactBoundaries", Phase08ExportArtifactBoundaries),
         ("Phase08.ProjectLoadCancellation", Phase08ProjectLoadCancellation),
         ("Phase08.MonotonicRateLimiter", Phase08MonotonicRateLimiter),
-        ("Phase08.ForcedExitRecovery", Phase08ForcedExitRecovery),
+        ("Storage.SimpleRecoveryThreatModel", SimpleStorageRecoveryThreatModel),
         ("Phase05.XmlAndReadOnlyRoundTrip", Phase05XmlAndReadOnlyRoundTrip),
         ("Phase05.RmkPackageRoundTrip", Phase05RmkPackageRoundTrip),
         ("Storage.BackupRecovery", StorageBackupRecovery),
@@ -84,7 +82,6 @@ internal static partial class Program
         ("Project.RunRegistrationBoundary", ProjectRunRegistrationBoundary),
         ("Storage.TranslationRunArtifacts", TranslationRunArtifacts),
         ("Storage.AsyncTransactionRollback", AsyncTransactionRollback),
-        ("Storage.TransactionCleanupFaults", StorageTransactionCleanupFaults),
         ("Storage.SettingsAsyncSnapshot", SettingsAsyncSnapshot),
         ("Storage.AtomicJsonBackupSingleRead", AtomicJsonBackupSingleRead),
         ("Storage.ProjectRevisionConcurrency", ProjectRevisionConcurrency),
@@ -129,6 +126,37 @@ internal static partial class Program
 
     private static int Main(string[] args)
     {
+        if (args.Length == 4
+            && args[0].Equals("--simple-storage-crash-child", StringComparison.Ordinal))
+        {
+            return RunSimpleStorageCrashChild(args[1], args[2], args[3]);
+        }
+
+        if (args.Length == 2
+            && args[0].Equals("--simple-storage-benchmark", StringComparison.Ordinal)
+            && int.TryParse(args[1], out var benchmarkTargetCount)
+            && benchmarkTargetCount > 0)
+        {
+            RunSimpleStorageBenchmark(benchmarkTargetCount);
+            return 0;
+        }
+
+        if (args.Length == 1
+            && args[0].Equals("--simple-storage-only", StringComparison.Ordinal))
+        {
+            try
+            {
+                SimpleStorageRecoveryThreatModel();
+                Console.WriteLine("PASS Storage.SimpleRecoveryThreatModel");
+                return 0;
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"FAIL Storage.SimpleRecoveryThreatModel: {exception}");
+                return 1;
+            }
+        }
+
         if (args.Length == 1
             && args[0].Equals("--legacy-compatibility-only", StringComparison.Ordinal))
         {
@@ -145,104 +173,13 @@ internal static partial class Program
             }
         }
 
-        if (args.Length == 3
-            && args[0].Equals("--phase08-atomic-crash-child", StringComparison.Ordinal))
-        {
-            return RunPhase08AtomicCrashChild(args[1], args[2]);
-        }
-
-        if (args.Length == 4
-            && args[0].Equals("--phase08-transaction-crash-child", StringComparison.Ordinal))
-        {
-            return RunPhase08TransactionCrashChild(args[1], args[2], args[3]);
-        }
-
-        if (args.Length == 4
-            && args[0].Equals("--phase08-snapshot-crash-child", StringComparison.Ordinal))
-        {
-            return RunPhase08SnapshotCrashChild(args[1], args[2], args[3]);
-        }
-
-        if (args.Length == 4
-            && args[0].Equals("--phase08-cleanup-crash-child", StringComparison.Ordinal))
-        {
-            return RunPhase08CleanupCrashChild(args[1], args[2], args[3]);
-        }
-
-        if (args.Length == 6
-            && args[0].Equals("--phase08-recovery-stage-child", StringComparison.Ordinal))
-        {
-            return RunPhase08RecoveryStageChild(
-                args[1], args[2], args[3], args[4], int.Parse(args[5], System.Globalization.CultureInfo.InvariantCulture));
-        }
-
-        if (args.Length == 5
-            && args[0].Equals("--phase08-forward-stage-child", StringComparison.Ordinal))
-        {
-            return RunPhase08ForwardStageChild(args[1], args[2], args[3], args[4]);
-        }
-
-        if (args.Length == 5
-            && args[0].Equals("--phase08-publication-stage-child", StringComparison.Ordinal))
-        {
-            return RunPhase08PublicationStageChild(args[1], args[2], args[3], args[4]);
-        }
-
-        if (args.Length == 5
-            && args[0].Equals("--phase08-rmk-unready-child", StringComparison.Ordinal))
-        {
-            return RunPhase08RmkUnreadyChild(args[1], args[2], args[3], args[4]);
-        }
-
-        if (args.Length == 4
-            && args[0].Equals("--phase08-rmk-service-crash-child", StringComparison.Ordinal))
-        {
-            return RunPhase08RmkServiceCrashChild(args[1], args[2], args[3]);
-        }
-
-        if (args.Length == 4
-            && args[0].Equals("--phase08-rmk-builder-service-crash-child", StringComparison.Ordinal))
-        {
-            return RunPhase08RmkBuilderServiceCrashChild(args[1], args[2], args[3]);
-        }
-
-        if (args.Length == 5
-            && args[0].Equals("--phase08-rmk-builder-artifact-crash-child", StringComparison.Ordinal))
-        {
-            return RunPhase08RmkBuilderArtifactCrashChild(args[1], args[2], args[3], args[4]);
-        }
-
-        if (args.Length == 5
-            && args[0].Equals("--phase08-translation-service-crash-child", StringComparison.Ordinal))
-        {
-            return RunPhase08TranslationServiceCrashChild(args[1], args[2], args[3], args[4]);
-        }
-
-        if (args.Length == 1
-            && args[0].Equals("--phase08-recovery-only", StringComparison.Ordinal))
-        {
-            try
-            {
-                Phase08ForcedExitRecovery();
-                Console.WriteLine("PASS Phase08.ForcedExitRecovery");
-                return 0;
-            }
-            catch (Exception exception)
-            {
-                Console.Error.WriteLine($"FAIL Phase08.ForcedExitRecovery: {exception}");
-                return 1;
-            }
-        }
-
         if (args.Length == 1
             && args[0].Equals("--phase08-storage-faults-only", StringComparison.Ordinal))
         {
             try
             {
                 Phase08AtomicStorageFaults();
-                Phase08NonDurableFinalEvidenceSubstitution();
-                Console.WriteLine(
-                    "PASS Phase08.AtomicStorageFaults + Phase08.NonDurableFinalEvidenceSubstitution");
+                Console.WriteLine("PASS Phase08.AtomicStorageFaults");
                 return 0;
             }
             catch (Exception exception)
@@ -253,17 +190,17 @@ internal static partial class Program
         }
 
         if (args.Length == 1
-            && args[0].Equals("--phase07-atomic-race-only", StringComparison.Ordinal))
+            && args[0].Equals("--phase07-native-only", StringComparison.Ordinal))
         {
             try
             {
-                Phase07AtomicCommitRaceRollback();
-                Console.WriteLine("PASS Phase07.AtomicCommitRaceRollback");
+                Phase07NativeArchiveAndWriteBoundary();
+                Console.WriteLine("PASS Phase07.NativeArchiveAndWriteBoundary");
                 return 0;
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine($"FAIL Phase07.AtomicCommitRaceRollback: {exception}");
+                Console.Error.WriteLine($"FAIL Phase07.NativeArchiveAndWriteBoundary: {exception}");
                 return 1;
             }
         }

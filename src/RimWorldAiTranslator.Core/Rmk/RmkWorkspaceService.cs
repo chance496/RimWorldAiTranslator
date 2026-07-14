@@ -1089,11 +1089,7 @@ public sealed partial class RmkWorkspaceService
     {
         try
         {
-            if (!AtomicTemporaryFiles.TryGetOwnedRegularFileIdentity(
-                    stream.SafeFileHandle,
-                    out var volumeSerialNumber,
-                    out var fileIndex)
-                || !PathSafety.Normalize(
+            if (!PathSafety.Normalize(
                         PathSafety.WindowsPathHandle.GetFinalPath(stream.SafeFileHandle))
                     .Equals(lockPath, StringComparison.OrdinalIgnoreCase))
             {
@@ -1382,16 +1378,12 @@ public sealed partial class RmkWorkspaceService
                 FileShare.Read,
                 4096,
                 FileOptions.WriteThrough);
-            if (!AtomicTemporaryFiles.TryGetOwnedRegularFileIdentity(
-                    stream.SafeFileHandle,
-                    out var volumeSerialNumber,
-                    out var fileIndex)
-                || !PathSafety.Normalize(
+            if (!PathSafety.Normalize(
                         PathSafety.WindowsPathHandle.GetFinalPath(stream.SafeFileHandle))
                     .Equals(registrationPath, StringComparison.OrdinalIgnoreCase))
             {
                 throw new IOException(
-                    "The RMK Builder stage ownership record could not be identity-pinned.");
+                    "The RMK Builder stage ownership record is redirected.");
             }
             stream.Write(bytes);
             stream.Flush(true);
@@ -1399,12 +1391,8 @@ public sealed partial class RmkWorkspaceService
                 stageName,
                 stageIdentity,
                 registrationPath,
-                volumeSerialNumber,
-                fileIndex,
                 bytes.LongLength,
-                SHA256.HashData(bytes),
-                stream);
-            stream = null;
+                SHA256.HashData(bytes));
             return ownership;
         }
         finally
@@ -1418,19 +1406,19 @@ public sealed partial class RmkWorkspaceService
         string expectedStageName,
         CancellationToken cancellationToken)
     {
-        using var handle = PathSafety.WindowsPathHandle
-            .OpenFileWithoutWriteOrDeleteSharing(registrationPath);
-        if (!AtomicTemporaryFiles.TryGetOwnedRegularFileIdentity(
-                handle,
-                out var volumeSerialNumber,
-                out var fileIndex)
-            || !PathSafety.Normalize(PathSafety.WindowsPathHandle.GetFinalPath(handle))
+        using var stream = new FileStream(
+            registrationPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            4096,
+            FileOptions.SequentialScan);
+        if (!PathSafety.Normalize(PathSafety.WindowsPathHandle.GetFinalPath(stream.SafeFileHandle))
                 .Equals(PathSafety.Normalize(registrationPath), StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidDataException(
                 $"An RMK Builder stage ownership record is redirected or ambiguous and was preserved: {registrationPath}");
         }
-        using var stream = new FileStream(handle, FileAccess.Read, 4096, isAsync: false);
         var bytes = BoundedFileReader.ReadAllBytes(
             stream,
             512,
@@ -1455,11 +1443,8 @@ public sealed partial class RmkWorkspaceService
             lines[1],
             lines[2],
             PathSafety.Normalize(registrationPath),
-            volumeSerialNumber,
-            fileIndex,
             bytes.LongLength,
-            SHA256.HashData(bytes),
-            lease: null);
+            SHA256.HashData(bytes));
     }
 
     private static void CleanupRegisteredBuilderStage(
@@ -1494,11 +1479,8 @@ public sealed partial class RmkWorkspaceService
         string registrationPath,
         BuilderStageOwnership ownership)
     {
-        ownership.ReleaseLease();
-        if (!AtomicTemporaryFiles.TryDeleteRegularFileByHandle(
+        if (!AtomicTemporaryFiles.TryDeleteRegularFile(
                 registrationPath,
-                ownership.RegistrationVolumeSerialNumber,
-                ownership.RegistrationFileIndex,
                 ownership.RegistrationLength,
                 ownership.RegistrationSha256))
         {
@@ -1553,8 +1535,6 @@ public sealed partial class RmkWorkspaceService
         return expected.Kind == SnapshotLeafKind.File
                && expected.Length == current.Length
                && expected.LastWriteTimeUtcTicks == current.LastWriteTimeUtcTicks
-               && expected.VolumeSerialNumber == current.VolumeSerialNumber
-               && expected.FileIndex == current.FileIndex
                && expected.Sha256 is { Length: 32 }
                && current.Sha256 is { Length: 32 }
                && CryptographicOperations.FixedTimeEquals(expected.Sha256, current.Sha256);
@@ -1627,8 +1607,6 @@ public sealed partial class RmkWorkspaceService
                 NormalizeBuilderRelativePath(input.RelativePath));
             AppendBuilderSourceSeal(hash, fingerprint.Length.ToString(System.Globalization.CultureInfo.InvariantCulture));
             AppendBuilderSourceSeal(hash, fingerprint.LastWriteTimeUtcTicks.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            AppendBuilderSourceSeal(hash, fingerprint.VolumeSerialNumber?.ToString("x8", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty);
-            AppendBuilderSourceSeal(hash, fingerprint.FileIndex?.ToString("x16", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty);
             AppendBuilderSourceSeal(hash, Convert.ToHexString(fingerprint.Sha256));
         }
         return Convert.ToHexString(hash.GetHashAndReset());
@@ -2362,7 +2340,6 @@ public sealed partial class RmkWorkspaceService
             stage.Identity);
         if (!cleanup.Removed)
         {
-            stage.Ownership.ReleaseLease();
             throw new IOException(
                 $"The isolated RMK Builder stage could not be cleaned safely and was preserved: {cleanup.PreservedPath ?? stage.Root}. {cleanup.Failure}");
         }
@@ -2383,6 +2360,12 @@ public sealed partial class RmkWorkspaceService
                                              or UnauthorizedAccessException
                                              or InvalidDataException)
         {
+            if (operationError is OperationCanceledException)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"Cancelled RMK Builder stage cleanup was deferred ({cleanupError.GetType().Name}).");
+                throw operationError;
+            }
             throw new IOException(
                 "RMK Builder failed and its isolated stage could not be cleaned safely. The live indexes were not modified.",
                 new AggregateException(operationError, cleanupError));
@@ -2986,9 +2969,7 @@ public sealed partial class RmkWorkspaceService
                     SnapshotLeafKind.File,
                     bytes.LongLength,
                     SHA256.HashData(bytes),
-                    File.GetLastWriteTimeUtc(fullPath).Ticks,
-                    identity.VolumeSerialNumber,
-                    identity.FileIndex);
+                    File.GetLastWriteTimeUtc(fullPath).Ticks);
                 var result = new PinnedBuilderOutput(fullPath, fingerprint, bytes, stream);
                 stream = null;
                 return result;
@@ -3182,24 +3163,14 @@ public sealed partial class RmkWorkspaceService
         string stageName,
         string stageIdentity,
         string registrationPath,
-        uint registrationVolumeSerialNumber,
-        ulong registrationFileIndex,
         long registrationLength,
-        byte[] registrationSha256,
-        FileStream? lease)
+        byte[] registrationSha256)
     {
-        private FileStream? registrationLease = lease;
-
         public string StageName { get; } = stageName;
         public string StageIdentity { get; } = stageIdentity;
         public string RegistrationPath { get; } = registrationPath;
-        public uint RegistrationVolumeSerialNumber { get; } = registrationVolumeSerialNumber;
-        public ulong RegistrationFileIndex { get; } = registrationFileIndex;
         public long RegistrationLength { get; } = registrationLength;
         public byte[] RegistrationSha256 { get; } = registrationSha256;
-
-        public void ReleaseLease() =>
-            Interlocked.Exchange(ref registrationLease, null)?.Dispose();
     }
 
     private sealed record BuilderStageInput(

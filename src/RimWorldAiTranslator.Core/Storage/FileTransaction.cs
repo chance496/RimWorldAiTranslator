@@ -121,6 +121,7 @@ public static class FileTransaction
                 deleteSnapshot,
                 recoverySession,
                 cancellationToken);
+            recoverySession.AttachJournal(journal);
             activation = recoverySession.Activate();
             action();
             activation.Dispose();
@@ -145,12 +146,7 @@ public static class FileTransaction
             IReadOnlySet<string>? concurrentPaths = operationError is ConcurrentLeafChangeException concurrent
                 ? concurrent.PreservedPaths
                 : null;
-            var rollback = recoverySession.IsEnabled
-                ? recoverySession.RollbackDurably(concurrentPaths)
-                : FileSnapshotJournal.Rollback(
-                    FileSnapshotJournal.CaptureRollbackState(journal, CancellationToken.None),
-                    concurrentPaths,
-                    CancellationToken.None);
+            var rollback = recoverySession.RollbackDurably(concurrentPaths);
             if (rollback.Errors.Count > 0)
             {
                 preserveSnapshots = true;
@@ -161,15 +157,15 @@ public static class FileTransaction
             }
             if (rollback.ConcurrentPaths.Count > 0)
             {
-                preserveSnapshots = true;
-                recoverySession.DetachPreservedEvidence();
+                preserveSnapshots = recoverySession.IsEnabled;
+                if (preserveSnapshots) recoverySession.DetachPreservedEvidence();
                 throw new ConcurrentLeafChangeException(
                     $"{operationName} stopped because rollback detected a concurrent save; current files and recovery snapshots were preserved: {string.Join(" | ", rollback.ConcurrentPaths)}.",
                     operationError,
-                    [.. rollback.ConcurrentPaths, .. rollback.RecoveryPaths]);
+                    preserveSnapshots
+                        ? [.. rollback.ConcurrentPaths, .. rollback.RecoveryPaths]
+                        : [.. rollback.ConcurrentPaths]);
             }
-            if (!recoverySession.IsEnabled)
-                recoverySession.MarkRollbackResolved(CancellationToken.None);
             if (operationError is OperationCanceledException) throw;
             throw new IOException(
                 $"{operationName} failed; all files written by this run were rolled back ({operationError.GetType().Name}).",
@@ -285,6 +281,7 @@ public static class FileTransaction
                 deleteSnapshot,
                 recoverySession,
                 cancellationToken);
+            recoverySession.AttachJournal(journal);
             activation = recoverySession.Activate();
             var result = await action().ConfigureAwait(false);
             activation.Dispose();
@@ -306,11 +303,7 @@ public static class FileTransaction
                     $"{operationName} completed but durable resolution was deferred; recovery evidence was preserved.",
                     operationError);
             }
-            var rollback = recoverySession.IsEnabled
-                ? recoverySession.RollbackDurably()
-                : FileSnapshotJournal.Rollback(
-                    FileSnapshotJournal.CaptureRollbackState(journal, CancellationToken.None),
-                    cancellationToken: CancellationToken.None);
+            var rollback = recoverySession.RollbackDurably();
             if (rollback.Errors.Count > 0)
             {
                 preserveSnapshots = true;
@@ -321,15 +314,15 @@ public static class FileTransaction
             }
             if (rollback.ConcurrentPaths.Count > 0)
             {
-                preserveSnapshots = true;
-                recoverySession.DetachPreservedEvidence();
+                preserveSnapshots = recoverySession.IsEnabled;
+                if (preserveSnapshots) recoverySession.DetachPreservedEvidence();
                 throw new ConcurrentLeafChangeException(
                     $"{operationName} stopped because rollback detected a concurrent save; current files and recovery snapshots were preserved: {string.Join(" | ", rollback.ConcurrentPaths)}.",
                     operationError,
-                    [.. rollback.ConcurrentPaths, .. rollback.RecoveryPaths]);
+                    preserveSnapshots
+                        ? [.. rollback.ConcurrentPaths, .. rollback.RecoveryPaths]
+                        : [.. rollback.ConcurrentPaths]);
             }
-            if (!recoverySession.IsEnabled)
-                recoverySession.MarkRollbackResolved(CancellationToken.None);
             if (operationError is OperationCanceledException) throw;
             throw new IOException(
                 $"{operationName} failed; all files written by this run were rolled back ({operationError.GetType().Name}).",

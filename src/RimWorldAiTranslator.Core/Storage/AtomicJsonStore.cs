@@ -17,7 +17,6 @@ public sealed class AtomicJsonStore
     private readonly long maximumBytes;
 
     internal Action<string>? AfterBackupValidatedTestHook { get; set; }
-    internal Action<string>? AfterSnapshotHandlePinnedTestHook { get; set; }
 
     public AtomicJsonStore(
         JsonSerializerOptions? options = null,
@@ -367,23 +366,16 @@ public sealed class AtomicJsonStore
         Action<SnapshotLeafFingerprint>? snapshotObserver = null,
         CancellationToken cancellationToken = default)
     {
-        using var pinnedHandle = PathSafety.WindowsPathHandle.OpenFileWithoutWriteOrDeleteSharing(path);
-        var identity = PathSafety.WindowsPathHandle.GetIdentity(pinnedHandle);
-        var canonical = Normalize(PathSafety.WindowsPathHandle.GetFinalPath(pinnedHandle));
-        if (!canonical.Equals(Normalize(path), StringComparison.OrdinalIgnoreCase)
-            || identity.FileIndex == 0
-            || identity.NumberOfLinks != 1
-            || (identity.FileAttributes
-                & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
-        {
-            throw new InvalidDataException("JSON store snapshot is not a unique regular file.");
-        }
-        AfterSnapshotHandlePinnedTestHook?.Invoke(path);
+        var attributes = File.GetAttributes(path);
+        if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
+            throw new InvalidDataException("JSON store snapshot is not a regular local file.");
         using var pinnedStream = new FileStream(
-            pinnedHandle,
+            path,
+            FileMode.Open,
             FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
             64 * 1024,
-            isAsync: false);
+            FileOptions.SequentialScan);
         var bytes = BoundedFileReader.ReadAllBytes(
             pinnedStream,
             maximumBytes,
@@ -393,8 +385,7 @@ public sealed class AtomicJsonStore
             SnapshotLeafKind.File,
             bytes.LongLength,
             SHA256.HashData(bytes),
-            VolumeSerialNumber: identity.VolumeSerialNumber,
-            FileIndex: identity.FileIndex);
+            File.GetLastWriteTimeUtc(path).Ticks);
         snapshotObserver?.Invoke(fingerprint);
         var value = (T)ReadValidated(bytes, typeof(T), cancellationToken);
         return new ValidatedJson<T>(value, bytes, fingerprint);
@@ -466,16 +457,9 @@ public sealed class AtomicJsonStore
         {
             SnapshotLeafKind.Missing => true,
             SnapshotLeafKind.Directory =>
-                current.VolumeSerialNumber.HasValue
-                && current.FileIndex.HasValue
-                && current.VolumeSerialNumber == expected.VolumeSerialNumber
-                && current.FileIndex == expected.FileIndex,
+                current.LastWriteTimeUtcTicks == expected.LastWriteTimeUtcTicks,
             SnapshotLeafKind.File =>
                 current.Length == expected.Length
-                && current.VolumeSerialNumber.HasValue
-                && current.FileIndex.HasValue
-                && current.VolumeSerialNumber == expected.VolumeSerialNumber
-                && current.FileIndex == expected.FileIndex
                 && current.Sha256 is { Length: 32 }
                 && expected.Sha256 is { Length: 32 }
                 && CryptographicOperations.FixedTimeEquals(current.Sha256, expected.Sha256),

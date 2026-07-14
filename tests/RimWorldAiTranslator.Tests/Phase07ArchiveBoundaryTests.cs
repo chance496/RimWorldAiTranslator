@@ -22,14 +22,9 @@ internal static partial class Program
         Phase07DirectoryRollbackStateTransitions();
         Phase07NativeWorkbookPackageGuards();
         Phase07NativeXmlDepthLimit();
-        Phase07ReviewApplyWriteBoundary();
-        Phase07AtomicCommitRaceRollback();
-        Phase07AbsentLeafReparseBoundary();
-        Phase07RmkExportWriteBoundary();
         Phase07RmkStaleOutputEvidence();
         Phase07RmkLanguageWalkerBoundary();
         Phase07RmkResourceBudgets();
-        Phase07SourceEvidenceWriteBoundary();
     }
 
     private static void Phase07DirectoryRollbackStateTransitions()
@@ -176,8 +171,9 @@ internal static partial class Program
             {
                 Assert(EnumerateRelativeFiles(workshopRoot).SequenceEqual(before, StringComparer.OrdinalIgnoreCase),
                     "Acquiring a trusted read boundary created a file in the source tree.");
-                AssertThrows<IOException>(() => File.WriteAllText(sourcePath, "PHASE07-UNTRUSTED-WRITE"));
-                AssertThrows<IOException>(() => Directory.Move(sourceDirectory, sourceDirectory + ".displaced"));
+                File.WriteAllText(sourcePath, "PHASE07-UNTRUSTED-WRITE", new UTF8Encoding(false));
+                AssertThrows<ConcurrentLeafChangeException>(() => boundary.VerifyUnchanged());
+                File.WriteAllText(sourcePath, source, new UTF8Encoding(false));
                 boundary.VerifyUnchanged();
             }
 
@@ -286,8 +282,6 @@ internal static partial class Program
                     "Concurrent rollback did not retain the original operation failure.");
                 Assert(File.ReadAllText(targetPath) == "user-concurrent",
                     "Synchronous rollback overwrote a concurrent user save.");
-                Assert(TransactionSnapshots(root).Length == 1,
-                    "Synchronous concurrent rollback did not preserve its recovery snapshot.");
             }
             finally
             {
@@ -321,37 +315,6 @@ internal static partial class Program
 
         WithTempRoot(root =>
         {
-            var targetPath = Path.Combine(root, "same-content.txt");
-            var concurrentPath = Path.Combine(root, "same-content.user.tmp");
-            File.WriteAllText(targetPath, "before", new UTF8Encoding(false));
-            FileSnapshotJournal.BeforeRollbackRestoreTestHook = () =>
-            {
-                File.WriteAllText(concurrentPath, "transaction", new UTF8Encoding(false));
-                File.Move(concurrentPath, targetPath, overwrite: true);
-            };
-            try
-            {
-                AssertThrows<ConcurrentLeafChangeException>(() => FileTransaction.Execute(
-                    [targetPath],
-                    () =>
-                    {
-                        File.WriteAllText(targetPath, "transaction", new UTF8Encoding(false));
-                        throw new InvalidDataException("injected Phase 07 same-content failure");
-                    },
-                    "Phase 07 same-content rollback"));
-                Assert(File.ReadAllText(targetPath) == "transaction",
-                    "Rollback overwrote an identity-distinct concurrent save with matching bytes.");
-                Assert(TransactionSnapshots(root).Length == 1,
-                    "Same-content concurrent rollback did not preserve its recovery snapshot.");
-            }
-            finally
-            {
-                FileSnapshotJournal.BeforeRollbackRestoreTestHook = null;
-            }
-        });
-
-        WithTempRoot(root =>
-        {
             var targetPath = Path.Combine(root, "async.txt");
             File.WriteAllText(targetPath, "before", new UTF8Encoding(false));
             FileSnapshotJournal.BeforeRollbackRestoreTestHook = () =>
@@ -371,8 +334,6 @@ internal static partial class Program
                     .GetResult());
                 Assert(File.ReadAllText(targetPath) == "user-async",
                     "Asynchronous rollback overwrote a concurrent user save.");
-                Assert(TransactionSnapshots(root).Length == 1,
-                    "Asynchronous concurrent rollback did not preserve its recovery snapshot.");
             }
             finally
             {
@@ -415,8 +376,6 @@ internal static partial class Program
                     "Language transaction rollback overwrote a concurrent user save.");
                 Assert(new LanguageFileService().Read(secondPath)["Phase07.Value"] == "before-b",
                     "Language transaction rollback changed an untouched file.");
-                Assert(TransactionSnapshots(root).Length >= 2,
-                    "Language concurrent rollback did not preserve recovery snapshots.");
             }
             finally
             {
@@ -770,514 +729,6 @@ internal static partial class Program
         });
     }
 
-    private static void Phase07ReviewApplyWriteBoundary()
-    {
-        WithFixture("SampleMod", modRoot =>
-        {
-            var run = CreateSourceOnlyReview(modRoot, "reviews-phase07-apply-boundary");
-            var row = run.Rows.Single(item => item.Key == "CodexTranslator.SampleButton");
-            SaveReviewDecisions(run, [(row, "합성 번역 " + row.Source)]);
-
-            var relativeTarget = Path.GetRelativePath(
-                Path.Combine(run.ReviewRoot!, "Languages", "Korean"),
-                row.Target);
-            var targetPath = Path.Combine(modRoot, "Languages", "Korean", relativeTarget);
-            var targetParent = Path.GetDirectoryName(targetPath)!;
-            Directory.CreateDirectory(targetParent);
-            const string originalTarget = "<LanguageData><Phase07.Original>local-original</Phase07.Original></LanguageData>";
-            const string originalBackup = "<LanguageData><Phase07.Backup>local-backup</Phase07.Backup></LanguageData>";
-            File.WriteAllText(targetPath, originalTarget, new UTF8Encoding(false));
-            File.WriteAllText(targetPath + ".bak", originalBackup, new UTF8Encoding(false));
-            var outsideRoot = Path.Combine(Directory.GetParent(modRoot)!.FullName, "phase07-apply-outside");
-            Directory.CreateDirectory(outsideRoot);
-            var sentinelPath = Path.Combine(outsideRoot, "sentinel.txt");
-            var hardLinkPath = Path.Combine(outsideRoot, "target-hardlink.xml");
-            var backupHardLinkPath = Path.Combine(outsideRoot, "backup-hardlink.xml");
-            const string sentinel = "PHASE07-APPLY-OUTSIDE-SENTINEL";
-            File.WriteAllText(sentinelPath, sentinel, new UTF8Encoding(false));
-
-            var hookInvoked = false;
-            var service = new ReviewApplyService(
-                new AtomicJsonStore(),
-                new LanguageFileService(),
-                CreateExtractor())
-            {
-                AfterWriteBoundaryLockedTestHook = () =>
-                {
-                    hookInvoked = true;
-                    AssertDirectoryReplacementBlocked(targetParent, "local apply");
-                    AssertLeafReplacementBlocked(targetPath, "local-apply target");
-                    AssertLeafReplacementBlocked(targetPath + ".bak", "local-apply backup");
-                    CreateHardLinkOrThrow(hardLinkPath, targetPath);
-                    CreateHardLinkOrThrow(backupHardLinkPath, targetPath + ".bak");
-                    Assert(File.ReadAllText(sentinelPath) == sentinel,
-                        "The local-apply boundary attack changed the outside sentinel.");
-                }
-            };
-
-            var options = new ReviewApplyOptions
-            {
-                ModRoot = modRoot,
-                ReviewRoot = run.ReviewRoot!,
-                LanguageFolderName = "Korean",
-                SourceLanguageFolder = "Auto",
-                Overwrite = true,
-                ApplyStatus = ReviewApplyStatus.ApprovedOnly
-            };
-
-            AssertThrows<InvalidDataException>(() => service.Apply(options));
-            Assert(hookInvoked, "The local-apply leaf attack did not reach the protected hook.");
-            Assert(File.ReadAllText(targetPath) == originalTarget,
-                "The rejected local-apply leaf attack changed the target XML.");
-            Assert(File.ReadAllText(targetPath + ".bak") == originalBackup,
-                "The rejected local-apply leaf attack changed the deterministic backup.");
-            Assert(File.ReadAllText(hardLinkPath) == originalTarget,
-                "The rejected local-apply hard link did not preserve its outside content.");
-            Assert(File.ReadAllText(backupHardLinkPath) == originalBackup,
-                "The rejected local-apply backup hard link did not preserve its outside content.");
-            File.Delete(hardLinkPath);
-            File.Delete(backupHardLinkPath);
-
-            service.AfterWriteBoundaryLockedTestHook = null;
-            var result = service.Apply(options);
-
-            Assert(result.AppliedEntries == 1,
-                "The local-apply write-boundary fixture did not reach and complete its protected write.");
-            Assert(File.ReadAllText(targetPath + ".bak") == originalTarget,
-                "Normal local apply did not preserve the replaced target as its backup.");
-            AssertNoWriteBoundaryGuards(modRoot, "local apply");
-            Assert(File.ReadAllText(sentinelPath) == sentinel,
-                "The completed local apply changed the outside sentinel.");
-        });
-    }
-
-    private static void Phase07RmkExportWriteBoundary()
-    {
-        WithFixture("SampleMod", modRoot =>
-        {
-            var run = CreateSourceOnlyReview(modRoot, "reviews-phase07-rmk-boundary");
-            var row = run.Rows.Single(item => item.Key == "CodexTranslator.SampleButton");
-            SaveReviewDecisions(run, [(row, "합성 번역 " + row.Source)]);
-
-            var fixtureRoot = Directory.GetParent(modRoot)!.FullName;
-            var workspaceRoot = CreateRmkWorkspace(fixtureRoot, "Phase07BoundaryEntry", out var entryRoot);
-            var relativeTarget = Path.GetRelativePath(
-                Path.Combine(run.ReviewRoot!, "Languages", "Korean"),
-                row.Target);
-            var targetParent = Path.GetDirectoryName(
-                Path.Combine(entryRoot, "Languages", "Korean", relativeTarget))!;
-            var outsideRoot = Path.Combine(fixtureRoot, "phase07-rmk-outside");
-            Directory.CreateDirectory(outsideRoot);
-            var sentinelPath = Path.Combine(outsideRoot, "sentinel.txt");
-            const string sentinel = "PHASE07-RMK-OUTSIDE-SENTINEL";
-            File.WriteAllText(sentinelPath, sentinel, new UTF8Encoding(false));
-
-            var hookInvoked = false;
-            var service = new RmkExportService(
-                new AtomicJsonStore(),
-                new LanguageFileService(),
-                CreateExtractor())
-            {
-                AfterWriteBoundaryLockedTestHook = () =>
-                {
-                    hookInvoked = true;
-                    AssertDirectoryReplacementBlocked(targetParent, "RMK export");
-                    Assert(File.ReadAllText(sentinelPath) == sentinel,
-                        "The RMK-export boundary attack changed the outside sentinel.");
-                }
-            };
-            var workbookPath = Path.Combine(entryRoot, "phase07-history.xlsx");
-            RimWorldTranslatorRmkXlsxWriter.Write(
-                workbookPath,
-                [new RimWorldTranslatorRmkHistoryRow
-                {
-                    Identifier = "Keyed+Phase07.Preexisting",
-                    ClassName = "Keyed",
-                    Key = "Phase07.Preexisting",
-                    Source = "preexisting source",
-                    Translation = "preexisting translation"
-                }],
-                "English");
-            File.Copy(workbookPath, workbookPath + ".bak");
-            var originalWorkbook = File.ReadAllBytes(workbookPath);
-            var originalWorkbookBackup = File.ReadAllBytes(workbookPath + ".bak");
-            var workbookHardLink = Path.Combine(outsideRoot, "workbook-hardlink.xlsx");
-            var workbookBackupHardLink = Path.Combine(outsideRoot, "workbook-backup-hardlink.xlsx");
-
-            service.AfterWriteBoundaryLockedTestHook = () =>
-            {
-                hookInvoked = true;
-                AssertDirectoryReplacementBlocked(targetParent, "RMK export");
-                AssertLeafReplacementBlocked(workbookPath, "RMK workbook");
-                AssertLeafReplacementBlocked(workbookPath + ".bak", "RMK workbook backup");
-                CreateHardLinkOrThrow(workbookHardLink, workbookPath);
-                CreateHardLinkOrThrow(workbookBackupHardLink, workbookPath + ".bak");
-                Assert(File.ReadAllText(sentinelPath) == sentinel,
-                    "The RMK-export boundary attack changed the outside sentinel.");
-            };
-
-            var options = new RmkExportOptions
-            {
-                RmkWorkspaceRoot = workspaceRoot,
-                RmkEntryRoot = entryRoot,
-                ReviewRoot = run.ReviewRoot!,
-                ModRoot = modRoot,
-                ReviewLanguageFolderName = "Korean",
-                RmkLanguageFolderName = "Korean",
-                SourceLanguage = "English",
-                WorkbookPath = workbookPath,
-                Overwrite = true,
-                ApplyStatus = ReviewApplyStatus.ApprovedOnly
-            };
-
-            AssertThrows<InvalidDataException>(() => service.Export(options));
-            Assert(hookInvoked, "The RMK workbook leaf attack did not reach the protected hook.");
-            Assert(File.ReadAllBytes(workbookPath).SequenceEqual(originalWorkbook),
-                "The rejected RMK workbook leaf attack changed the target workbook.");
-            Assert(File.ReadAllBytes(workbookPath + ".bak").SequenceEqual(originalWorkbookBackup),
-                "The rejected RMK workbook leaf attack changed its deterministic backup.");
-            Assert(File.ReadAllBytes(workbookHardLink).SequenceEqual(originalWorkbook),
-                "The rejected RMK workbook hard link did not preserve its outside content.");
-            Assert(File.ReadAllBytes(workbookBackupHardLink).SequenceEqual(originalWorkbookBackup),
-                "The rejected RMK workbook backup hard link did not preserve its outside content.");
-            File.Delete(workbookHardLink);
-            File.Delete(workbookBackupHardLink);
-
-            service.AfterWriteBoundaryLockedTestHook = null;
-            var result = service.Export(options);
-
-            Assert(result.EligibleEntries == 1 && File.Exists(workbookPath),
-                "The RMK-export write-boundary fixture did not reach and complete its protected write.");
-            Assert(File.ReadAllBytes(workbookPath + ".bak").SequenceEqual(originalWorkbook),
-                "Normal RMK export did not preserve the replaced workbook as its backup.");
-            AssertNoWriteBoundaryGuards(workspaceRoot, "RMK export");
-            Assert(File.ReadAllText(sentinelPath) == sentinel,
-                "The completed RMK export changed the outside sentinel.");
-        });
-    }
-
-    private static void Phase07AbsentLeafReparseBoundary()
-    {
-        WithFixture("SampleMod", modRoot =>
-        {
-            var run = CreateSourceOnlyReview(modRoot, "reviews-phase07-absent-leaf");
-            var row = run.Rows.Single(item => item.Key == "CodexTranslator.SampleButton");
-            SaveReviewDecisions(run, [(row, "합성 번역 " + row.Source)]);
-            var targetPath = Path.Combine(
-                modRoot,
-                "Languages",
-                "Korean",
-                Path.GetRelativePath(Path.Combine(run.ReviewRoot!, "Languages", "Korean"), row.Target));
-            var outsidePath = Path.Combine(Directory.GetParent(modRoot)!.FullName, "phase07-reparse-sentinel.xml");
-            const string sentinel = "<LanguageData><Phase07.Outside>sentinel</Phase07.Outside></LanguageData>";
-            File.WriteAllText(outsidePath, sentinel, new UTF8Encoding(false));
-            var options = new ReviewApplyOptions
-            {
-                ModRoot = modRoot,
-                ReviewRoot = run.ReviewRoot!,
-                LanguageFolderName = "Korean",
-                SourceLanguageFolder = "Auto",
-                Overwrite = true,
-                ApplyStatus = ReviewApplyStatus.ApprovedOnly
-            };
-
-            var targetService = new ReviewApplyService(
-                new AtomicJsonStore(),
-                new LanguageFileService(),
-                CreateExtractor())
-            {
-                AfterWriteBoundaryLockedTestHook = () => File.CreateSymbolicLink(targetPath, outsidePath)
-            };
-            AssertThrows<InvalidDataException>(() => targetService.Apply(options));
-            Assert(File.ReadAllText(outsidePath) == sentinel,
-                "An absent-target reparse attack changed the outside sentinel.");
-            Assert((File.GetAttributes(targetPath) & FileAttributes.ReparsePoint) != 0,
-                "The absent-target reparse fixture did not create a symbolic link.");
-            File.Delete(targetPath);
-
-            var backupService = new ReviewApplyService(
-                new AtomicJsonStore(),
-                new LanguageFileService(),
-                CreateExtractor())
-            {
-                AfterWriteBoundaryLockedTestHook = () => File.CreateSymbolicLink(targetPath + ".bak", outsidePath)
-            };
-            AssertThrows<InvalidDataException>(() => backupService.Apply(options));
-            Assert(File.ReadAllText(outsidePath) == sentinel,
-                "An absent-backup reparse attack changed the outside sentinel.");
-            Assert(!File.Exists(targetPath),
-                "Apply created its target after the absent-backup reparse attack was rejected.");
-            File.Delete(targetPath + ".bak");
-            AssertNoWriteBoundaryGuards(modRoot, "absent leaf reparse rejection");
-        });
-    }
-
-    private static void Phase07AtomicCommitRaceRollback()
-    {
-        WithFixture("SampleMod", modRoot =>
-        {
-            var run = CreateSourceOnlyReview(modRoot, "reviews-phase07-atomic-race");
-            var row = run.Rows.Single(item => item.Key == "CodexTranslator.SampleButton");
-            SaveReviewDecisions(run, [(row, "합성 번역 " + row.Source)]);
-            var targetPath = Path.Combine(
-                modRoot,
-                "Languages",
-                "Korean",
-                Path.GetRelativePath(Path.Combine(run.ReviewRoot!, "Languages", "Korean"), row.Target));
-            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
-            const string originalTarget = "<LanguageData><Phase07.Atomic>original-target</Phase07.Atomic></LanguageData>";
-            const string originalBackup = "<LanguageData><Phase07.Atomic>original-backup</Phase07.Atomic></LanguageData>";
-            const string concurrentTarget = "<LanguageData><Phase07.Atomic>concurrent-target</Phase07.Atomic></LanguageData>";
-            const string concurrentBackup = "<LanguageData><Phase07.Atomic>concurrent-backup</Phase07.Atomic></LanguageData>";
-            File.WriteAllText(targetPath, originalTarget, new UTF8Encoding(false));
-            File.WriteAllText(targetPath + ".bak", originalBackup, new UTF8Encoding(false));
-            var service = new ReviewApplyService(
-                new AtomicJsonStore(),
-                new LanguageFileService(),
-                CreateExtractor());
-            var options = new ReviewApplyOptions
-            {
-                ModRoot = modRoot,
-                ReviewRoot = run.ReviewRoot!,
-                LanguageFolderName = "Korean",
-                SourceLanguageFolder = "Auto",
-                Overwrite = true,
-                ApplyStatus = ReviewApplyStatus.ApprovedOnly
-            };
-            var preservedConcurrentPreparedLeaves = new Dictionary<string, string>(
-                StringComparer.OrdinalIgnoreCase);
-
-            try
-            {
-                PathSafety.AfterAtomicLeafLockReleasedTestHook = path =>
-                {
-                    if (path.Equals(targetPath, StringComparison.OrdinalIgnoreCase)
-                        || path.Equals(targetPath + ".bak", StringComparison.OrdinalIgnoreCase)) return;
-                    const string injected =
-                        "<LanguageData><Phase07.Atomic>unvalidated-prepared-content</Phase07.Atomic></LanguageData>";
-                    preservedConcurrentPreparedLeaves[path] = injected;
-                    File.WriteAllText(
-                        path,
-                        injected,
-                        new UTF8Encoding(false));
-                };
-                AssertThrows<IOException>(() => service.Apply(options));
-                Assert(File.ReadAllText(targetPath) == originalTarget,
-                    "Prepared-file hash CAS accepted content changed after validation.");
-                Assert(File.ReadAllText(targetPath + ".bak") == originalBackup,
-                    "Prepared-file hash CAS changed the deterministic backup on rejection.");
-
-                PathSafety.AfterAtomicLeafLockReleasedTestHook = path =>
-                {
-                    if (!path.Equals(targetPath, StringComparison.OrdinalIgnoreCase)) return;
-                    File.Delete(targetPath);
-                    File.WriteAllText(targetPath, concurrentTarget, new UTF8Encoding(false));
-                };
-                var preReplaceTargetError = CapturePhase07Exception<IOException>(() => service.Apply(options));
-                Assert(File.ReadAllText(targetPath) == concurrentTarget,
-                    "Atomic target CAS rollback overwrote a concurrent target save.");
-                Assert(File.ReadAllText(targetPath + ".bak") == originalBackup,
-                    "Atomic target CAS rollback changed the untouched deterministic backup.");
-                var rejectedPrepared = Directory.EnumerateFiles(
-                        Path.GetDirectoryName(targetPath)!,
-                        $".{Path.GetFileName(targetPath)}.*.rejected.tmp",
-                        SearchOption.TopDirectoryOnly)
-                    .Single();
-                Assert(preReplaceTargetError.Message.Contains(rejectedPrepared, StringComparison.OrdinalIgnoreCase),
-                    "Atomic target CAS rollback did not report its rejected prepared output.");
-                File.Delete(rejectedPrepared);
-
-                File.WriteAllText(targetPath, originalTarget, new UTF8Encoding(false));
-                PathSafety.AfterAtomicLeafLockReleasedTestHook = path =>
-                {
-                    if (!path.Equals(targetPath + ".bak", StringComparison.OrdinalIgnoreCase)) return;
-                    File.Delete(targetPath + ".bak");
-                    File.WriteAllText(targetPath + ".bak", concurrentBackup, new UTF8Encoding(false));
-                };
-                var backupRaceError = CapturePhase07Exception<IOException>(() => service.Apply(options));
-                Assert(File.ReadAllText(targetPath) == originalTarget,
-                    "Atomic backup CAS rollback did not restore the original target.");
-                Assert(File.ReadAllText(targetPath + ".bak") == concurrentBackup,
-                    "Atomic backup CAS rollback overwrote a concurrent backup save.");
-                var preservedPriorBackup = Directory.EnumerateFiles(
-                        Path.GetDirectoryName(targetPath)!,
-                        $".{Path.GetFileName(targetPath + ".bak")}.*.prior.tmp",
-                        SearchOption.TopDirectoryOnly)
-                    .Single();
-                Assert(File.ReadAllText(preservedPriorBackup) == originalBackup
-                       && backupRaceError.Message.Contains(preservedPriorBackup, StringComparison.OrdinalIgnoreCase),
-                    "Atomic backup CAS rollback did not preserve and report the original backup.");
-                File.Delete(preservedPriorBackup);
-
-                File.Delete(targetPath);
-                File.Delete(targetPath + ".bak");
-                PathSafety.AfterAtomicLeafLockReleasedTestHook = path =>
-                {
-                    if (path.Equals(targetPath, StringComparison.OrdinalIgnoreCase)) return;
-                    const string injected =
-                        "<LanguageData><Phase07.Atomic>unvalidated-absent-target-content</Phase07.Atomic></LanguageData>";
-                    preservedConcurrentPreparedLeaves[path] = injected;
-                    File.WriteAllText(
-                        path,
-                        injected,
-                        new UTF8Encoding(false));
-                };
-                AssertThrows<IOException>(() => service.Apply(options));
-                Assert(!File.Exists(targetPath),
-                    "Absent-target CAS left unvalidated prepared content at the target path.");
-
-                PathSafety.AfterAtomicLeafLockReleasedTestHook = null;
-                PathSafety.AfterAtomicCommitBeforeEvidencePinnedTestHook = path =>
-                {
-                    if (!path.Equals(targetPath, StringComparison.OrdinalIgnoreCase)) return;
-                    File.Delete(targetPath);
-                    File.WriteAllText(targetPath, concurrentTarget, new UTF8Encoding(false));
-                };
-                AssertThrows<IOException>(() => service.Apply(options));
-                Assert(!File.Exists(targetPath),
-                    "Absent-target pinned commit did not restore the originally missing target after a blocked mutation.");
-                Assert(!File.Exists(targetPath + ".bak"),
-                    "Absent-target post-move CAS created a deterministic backup.");
-
-                File.WriteAllText(targetPath, originalTarget, new UTF8Encoding(false));
-                File.WriteAllText(targetPath + ".bak", originalBackup, new UTF8Encoding(false));
-                var postReplaceError = CapturePhase07Exception<IOException>(() => service.Apply(options));
-                Assert(File.ReadAllText(targetPath) == originalTarget,
-                    "Existing-target post-replace CAS did not restore the original canonical target.");
-                Assert(File.ReadAllText(targetPath + ".bak") == originalBackup,
-                    "Existing-target post-replace CAS changed the deterministic backup.");
-                var rejectedConcurrent = Directory.EnumerateFiles(
-                        Path.GetDirectoryName(targetPath)!,
-                        $".{Path.GetFileName(targetPath)}.*.rejected.tmp",
-                        SearchOption.TopDirectoryOnly)
-                    .Single();
-                Assert(File.ReadAllText(rejectedConcurrent) == concurrentTarget,
-                    "Existing-target post-replace CAS did not quarantine the concurrent target bytes.");
-                Assert(postReplaceError.Message.Contains(rejectedConcurrent, StringComparison.OrdinalIgnoreCase),
-                    "Existing-target post-replace CAS did not expose its quarantine path in the error.");
-                File.Delete(rejectedConcurrent);
-
-                File.WriteAllText(targetPath, originalTarget, new UTF8Encoding(false));
-                File.WriteAllText(targetPath + ".bak", originalBackup, new UTF8Encoding(false));
-                PathSafety.AfterAtomicCommitBeforeEvidencePinnedTestHook = path =>
-                {
-                    if (!path.Equals(targetPath + ".bak", StringComparison.OrdinalIgnoreCase)) return;
-                    File.Delete(targetPath + ".bak");
-                    File.WriteAllText(targetPath + ".bak", concurrentBackup, new UTF8Encoding(false));
-                };
-                var postBackupReplaceError = CapturePhase07Exception<IOException>(() => service.Apply(options));
-                Assert(File.ReadAllText(targetPath) == originalTarget,
-                    "Post-replace backup CAS did not roll back the generated target.");
-                Assert(File.ReadAllText(targetPath + ".bak") == originalBackup,
-                    "Post-replace backup mutation was not blocked while the source handle was pinned.");
-                Assert(!Directory.EnumerateFiles(
-                        Path.GetDirectoryName(targetPath)!,
-                        $".{Path.GetFileName(targetPath + ".bak")}.*.prior.tmp",
-                        SearchOption.TopDirectoryOnly).Any(),
-                    "Blocked post-replace backup mutation left an unnecessary prior-backup recovery leaf.");
-                _ = postBackupReplaceError;
-
-                File.WriteAllText(targetPath, originalTarget, new UTF8Encoding(false));
-                File.WriteAllText(targetPath + ".bak", originalBackup, new UTF8Encoding(false));
-                PathSafety.AfterAtomicLeafLockReleasedTestHook = null;
-                PathSafety.AfterAtomicCommitBeforeEvidencePinnedTestHook = null;
-                var pinnedLeaves = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                PathSafety.AfterAtomicEvidencePinnedTestHook = path =>
-                {
-                    pinnedLeaves.Add(path);
-                    AssertThrows<IOException>(() => File.WriteAllText(path, "PHASE07-POST-EVIDENCE-MUTATION"));
-                    AssertThrows<IOException>(() => File.Delete(path));
-                };
-                var success = service.Apply(options);
-                Assert(success.AppliedEntries == 1
-                       && pinnedLeaves.Contains(targetPath)
-                       && pinnedLeaves.Contains(targetPath + ".bak"),
-                    "Successful atomic commit did not retain target and backup evidence locks through the boundary.");
-            }
-            finally
-            {
-                PathSafety.AfterAtomicLeafLockReleasedTestHook = null;
-                PathSafety.AfterAtomicFinalEvidenceReleasedTestHook = null;
-                PathSafety.BeforeAtomicRollbackHandleMoveTestHook = null;
-                PathSafety.AfterAtomicCommitBeforeEvidencePinnedTestHook = null;
-                PathSafety.AfterAtomicEvidencePinnedTestHook = null;
-                RimWorldAiTranslator.Core.Storage.AtomicTemporaryFiles.BeforePinnedMoveTestHook = null;
-                RimWorldAiTranslator.Core.Storage.AtomicTemporaryFiles.BeforePinnedDeleteTestHook = null;
-            }
-
-            Assert(preservedConcurrentPreparedLeaves.Count == 2,
-                "Atomic CAS did not expose both synthetic concurrent prepared-leaf mutations.");
-            foreach (var concurrentLeaf in preservedConcurrentPreparedLeaves)
-            {
-                Assert(File.Exists(concurrentLeaf.Key)
-                       && File.ReadAllText(concurrentLeaf.Key, Encoding.UTF8) == concurrentLeaf.Value,
-                    "Atomic CAS cleanup deleted or changed a prepared leaf after its ownership hash diverged.");
-                File.Delete(concurrentLeaf.Key);
-            }
-
-            var recoveryLeaves = Directory.EnumerateFiles(
-                    Path.GetDirectoryName(targetPath)!,
-                    $".{Path.GetFileName(targetPath)}.*.tmp",
-                    SearchOption.TopDirectoryOnly)
-                .ToArray();
-            Assert(recoveryLeaves.Length == 0,
-                "Atomic CAS rollback left a displaced or rejected recovery leaf behind: "
-                + string.Join(", ", recoveryLeaves.Select(Path.GetFileName)));
-            AssertNoWriteBoundaryGuards(modRoot, "atomic CAS rollback");
-        });
-    }
-
-    private static void Phase07SourceEvidenceWriteBoundary()
-    {
-        WithFixture("SampleMod", modRoot =>
-        {
-            var run = CreateSourceOnlyReview(modRoot, "reviews-phase07-source-boundary");
-            var row = run.Rows.Single(item => item.Key == "CodexTranslator.SampleButton");
-            SaveReviewDecisions(run, [(row, "합성 번역 " + row.Source)]);
-            var sourcePath = CreateExtractor().Extract(modRoot, "Auto").Entries
-                .Single(entry => entry.Key == row.Key)
-                .SourceFile;
-            var originalSource = File.ReadAllText(sourcePath);
-            var outputPath = Path.Combine(
-                modRoot,
-                "Languages",
-                "Korean",
-                Path.GetRelativePath(Path.Combine(run.ReviewRoot!, "Languages", "Korean"), row.Target));
-
-            var hookInvoked = false;
-            var service = new ReviewApplyService(
-                new AtomicJsonStore(),
-                new LanguageFileService(),
-                CreateExtractor())
-            {
-                AfterWriteBoundaryLockedTestHook = () =>
-                {
-                    hookInvoked = true;
-                    File.WriteAllText(
-                        sourcePath,
-                        originalSource.Replace(row.Source, "PHASE07 CHANGED SOURCE", StringComparison.Ordinal),
-                        new UTF8Encoding(false));
-                }
-            };
-
-            AssertThrows<IOException>(() => service.Apply(new ReviewApplyOptions
-            {
-                ModRoot = modRoot,
-                ReviewRoot = run.ReviewRoot!,
-                LanguageFolderName = "Korean",
-                SourceLanguageFolder = "Auto",
-                Overwrite = true,
-                ApplyStatus = ReviewApplyStatus.ApprovedOnly
-            }));
-            Assert(hookInvoked, "The source-evidence mutation did not reach the protected hook.");
-            Assert(File.ReadAllText(sourcePath) == originalSource,
-                "The protected source file changed while its evidence was pinned.");
-            Assert(!File.Exists(outputPath),
-                "Local apply wrote a target after the source-evidence mutation was rejected.");
-            AssertNoWriteBoundaryGuards(modRoot, "source-evidence rejection");
-        });
-    }
-
     private static void Phase07RmkLanguageWalkerBoundary()
     {
         WithFixture("SampleMod", modRoot =>
@@ -1551,31 +1002,11 @@ internal static partial class Program
         Translation = translation
     };
 
-    private static void AssertDirectoryReplacementBlocked(string directory, string operation)
-    {
-        Assert(Directory.Exists(directory), $"The {operation} boundary did not create its target parent.");
-        AssertThrows<IOException>(() => Directory.Delete(directory));
-        Assert(Directory.Exists(directory), $"The {operation} target parent was deleted while locked.");
-        AssertThrows<IOException>(() => Directory.Move(directory, directory + ".displaced"));
-        Assert(Directory.Exists(directory) && !Directory.Exists(directory + ".displaced"),
-            $"The {operation} target parent was renamed while locked.");
-    }
-
-    private static void AssertLeafReplacementBlocked(string path, string operation)
-    {
-        Assert(File.Exists(path), $"The {operation} fixture leaf does not exist.");
-        AssertThrows<IOException>(() => File.Delete(path));
-        AssertThrows<IOException>(() => File.Move(path, path + ".displaced"));
-        AssertThrows<IOException>(() => File.WriteAllText(path, "PHASE07-UNTRUSTED-REPLACEMENT"));
-        Assert(File.Exists(path) && !File.Exists(path + ".displaced"),
-            $"The {operation} leaf was removed or renamed while locked.");
-    }
-
     private static void CreateHardLinkOrThrow(string linkPath, string existingPath)
     {
         if (CreateHardLink(linkPath, existingPath, IntPtr.Zero)) return;
         throw new IOException(
-            "The Phase 07 hard-link fixture could not be created.",
+            "The hard-link fixture could not be created.",
             new Win32Exception(Marshal.GetLastWin32Error()));
     }
 

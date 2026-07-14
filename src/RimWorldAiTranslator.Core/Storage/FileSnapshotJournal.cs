@@ -16,8 +16,6 @@ internal sealed record SnapshotLeafFingerprint(
     long Length = 0,
     byte[]? Sha256 = null,
     long LastWriteTimeUtcTicks = 0,
-    uint? VolumeSerialNumber = null,
-    ulong? FileIndex = null,
     string? Failure = null);
 
 internal sealed record FileSnapshotEntry(
@@ -48,13 +46,7 @@ internal static class FileSnapshotJournal
         Action<string, string> copySnapshot,
         Action<string> deleteSnapshot,
         CancellationToken cancellationToken = default) =>
-        Capture(
-            paths,
-            operationName,
-            copySnapshot,
-            deleteSnapshot,
-            null,
-            cancellationToken);
+        Capture(paths, operationName, copySnapshot, deleteSnapshot, null, cancellationToken);
 
     internal static FileSnapshotEntry[] Capture(
         IEnumerable<string> paths,
@@ -66,45 +58,44 @@ internal static class FileSnapshotJournal
     {
         var entries = new List<FileSnapshotEntry>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string? localTransactionRoot = null;
         long aggregateBytes = 0;
-        var targetCount = 0;
         try
         {
+            var targetCount = 0;
             foreach (var rawPath in paths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                targetCount++;
-                if (targetCount > MaximumSnapshotTargets)
+                if (++targetCount > MaximumSnapshotTargets)
                     throw new InvalidDataException(
                         $"Snapshot target count exceeds the {MaximumSnapshotTargets:N0}-target limit.");
-                var targetPath = Path.GetFullPath(rawPath);
-                foreach (var path in new[] { targetPath, targetPath + ".bak" })
+                var target = Path.GetFullPath(rawPath);
+                foreach (var path in new[] { target, target + ".bak" })
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
                     if (!seen.Add(path)) continue;
-                    var initialState = CaptureInitialState(path);
-                    var existed = initialState.Kind == SnapshotLeafKind.File;
-                    string? snapshot = null;
-                    long sourceLength = 0;
-                    if (existed)
+                    var initial = CaptureRecoveryFingerprint(path, cancellationToken);
+                    if (initial.Kind == SnapshotLeafKind.File)
                     {
-                        sourceLength = new FileInfo(path).Length;
-                        ValidateSnapshotLength(path, sourceLength, ref aggregateBytes);
-                        var directory = Path.GetDirectoryName(path)
-                            ?? throw new InvalidDataException($"Snapshot target has no parent directory: {path}");
-                        snapshot = Path.Combine(directory, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.transaction.bak");
+                        aggregateBytes = checked(aggregateBytes + initial.Length);
+                        if (aggregateBytes > PathSafety.MaximumTrustedBoundaryBytes)
+                            throw new InvalidDataException("Transaction backups exceed the aggregate size limit.");
                     }
-
-                    entries.Add(new FileSnapshotEntry(path, initialState, snapshot));
+                    entries.Add(new FileSnapshotEntry(path, initial, null));
                 }
             }
 
             if (recoverySession?.IsEnabled == true)
             {
-                entries = [.. recoverySession.PrepareCapture(
-                    entries,
-                    operationName,
-                    cancellationToken)];
+                entries = [.. recoverySession.PrepareCapture(entries, operationName, cancellationToken)];
+            }
+            else if (entries.Any(entry => entry.Existed))
+            {
+                localTransactionRoot = CreateLocalTransactionDirectory();
+                var backups = Path.Combine(localTransactionRoot, "backups");
+                entries = entries.Select((entry, index) => entry.Existed
+                        ? entry with { SnapshotPath = Path.Combine(backups, $"{index:D5}.bin") }
+                        : entry)
+                    .ToList();
             }
 
             for (var index = 0; index < entries.Count; index++)
@@ -113,22 +104,9 @@ internal static class FileSnapshotJournal
                 var entry = entries[index];
                 if (entry.SnapshotPath is null) continue;
                 if (recoverySession?.IsEnabled == true)
-                {
-                    recoverySession.CopySnapshot(
-                        entry,
-                        index,
-                        copySnapshot,
-                        cancellationToken);
-                }
+                    recoverySession.CopySnapshot(entry, index, copySnapshot, cancellationToken);
                 else
-                {
-                    copySnapshot(entry.Path, entry.SnapshotPath);
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var snapshotState = CaptureRecoveryFingerprint(entry.SnapshotPath, cancellationToken);
-                    if (!HasSameContent(entry.InitialState, snapshotState))
-                        throw new InvalidDataException(
-                            $"Snapshot source changed while it was being captured: {Path.GetFileName(entry.Path)}");
-                }
+                    CopyAndVerifySnapshot(entry, copySnapshot, cancellationToken);
             }
             recoverySession?.CompleteCapture(entries, cancellationToken);
             return entries.ToArray();
@@ -139,57 +117,93 @@ internal static class FileSnapshotJournal
                 entries,
                 deleteSnapshot,
                 preserveSnapshots: recoverySession?.ShouldPreserveSnapshots == true,
-                "snapshot capture");
+                "snapshot capture").ToList();
+            if (localTransactionRoot is not null)
+                TryDeleteEmptyLocalTransaction(localTransactionRoot, cleanupFailures);
             if (cleanupFailures.Count > 0)
             {
                 throw new IOException(
-                    $"{operationName} snapshot capture failed ({captureError.GetType().Name}). Recovery snapshot cleanup was incomplete: {string.Join(" | ", cleanupFailures)}",
+                    $"{operationName} snapshot capture failed and temporary backup cleanup was incomplete.",
                     captureError);
             }
-            if (recoverySession?.ShouldPreserveSnapshots == true)
-                throw new IOException(
-                    $"{operationName} snapshot capture failed; durable recovery evidence was preserved ({captureError.GetType().Name}).",
-                    captureError);
             if (captureError is OperationCanceledException) throw;
-            throw new IOException(
-                $"{operationName} snapshot capture failed; all partial snapshots were cleaned up ({captureError.GetType().Name}).",
-                captureError);
+            throw new IOException($"{operationName} snapshot capture failed.", captureError);
         }
     }
 
     public static FileRollbackEntry[] CaptureRollbackState(
         IEnumerable<FileSnapshotEntry> entries,
-        CancellationToken cancellationToken = default)
-    {
-        var result = new List<FileRollbackEntry>();
-        long aggregateBytes = 0;
-        foreach (var entry in entries)
+        CancellationToken cancellationToken = default) =>
+        entries.Select(entry =>
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            SnapshotLeafFingerprint fingerprint;
             try
             {
-                fingerprint = CaptureFingerprint(entry.Path, ref aggregateBytes, cancellationToken);
+                return new FileRollbackEntry(
+                    entry,
+                    CaptureRecoveryFingerprint(entry.Path, cancellationToken));
             }
             catch (Exception exception) when (exception is IOException
                                               or UnauthorizedAccessException
                                               or InvalidDataException)
             {
-                fingerprint = new SnapshotLeafFingerprint(
-                    SnapshotLeafKind.Unstable,
-                    Failure: exception.GetType().Name);
+                return new FileRollbackEntry(
+                    entry,
+                    new SnapshotLeafFingerprint(
+                        SnapshotLeafKind.Unstable,
+                        Failure: exception.GetType().Name));
             }
-            result.Add(new FileRollbackEntry(entry, fingerprint));
-        }
-        return result.ToArray();
-    }
+        }).ToArray();
 
     internal static SnapshotLeafFingerprint CaptureRecoveryFingerprint(
         string path,
         CancellationToken cancellationToken = default)
     {
-        long aggregateBytes = 0;
-        return CaptureFingerprint(Path.GetFullPath(path), ref aggregateBytes, cancellationToken);
+        var fullPath = Path.GetFullPath(path);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (Directory.Exists(fullPath))
+        {
+            if (File.Exists(fullPath))
+                throw new InvalidDataException("A transaction path is both a file and a directory.");
+            var attributes = File.GetAttributes(fullPath);
+            if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
+                throw new InvalidDataException("A transaction directory is redirected.");
+            return new SnapshotLeafFingerprint(
+                SnapshotLeafKind.Directory,
+                LastWriteTimeUtcTicks: Directory.GetLastWriteTimeUtc(fullPath).Ticks);
+        }
+        if (!File.Exists(fullPath)) return new SnapshotLeafFingerprint(SnapshotLeafKind.Missing);
+
+        var fileAttributes = File.GetAttributes(fullPath);
+        if ((fileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
+            throw new InvalidDataException("Transaction backups require a regular local file.");
+        using var stream = new FileStream(
+            fullPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            64 * 1024,
+            FileOptions.SequentialScan);
+        if (stream.Length > PathSafety.MaximumTrustedLeafBytes)
+            throw new InvalidDataException(
+                $"Transaction file exceeds the {PathSafety.MaximumTrustedLeafBytes:N0}-byte limit.");
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[64 * 1024];
+        long total = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var read = stream.Read(buffer, 0, buffer.Length);
+            if (read == 0) break;
+            total = checked(total + read);
+            if (total > PathSafety.MaximumTrustedLeafBytes)
+                throw new InvalidDataException("A transaction file grew beyond its size limit.");
+            hash.AppendData(buffer, 0, read);
+        }
+        return new SnapshotLeafFingerprint(
+            SnapshotLeafKind.File,
+            total,
+            hash.GetHashAndReset(),
+            File.GetLastWriteTimeUtc(fullPath).Ticks);
     }
 
     public static FileRollbackResult Rollback(
@@ -198,29 +212,34 @@ internal static class FileSnapshotJournal
         CancellationToken cancellationToken = default)
     {
         var concurrent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var recovery = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var errors = new List<string>();
+        var recovery = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (alreadyConcurrentPaths is not null) concurrent.UnionWith(alreadyConcurrentPaths);
-
         BeforeRollbackRestoreTestHook?.Invoke();
         for (var index = rollbackEntries.Count - 1; index >= 0; index--)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var rollback = rollbackEntries[index];
-            var path = Path.GetFullPath(rollback.Snapshot.Path);
+            var path = rollback.Snapshot.Path;
             if (concurrent.Contains(path)) continue;
             try
             {
-                RestoreCas(rollback, recovery, cancellationToken);
+                Restore(rollback, cancellationToken);
             }
             catch (ConcurrentLeafChangeException exception)
             {
                 concurrent.Add(path);
                 concurrent.UnionWith(exception.PreservedPaths);
+                if (rollback.Snapshot.SnapshotPath is not null)
+                    recovery.Add(rollback.Snapshot.SnapshotPath);
             }
-            catch (Exception exception)
+            catch (Exception exception) when (exception is IOException
+                                              or UnauthorizedAccessException
+                                              or InvalidDataException)
             {
                 errors.Add($"{Path.GetFileName(path)} ({exception.GetType().Name})");
+                if (rollback.Snapshot.SnapshotPath is not null)
+                    recovery.Add(rollback.Snapshot.SnapshotPath);
             }
         }
         return new FileRollbackResult(concurrent, errors, recovery);
@@ -232,416 +251,28 @@ internal static class FileSnapshotJournal
         bool preserveSnapshots,
         string context)
     {
-        var failures = new List<string>();
-        foreach (var entry in entries)
+        if (preserveSnapshots) return [];
+        var errors = new List<string>();
+        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var snapshot in entries.Select(entry => entry.SnapshotPath)
+                     .Where(path => path is not null)
+                     .Cast<string>()
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            if (entry.SnapshotPath is null || !File.Exists(entry.SnapshotPath)) continue;
-            if (preserveSnapshots)
-            {
-                System.Diagnostics.Trace.TraceWarning(
-                    $"{context} recovery snapshot preserved after incomplete rollback: {entry.SnapshotPath}");
-                continue;
-            }
-
             try
             {
-                deleteSnapshot(entry.SnapshotPath);
-            }
-            catch (Exception exception)
-            {
-                failures.Add($"{entry.SnapshotPath} ({exception.GetType().Name})");
-                System.Diagnostics.Trace.TraceWarning(
-                    $"{context} snapshot cleanup failed: {entry.SnapshotPath} ({exception.GetType().Name}).");
-                continue;
-            }
-
-            if (File.Exists(entry.SnapshotPath))
-            {
-                failures.Add($"{entry.SnapshotPath} (still exists)");
-                System.Diagnostics.Trace.TraceWarning(
-                    $"{context} snapshot cleanup returned without removing: {entry.SnapshotPath}.");
-            }
-        }
-        return failures;
-    }
-
-    private static void RestoreCas(
-        FileRollbackEntry rollback,
-        ISet<string> recoveryPaths,
-        CancellationToken cancellationToken)
-    {
-        var entry = rollback.Snapshot;
-        var path = Path.GetFullPath(entry.Path);
-        var expected = rollback.ExpectedCurrent;
-        if (expected.Kind == SnapshotLeafKind.Unstable)
-            throw new ConcurrentLeafChangeException(
-                $"Rollback state could not be pinned ({expected.Failure ?? "Unknown"}).",
-                path);
-
-        if (expected.Kind == SnapshotLeafKind.Directory)
-        {
-            if (entry.InitialState.Kind == SnapshotLeafKind.Directory
-                && SameDirectoryIdentity(entry.InitialState, expected))
-            {
-                var current = CaptureInitialState(path);
-                if (SameDirectoryIdentity(expected, current)) return;
-                throw new ConcurrentLeafChangeException(
-                    "A protected directory changed after rollback state was captured.",
-                    path);
-            }
-            throw new IOException(
-                "Rollback target is a directory; automatic file restoration is unsafe.");
-        }
-
-        if (expected.Kind == SnapshotLeafKind.Missing)
-        {
-            if (File.Exists(path) || Directory.Exists(path))
-                throw new ConcurrentLeafChangeException("A rollback target appeared after failure.", path);
-            if (entry.InitialState.Kind == SnapshotLeafKind.Missing) return;
-            if (entry.InitialState.Kind == SnapshotLeafKind.Directory)
-                throw new IOException(
-                    "An original rollback directory disappeared; automatic restoration is unsafe.");
-            RestoreMissingTarget(entry, cancellationToken);
-            return;
-        }
-
-        if (!File.Exists(path) || Directory.Exists(path))
-            throw new ConcurrentLeafChangeException("A rollback target disappeared after failure.", path);
-        if (entry.InitialState.Kind == SnapshotLeafKind.Directory)
-            throw new IOException(
-                "An original rollback directory was replaced by a file; automatic restoration is unsafe.");
-        if (entry.InitialState.Kind == SnapshotLeafKind.File)
-        {
-            RestoreExistingTarget(entry, expected, recoveryPaths, cancellationToken);
-            return;
-        }
-        RemoveCreatedTarget(path, expected, recoveryPaths, cancellationToken);
-    }
-
-    private static void RestoreMissingTarget(
-        FileSnapshotEntry entry,
-        CancellationToken cancellationToken)
-    {
-        var restore = CreatePreparedRestore(entry, cancellationToken);
-        try
-        {
-            File.Move(restore, entry.Path);
-        }
-        catch (IOException exception) when (File.Exists(entry.Path) || Directory.Exists(entry.Path))
-        {
-            throw new ConcurrentLeafChangeException(
-                "A rollback target appeared while its original content was being restored.",
-                exception,
-                entry.Path);
-        }
-        finally
-        {
-            TryDelete(restore);
-        }
-    }
-
-    private static void RestoreExistingTarget(
-        FileSnapshotEntry entry,
-        SnapshotLeafFingerprint expected,
-        ISet<string> recoveryPaths,
-        CancellationToken cancellationToken)
-    {
-        var directory = Path.GetDirectoryName(entry.Path)!;
-        var restore = CreatePreparedRestore(entry, cancellationToken);
-        var displaced = Path.Combine(directory, $".{Path.GetFileName(entry.Path)}.{Guid.NewGuid():N}.rollback-current.tmp");
-        var rejected = Path.Combine(directory, $".{Path.GetFileName(entry.Path)}.{Guid.NewGuid():N}.rollback-rejected.tmp");
-        try
-        {
-            File.Replace(restore, entry.Path, displaced, ignoreMetadataErrors: true);
-            if (MatchesFingerprint(displaced, expected, cancellationToken))
-            {
-                File.Delete(displaced);
-                return;
-            }
-
-            try
-            {
-                if (File.Exists(entry.Path))
-                    File.Replace(displaced, entry.Path, rejected, ignoreMetadataErrors: true);
-                else if (!Directory.Exists(entry.Path))
-                    File.Move(displaced, entry.Path);
+                if (File.Exists(snapshot)) deleteSnapshot(snapshot);
+                var backups = Path.GetDirectoryName(snapshot);
+                var root = backups is null ? null : Path.GetDirectoryName(backups);
+                if (root is not null) roots.Add(root);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
-                if (File.Exists(displaced)) recoveryPaths.Add(displaced);
-                if (File.Exists(rejected)) recoveryPaths.Add(rejected);
-                throw new ConcurrentLeafChangeException(
-                    "Rollback detected concurrent content and could not restore it in place; recovery files were preserved.",
-                    exception,
-                    entry.Path,
-                    displaced,
-                    rejected);
-            }
-
-            if (File.Exists(rejected))
-            {
-                if (entry.SnapshotPath is not null
-                    && FilesHaveSameContent(rejected, entry.SnapshotPath, cancellationToken))
-                    File.Delete(rejected);
-                else
-                {
-                    recoveryPaths.Add(rejected);
-                }
-            }
-            throw new ConcurrentLeafChangeException(
-                "Rollback preserved a concurrent save instead of overwriting it.",
-                entry.Path,
-                rejected);
-        }
-        catch (IOException exception) when (exception is not ConcurrentLeafChangeException
-                                            && !File.Exists(displaced))
-        {
-            throw new ConcurrentLeafChangeException(
-                "Rollback target changed before atomic restoration.",
-                exception,
-                entry.Path);
-        }
-        finally
-        {
-            TryDelete(restore);
-            if (File.Exists(displaced)) recoveryPaths.Add(displaced);
-        }
-    }
-
-    private static void RemoveCreatedTarget(
-        string path,
-        SnapshotLeafFingerprint expected,
-        ISet<string> recoveryPaths,
-        CancellationToken cancellationToken)
-    {
-        var directory = Path.GetDirectoryName(path)!;
-        var displaced = Path.Combine(directory, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.rollback-created.tmp");
-        try
-        {
-            File.Move(path, displaced);
-        }
-        catch (IOException exception)
-        {
-            throw new ConcurrentLeafChangeException(
-                "A transaction-created target changed before rollback.",
-                exception,
-                path);
-        }
-
-        if (MatchesFingerprint(displaced, expected, cancellationToken))
-        {
-            File.Delete(displaced);
-            return;
-        }
-
-        try
-        {
-            if (!File.Exists(path) && !Directory.Exists(path)) File.Move(displaced, path);
-            else recoveryPaths.Add(displaced);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            recoveryPaths.Add(displaced);
-            throw new ConcurrentLeafChangeException(
-                "A concurrent save was preserved in a rollback recovery file.",
-                exception,
-                path,
-                displaced);
-        }
-        throw new ConcurrentLeafChangeException(
-            "Rollback preserved a concurrent save instead of deleting it.",
-            path,
-            displaced);
-    }
-
-    private static string CreatePreparedRestore(
-        FileSnapshotEntry entry,
-        CancellationToken cancellationToken)
-    {
-        if (entry.SnapshotPath is null)
-            throw new InvalidDataException("Rollback snapshot is missing.");
-        var directory = Path.GetDirectoryName(entry.Path)!;
-        var restore = Path.Combine(directory, $".{Path.GetFileName(entry.Path)}.{Guid.NewGuid():N}.restore.tmp");
-        AtomicFile.CopyFlushedBounded(
-            entry.SnapshotPath,
-            restore,
-            PathSafety.MaximumTrustedLeafBytes,
-            cancellationToken);
-        return restore;
-    }
-
-    private static SnapshotLeafFingerprint CaptureFingerprint(
-        string path,
-        ref long aggregateBytes,
-        CancellationToken cancellationToken)
-    {
-        if (Directory.Exists(path))
-        {
-            if (File.Exists(path))
-                throw new InvalidDataException("Rollback path is both a file and directory.");
-            return CaptureDirectoryFingerprint(path);
-        }
-        if (!File.Exists(path)) return new SnapshotLeafFingerprint(SnapshotLeafKind.Missing);
-
-        var attributes = File.GetAttributes(path);
-        if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
-            throw new InvalidDataException("Rollback fingerprints require a regular non-redirected file.");
-
-        FileStream stream;
-        if (OperatingSystem.IsWindows())
-        {
-            var handle = PathSafety.WindowsPathHandle.OpenFileWithoutWriteOrDeleteSharing(path);
-            try
-            {
-                var identity = PathSafety.WindowsPathHandle.GetIdentity(handle);
-                if (identity.FileIndex == 0
-                    || identity.NumberOfLinks != 1
-                    || (identity.FileAttributes
-                        & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
-                {
-                    throw new InvalidDataException(
-                        "Rollback fingerprints require a unique regular file identity.");
-                }
-                stream = new FileStream(handle, FileAccess.Read, 64 * 1024, isAsync: false);
-            }
-            catch
-            {
-                handle.Dispose();
-                throw;
+                errors.Add($"{context} temporary backup ({exception.GetType().Name})");
             }
         }
-        else
-        {
-            stream = new FileStream(
-                path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read,
-                64 * 1024,
-                FileOptions.SequentialScan);
-        }
-        using (stream)
-        {
-        var length = stream.Length;
-        ValidateSnapshotLength(path, length, ref aggregateBytes);
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var buffer = new byte[64 * 1024];
-        long readTotal = 0;
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var read = stream.Read(buffer, 0, buffer.Length);
-            if (read == 0) break;
-            readTotal = checked(readTotal + read);
-            if (readTotal > PathSafety.MaximumTrustedLeafBytes)
-                throw new InvalidDataException("Rollback fingerprint exceeds its file-size limit.");
-            hash.AppendData(buffer, 0, read);
-        }
-        var lastWriteTimeUtcTicks = File.GetLastWriteTimeUtc(path).Ticks;
-        uint? volumeSerialNumber = null;
-        ulong? fileIndex = null;
-        if (OperatingSystem.IsWindows())
-        {
-            var identity = PathSafety.WindowsPathHandle.GetIdentity(stream.SafeFileHandle);
-            volumeSerialNumber = identity.VolumeSerialNumber;
-            fileIndex = identity.FileIndex;
-        }
-        return new SnapshotLeafFingerprint(
-            SnapshotLeafKind.File,
-            readTotal,
-            hash.GetHashAndReset(),
-            lastWriteTimeUtcTicks,
-            volumeSerialNumber,
-            fileIndex);
-        }
-    }
-
-    private static SnapshotLeafFingerprint CaptureInitialState(string path)
-    {
-        if (Directory.Exists(path))
-        {
-            if (File.Exists(path))
-                throw new InvalidDataException("Snapshot path is both a file and directory.");
-            return CaptureDirectoryFingerprint(path);
-        }
-        return File.Exists(path)
-            ? CaptureRecoveryFingerprint(path)
-            : new SnapshotLeafFingerprint(SnapshotLeafKind.Missing);
-    }
-
-    private static SnapshotLeafFingerprint CaptureDirectoryFingerprint(string path)
-    {
-        var lastWriteTimeUtcTicks = Directory.GetLastWriteTimeUtc(path).Ticks;
-        if (!OperatingSystem.IsWindows())
-            return new SnapshotLeafFingerprint(
-                SnapshotLeafKind.Directory,
-                LastWriteTimeUtcTicks: lastWriteTimeUtcTicks);
-
-        using var handle = PathSafety.WindowsPathHandle.OpenDirectoryForIdentity(path);
-        var identity = PathSafety.WindowsPathHandle.GetIdentity(handle);
-        if (identity.FileIndex == 0
-            || (identity.FileAttributes & FileAttributes.Directory) == 0
-            || (identity.FileAttributes & (FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
-            throw new InvalidDataException("Rollback directory has no stable regular-directory identity.");
-        return new SnapshotLeafFingerprint(
-            SnapshotLeafKind.Directory,
-            LastWriteTimeUtcTicks: lastWriteTimeUtcTicks,
-            VolumeSerialNumber: identity.VolumeSerialNumber,
-            FileIndex: identity.FileIndex);
-    }
-
-    private static bool SameDirectoryIdentity(
-        SnapshotLeafFingerprint initial,
-        SnapshotLeafFingerprint current) =>
-        initial.Kind == SnapshotLeafKind.Directory
-        && current.Kind == SnapshotLeafKind.Directory
-        && (OperatingSystem.IsWindows()
-            ? initial.VolumeSerialNumber is not null
-              && initial.FileIndex is not null
-              && initial.VolumeSerialNumber == current.VolumeSerialNumber
-              && initial.FileIndex == current.FileIndex
-            : initial.LastWriteTimeUtcTicks == current.LastWriteTimeUtcTicks);
-
-    private static bool MatchesFingerprint(
-        string path,
-        SnapshotLeafFingerprint expected,
-        CancellationToken cancellationToken)
-    {
-        long aggregate = 0;
-        try
-        {
-            var actual = CaptureFingerprint(path, ref aggregate, cancellationToken);
-            return actual.Kind == expected.Kind
-                   && actual.Length == expected.Length
-                   && actual.LastWriteTimeUtcTicks == expected.LastWriteTimeUtcTicks
-                   && actual.VolumeSerialNumber == expected.VolumeSerialNumber
-                   && actual.FileIndex == expected.FileIndex
-                   && actual.Sha256 is not null
-                   && expected.Sha256 is not null
-                   && CryptographicOperations.FixedTimeEquals(actual.Sha256, expected.Sha256);
-        }
-        catch (Exception exception) when (exception is IOException
-                                          or UnauthorizedAccessException
-                                          or InvalidDataException)
-        {
-            return false;
-        }
-    }
-
-    private static bool FilesHaveSameContent(
-        string left,
-        string right,
-        CancellationToken cancellationToken)
-    {
-        long aggregate = 0;
-        var leftFingerprint = CaptureFingerprint(left, ref aggregate, cancellationToken);
-        var rightFingerprint = CaptureFingerprint(right, ref aggregate, cancellationToken);
-        return leftFingerprint.Kind == SnapshotLeafKind.File
-               && rightFingerprint.Kind == SnapshotLeafKind.File
-               && leftFingerprint.Length == rightFingerprint.Length
-               && leftFingerprint.Sha256 is not null
-               && rightFingerprint.Sha256 is not null
-               && CryptographicOperations.FixedTimeEquals(leftFingerprint.Sha256, rightFingerprint.Sha256);
+        foreach (var root in roots) TryDeleteEmptyLocalTransaction(root, errors);
+        return errors;
     }
 
     internal static bool HasSameContent(
@@ -654,27 +285,131 @@ internal static class FileSnapshotJournal
         && right.Sha256 is { Length: 32 }
         && CryptographicOperations.FixedTimeEquals(left.Sha256, right.Sha256);
 
-    private static void ValidateSnapshotLength(string path, long length, ref long aggregateBytes)
+    private static void CopyAndVerifySnapshot(
+        FileSnapshotEntry entry,
+        Action<string, string> copySnapshot,
+        CancellationToken cancellationToken)
     {
-        if (length < 0 || length > PathSafety.MaximumTrustedLeafBytes)
-            throw new InvalidDataException(
-                $"Snapshot file exceeds the {PathSafety.MaximumTrustedLeafBytes:N0}-byte limit: {Path.GetFileName(path)}");
-        aggregateBytes = checked(aggregateBytes + length);
-        if (aggregateBytes > PathSafety.MaximumTrustedBoundaryBytes)
-            throw new InvalidDataException(
-                $"Snapshot files exceed the {PathSafety.MaximumTrustedBoundaryBytes:N0}-byte aggregate limit.");
+        copySnapshot(entry.Path, entry.SnapshotPath!);
+        var snapshot = CaptureRecoveryFingerprint(entry.SnapshotPath!, cancellationToken);
+        if (!HasSameContent(entry.InitialState, snapshot))
+            throw new InvalidDataException("A file changed while its transaction backup was copied.");
     }
 
-    private static void TryDelete(string path)
+    private static void Restore(
+        FileRollbackEntry rollback,
+        CancellationToken cancellationToken)
+    {
+        var entry = rollback.Snapshot;
+        var current = CaptureRecoveryFingerprint(entry.Path, cancellationToken);
+        if (!SameState(current, rollback.ExpectedCurrent))
+            throw new ConcurrentLeafChangeException(
+                "A file changed while rollback was starting.",
+                entry.Path);
+        if (SameState(current, entry.InitialState)) return;
+
+        if (entry.InitialState.Kind == SnapshotLeafKind.Missing)
+        {
+            if (current.Kind == SnapshotLeafKind.File)
+            {
+                if (File.GetAttributes(entry.Path).HasFlag(FileAttributes.ReadOnly))
+                    throw new UnauthorizedAccessException("A created output became read-only during rollback.");
+                File.Delete(entry.Path);
+                return;
+            }
+            throw new ConcurrentLeafChangeException(
+                "A created output could not be removed safely.",
+                entry.Path);
+        }
+        if (entry.InitialState.Kind != SnapshotLeafKind.File
+            || entry.SnapshotPath is null
+            || !File.Exists(entry.SnapshotPath))
+        {
+            throw new InvalidDataException("A rollback backup is missing or unsupported.");
+        }
+        var snapshot = CaptureRecoveryFingerprint(entry.SnapshotPath, cancellationToken);
+        if (!HasSameContent(snapshot, entry.InitialState))
+            throw new InvalidDataException("A rollback backup failed validation.");
+
+        var directory = Path.GetDirectoryName(entry.Path)
+            ?? throw new InvalidDataException("A rollback target has no parent directory.");
+        var prepared = Path.Combine(
+            directory,
+            $".{Path.GetFileName(entry.Path)}.{Guid.NewGuid():N}.restore.tmp");
+        try
+        {
+            AtomicFile.CopyFlushedBounded(
+                entry.SnapshotPath,
+                prepared,
+                PathSafety.MaximumTrustedLeafBytes,
+                cancellationToken);
+            if (File.Exists(entry.Path))
+                File.Replace(prepared, entry.Path, null, ignoreMetadataErrors: true);
+            else
+                File.Move(prepared, entry.Path);
+        }
+        finally
+        {
+            if (File.Exists(prepared)) File.Delete(prepared);
+        }
+        var restored = CaptureRecoveryFingerprint(entry.Path, cancellationToken);
+        if (!HasSameContent(restored, entry.InitialState))
+            throw new IOException("A rollback target failed post-write validation.");
+    }
+
+    private static bool SameState(
+        SnapshotLeafFingerprint left,
+        SnapshotLeafFingerprint right) =>
+        left.Kind == right.Kind
+        && left.Kind switch
+        {
+            SnapshotLeafKind.Missing => true,
+            SnapshotLeafKind.File => HasSameContent(left, right),
+            SnapshotLeafKind.Directory => left.LastWriteTimeUtcTicks == right.LastWriteTimeUtcTicks,
+            _ => false
+        };
+
+    private static string CreateLocalTransactionDirectory()
+    {
+        var parent = Path.Combine(Path.GetTempPath(), "RimWorldAiTranslator-transactions");
+        Directory.CreateDirectory(parent);
+        var root = Path.Combine(parent, $"transaction-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        FileTransactionRecoveryAuthority.WriteSmallFlushedFile(
+            Path.Combine(root, FileTransactionRecoveryAuthority.OwnerMarkerName),
+            FileTransactionRecoveryAuthority.OwnerMarkerContent);
+        Directory.CreateDirectory(Path.Combine(root, "backups"));
+        return root;
+    }
+
+    private static void TryDeleteEmptyLocalTransaction(
+        string transactionRoot,
+        ICollection<string> errors)
     {
         try
         {
-            if (File.Exists(path)) File.Delete(path);
+            var name = Path.GetFileName(transactionRoot);
+            var marker = Path.Combine(transactionRoot, FileTransactionRecoveryAuthority.OwnerMarkerName);
+            if (!name.StartsWith("transaction-", StringComparison.Ordinal)
+                || !File.Exists(marker)
+                || !File.ReadAllText(marker)
+                    .Equals(FileTransactionRecoveryAuthority.OwnerMarkerContent, StringComparison.Ordinal))
+            {
+                return;
+            }
+            var backups = Path.Combine(transactionRoot, "backups");
+            if (Directory.Exists(backups)
+                && !Directory.EnumerateFileSystemEntries(backups).Any())
+            {
+                Directory.Delete(backups);
+            }
+            if (File.Exists(marker)) File.Delete(marker);
+            if (!Directory.EnumerateFileSystemEntries(transactionRoot).Any())
+                Directory.Delete(transactionRoot);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            System.Diagnostics.Trace.TraceWarning(
-                $"Rollback cleanup preserved a recovery file ({exception.GetType().Name}): {path}");
+            errors.Add($"temporary transaction cleanup ({exception.GetType().Name})");
         }
     }
 }

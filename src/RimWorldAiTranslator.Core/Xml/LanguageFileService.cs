@@ -258,6 +258,7 @@ public sealed partial class LanguageFileService
                 deleteSnapshot,
                 recoverySession,
                 cancellationToken);
+            recoverySession.AttachJournal(journal);
             activation = recoverySession.Activate();
             foreach (var group in groups)
             {
@@ -291,12 +292,7 @@ public sealed partial class LanguageFileService
             IReadOnlySet<string>? concurrentPaths = writeError is ConcurrentLeafChangeException concurrent
                 ? concurrent.PreservedPaths
                 : null;
-            var rollback = recoverySession.IsEnabled
-                ? recoverySession.RollbackDurably(concurrentPaths)
-                : FileSnapshotJournal.Rollback(
-                    FileSnapshotJournal.CaptureRollbackState(journal, CancellationToken.None),
-                    concurrentPaths,
-                    CancellationToken.None);
+            var rollback = recoverySession.RollbackDurably(concurrentPaths);
             if (rollback.Errors.Count > 0)
             {
                 preserveSnapshots = true;
@@ -305,15 +301,15 @@ public sealed partial class LanguageFileService
             }
             if (rollback.ConcurrentPaths.Count > 0)
             {
-                preserveSnapshots = true;
-                recoverySession.DetachPreservedEvidence();
+                preserveSnapshots = recoverySession.IsEnabled;
+                if (preserveSnapshots) recoverySession.DetachPreservedEvidence();
                 throw new ConcurrentLeafChangeException(
                     $"Translation output stopped because rollback detected a concurrent save; current files and recovery snapshots were preserved: {string.Join(" | ", rollback.ConcurrentPaths)}.",
                     writeError,
-                    [.. rollback.ConcurrentPaths, .. rollback.RecoveryPaths]);
+                    preserveSnapshots
+                        ? [.. rollback.ConcurrentPaths, .. rollback.RecoveryPaths]
+                        : [.. rollback.ConcurrentPaths]);
             }
-            if (!recoverySession.IsEnabled)
-                recoverySession.MarkRollbackResolved(CancellationToken.None);
             if (writeError is OperationCanceledException) throw;
             throw new IOException($"Translation output failed; all files written by this run were rolled back. {writeError.Message}", writeError);
         }

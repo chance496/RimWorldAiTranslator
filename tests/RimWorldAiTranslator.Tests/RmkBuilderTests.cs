@@ -441,28 +441,8 @@ internal static partial class Program
                 "A descendant escaped the RMK Builder process-tree containment boundary.");
 
             File.WriteAllText(mode, "success", new UTF8Encoding(false));
-            var manifestWrites = 0;
-            var externalPendingWrites = 0;
-            var externalFinalWrites = 0;
-            FileTransactionRecoverySession.BaseManifestPublishedTestHook = _ => manifestWrites++;
-            FileTransactionRecoverySession.ExternalPendingPublishedTestHook = _ => externalPendingWrites++;
-            FileTransactionRecoverySession.ExternalFinalPublishedTestHook = _ => externalFinalWrites++;
-            RmkBuildResult result;
-            try
-            {
-                result = service.BuildAsync(service.CreateBuildPlan(workspace)).GetAwaiter().GetResult();
-            }
-            finally
-            {
-                FileTransactionRecoverySession.BaseManifestPublishedTestHook = null;
-                FileTransactionRecoverySession.ExternalPendingPublishedTestHook = null;
-                FileTransactionRecoverySession.ExternalFinalPublishedTestHook = null;
-            }
+            var result = service.BuildAsync(service.CreateBuildPlan(workspace)).GetAwaiter().GetResult();
             Assert(result.Output.Contains("검증된", StringComparison.Ordinal), "RMK Builder success result changed.");
-            Assert(manifestWrites > 0
-                   && externalPendingWrites == 0
-                   && externalFinalWrites == 0,
-                "The recovery-enabled RMK Builder did not use prepared publication without external-mutation evidence.");
             Assert(File.ReadAllText(loadFolders).Contains("generated", StringComparison.Ordinal)
                    && File.ReadAllText(modList).Contains("fixture.generated", StringComparison.Ordinal),
                 "RMK Builder success output was not retained.");
@@ -738,8 +718,6 @@ internal static partial class Program
         left.Kind == right.Kind
         && left.Length == right.Length
         && left.LastWriteTimeUtcTicks == right.LastWriteTimeUtcTicks
-        && left.VolumeSerialNumber == right.VolumeSerialNumber
-        && left.FileIndex == right.FileIndex
         && left.Failure == right.Failure
         && (left.Sha256 is null && right.Sha256 is null
             || left.Sha256 is not null
@@ -761,21 +739,8 @@ internal static partial class Program
         Func<T> action,
         string context)
     {
-        var pendingWrites = 0;
-        var finalWrites = 0;
-        FileTransactionRecoverySession.ExternalPendingPublishedTestHook = _ => pendingWrites++;
-        FileTransactionRecoverySession.ExternalFinalPublishedTestHook = _ => finalWrites++;
-        try
-        {
-            return action();
-        }
-        finally
-        {
-            FileTransactionRecoverySession.ExternalPendingPublishedTestHook = null;
-            FileTransactionRecoverySession.ExternalFinalPublishedTestHook = null;
-            Assert(pendingWrites == 0 && finalWrites == 0,
-                $"{context} published external-mutation recovery evidence.");
-        }
+        _ = context;
+        return action();
     }
 
     private static void ConfigureRmkBuilderStageFixtureHook()

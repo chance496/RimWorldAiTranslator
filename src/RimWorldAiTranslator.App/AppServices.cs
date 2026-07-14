@@ -17,6 +17,7 @@ namespace RimWorldAiTranslator.App;
 internal sealed class AppServices : IDisposable, IAsyncDisposable
 {
     private readonly ConcurrentQueue<JsonRecoveryNotice> recoveryNotices = new();
+    private readonly ConcurrentQueue<PendingFileTransaction> pendingFileTransactions = new();
     private int disposalStarted;
 
     public AppServices(string? dataRoot = null, RimWorldModDiscoveryService? discovery = null)
@@ -50,6 +51,8 @@ internal sealed class AppServices : IDisposable, IAsyncDisposable
         TranslationArtifacts = new TranslationRunArtifactService(Paths.Temp, Paths.Reviews);
         IsolationAcknowledgements = new IsolatedDiscoveryAcknowledgementService();
         RecoveryAuthority = new FileTransactionRecoveryAuthority(Paths.RecoveryAuthority);
+        foreach (var pending in RecoveryAuthority.FindPending(cancellationToken: cancellationToken))
+            pendingFileTransactions.Enqueue(pending);
         RmkWorkspace = new RmkWorkspaceService(RecoveryAuthority, Paths.RmkBuilderStaging);
         Apply = new ReviewApplyService(
             Store,
@@ -106,6 +109,13 @@ internal sealed class AppServices : IDisposable, IAsyncDisposable
         var notices = new List<JsonRecoveryNotice>();
         while (recoveryNotices.TryDequeue(out var notice)) notices.Add(notice);
         return notices;
+    }
+
+    public IReadOnlyList<PendingFileTransaction> DrainPendingFileTransactions()
+    {
+        var pending = new List<PendingFileTransaction>();
+        while (pendingFileTransactions.TryDequeue(out var transaction)) pending.Add(transaction);
+        return pending;
     }
 
     public TranslationEngine CreateTranslationEngine() =>

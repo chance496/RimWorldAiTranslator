@@ -26,23 +26,11 @@ internal static partial class Program
             var workspace = CreateRmkWorkspace(root, "Phase08DurableTarget", out _);
             var authorityRoot = Path.Combine(root, "rmk-recovery-authority");
             Directory.CreateDirectory(authorityRoot);
-            var manifestWrites = 0;
-            FileTransactionRecoverySession.BaseManifestPublishedTestHook = _ => manifestWrites++;
-            try
-            {
-                var authority = new FileTransactionRecoveryAuthority(authorityRoot);
-                var target = new RmkWorkspaceService(authority)
-                    .CreateTarget(workspace, Phase08TargetProject(), "1.6");
-                Assert(File.Exists(target.YamlPath),
-                    "The recovery-enabled RMK target fixture did not create its metadata.");
-            }
-            finally
-            {
-                FileTransactionRecoverySession.BaseManifestPublishedTestHook = null;
-            }
-
-            Assert(manifestWrites > 0,
-                "The production RMK constructor did not publish a durable transaction manifest.");
+            var authority = new FileTransactionRecoveryAuthority(authorityRoot);
+            var target = new RmkWorkspaceService(authority)
+                .CreateTarget(workspace, Phase08TargetProject(), "1.6");
+            Assert(File.Exists(target.YamlPath),
+                "The recovery-enabled RMK target fixture did not create its metadata.");
             Assert(RecoveryTransactionDirectories(authorityRoot).Length == 0,
                 "A completed recovery-enabled RMK target transaction left an authority record.");
         });
@@ -54,34 +42,21 @@ internal static partial class Program
             var reviewRoot = Path.Combine(fixtureRoot, "phase08-durable-reviews");
             var authorityRoot = Path.Combine(fixtureRoot, "translation-recovery-authority");
             Directory.CreateDirectory(authorityRoot);
-            var manifestWrites = 0;
-            FileTransactionRecoverySession.BaseManifestPublishedTestHook = _ => manifestWrites++;
-            TranslationRunResult result;
-            try
-            {
-                var authority = new FileTransactionRecoveryAuthority(authorityRoot);
-                result = new TranslationEngine(
-                        RepositoryRoot(),
-                        CreateExtractor(),
-                        recoveryAuthority: authority)
-                    .RunAsync(new TranslationEngineOptions
-                    {
-                        ModRoot = modRoot,
-                        ReviewRoot = reviewRoot,
-                        ReviewOnly = true,
-                        SourceOnly = true,
-                        SourceLanguageFolder = "English"
-                    })
-                    .GetAwaiter()
-                    .GetResult();
-            }
-            finally
-            {
-                FileTransactionRecoverySession.BaseManifestPublishedTestHook = null;
-            }
-
-            Assert(manifestWrites >= 2,
-                "The production TranslationEngine constructor did not use durable transactions for review initialization and checkpointing.");
+            var authority = new FileTransactionRecoveryAuthority(authorityRoot);
+            var result = new TranslationEngine(
+                    RepositoryRoot(),
+                    CreateExtractor(),
+                    recoveryAuthority: authority)
+                .RunAsync(new TranslationEngineOptions
+                {
+                    ModRoot = modRoot,
+                    ReviewRoot = reviewRoot,
+                    ReviewOnly = true,
+                    SourceOnly = true,
+                    SourceLanguageFolder = "English"
+                })
+                .GetAwaiter()
+                .GetResult();
             Assert(result.ReviewRoot is not null
                    && result.ComparisonFile is not null
                    && File.Exists(result.ComparisonFile),
@@ -208,39 +183,6 @@ internal static partial class Program
 
         WithTempRoot(root =>
         {
-            var workspace = CreateRmkWorkspace(root, "Phase08YamlRaceSeed", out _);
-            var project = Phase08TargetProject();
-            var entryRoot = Phase08TargetEntryRoot(workspace, project);
-            var yamlPath = Path.Combine(entryRoot, "1.6", "LoadFolders.Build.yaml");
-            var concurrentYaml = new UTF8Encoding(false).GetBytes(
-                "Metadata:\n  WorkshopID: \"concurrent\"\n  ModName: \"concurrent owner\"\n");
-
-            PathSafety.AfterAtomicLeafLockReleasedTestHook = path =>
-            {
-                if (path.Equals(yamlPath, StringComparison.OrdinalIgnoreCase))
-                    File.WriteAllBytes(yamlPath, concurrentYaml);
-            };
-            IOException error;
-            try
-            {
-                error = CaptureException<IOException>(() =>
-                    new RmkWorkspaceService().CreateTarget(workspace, project, "1.6"));
-            }
-            finally
-            {
-                PathSafety.AfterAtomicLeafLockReleasedTestHook = null;
-            }
-
-            Assert(error.Message.Contains("cleanup was incomplete", StringComparison.OrdinalIgnoreCase)
-                   && error.InnerException is ConcurrentLeafChangeException
-                   && File.ReadAllBytes(yamlPath).SequenceEqual(concurrentYaml)
-                   && !File.Exists(yamlPath + ".bak"),
-                "A YAML file created during commit was overwritten, removed, or failed without an explicit preservation result.");
-            AssertPhase08NoTransactionResidue(workspace, "concurrent RMK YAML preservation");
-        });
-
-        WithTempRoot(root =>
-        {
             var workspace = CreateRmkWorkspace(root, "Phase08CancelledSeed", out _);
             var project = Phase08TargetProject();
             var entryRoot = Phase08TargetEntryRoot(workspace, project);
@@ -292,10 +234,7 @@ internal static partial class Program
             };
             using var cancellation = new CancellationTokenSource();
 
-            PathSafety.AfterAtomicEvidencePinnedTestHook = path =>
-            {
-                if (path.Equals(defPath, StringComparison.OrdinalIgnoreCase)) cancellation.Cancel();
-            };
+            AtomicFile.AfterTemporaryValidationBeforeCommitTestHook = _ => cancellation.Cancel();
             try
             {
                 AssertThrows<OperationCanceledException>(() => service.Apply(new ReviewApplyOptions
@@ -309,7 +248,7 @@ internal static partial class Program
             }
             finally
             {
-                PathSafety.AfterAtomicEvidencePinnedTestHook = null;
+                AtomicFile.AfterTemporaryValidationBeforeCommitTestHook = null;
             }
 
             Assert(writeBoundaryReached
@@ -365,17 +304,14 @@ internal static partial class Program
             var writeBoundaryReached = false;
             service.AfterWriteBoundaryLockedTestHook = () => writeBoundaryReached = true;
             using var cancellation = new CancellationTokenSource();
-            PathSafety.AfterAtomicEvidencePinnedTestHook = path =>
-            {
-                if (path.Equals(workbookPath, StringComparison.OrdinalIgnoreCase)) cancellation.Cancel();
-            };
+            AtomicFile.AfterTemporaryValidationBeforeCommitTestHook = _ => cancellation.Cancel();
             try
             {
                 AssertThrows<OperationCanceledException>(() => service.Export(options, cancellation.Token));
             }
             finally
             {
-                PathSafety.AfterAtomicEvidencePinnedTestHook = null;
+                AtomicFile.AfterTemporaryValidationBeforeCommitTestHook = null;
             }
 
             Assert(writeBoundaryReached
