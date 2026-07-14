@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\RimWorldAiTranslator.Core\RimWorldAiTranslator.Core.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\RimWorldAiTranslator.ico</ApplicationIcon>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <AssemblyName>RimWorldAiTranslator</AssemblyName>
+    <AssemblyTitle>RimWorld AI Translator</AssemblyTitle>
+    <RootNamespace>RimWorldAiTranslator.App</RootNamespace>
+    <!-- Concrete return types would couple UI composition helpers to implementation
+         controls; keep the Control/IReadOnlyList seams while running Recommended rules. -->
+    <NoWarn>$(NoWarn);CA1859</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\rimworld-def-field-rules.txt" Link="rimworld-def-field-rules.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <Content Include="..\..\glossary.generated.ko.json" Link="glossary.generated.ko.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
+</Project>

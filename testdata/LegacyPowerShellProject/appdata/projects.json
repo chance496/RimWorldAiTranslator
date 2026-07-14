@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "updatedAt": "2025-01-02T03:04:05.0000000+00:00",
+  "projects": [
+    {
+      "id": "legacy-powershell-fixture",
+      "name": "Legacy PowerShell Fixture",
+      "modRoot": "__MOD_ROOT__",
+      "packageId": "fixture.legacy",
+      "workshopId": "",
+      "sourceLanguageFolder": "English",
+      "latestReviewRoot": "__REVIEW_ROOT__",
+      "latestReviewAt": "2025-01-02T03:04:05.0000000+00:00",
+      "lastAppliedAt": "",
+      "createdAt": "2025-01-01T00:00:00.0000000+00:00",
+      "updatedAt": "2025-01-02T03:04:05.0000000+00:00",
+      "runs": [
+        {
+          "reviewRoot": "__REVIEW_ROOT__",
+          "createdAt": "2025-01-02T03:04:05.0000000+00:00",
+          "provider": "Manual",
+          "legacyRunMetadata": "preserve-or-ignore"
+        }
+      ],
+      "legacyProjectMetadata": {
+        "source": "PowerShell"
+      }
+    }
+  ],
+  "legacyStoreMetadata": "preserve-or-ignore"
+}

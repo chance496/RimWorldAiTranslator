@@ -1,3 +1,36 @@
+# RimWorld AI Translator v1.0.1-rc.1 (Local RC)
+
+이 후보는 공개 v1.0.0을 변경하지 않는 로컬 검증 결과물입니다. push, PR, tag, GitHub Release, asset 변경, 외부 업로드와 실제 공개 배포는 범위가 아닙니다.
+
+RimWorld AI Translator는 비공식 커뮤니티 도구이며 Ludeon Studios가 개발·보증·지원하는 제품이 아닙니다. RimWorld와 관련 명칭은 각 권리자에게 속합니다.
+
+## C# 후보 변경
+
+- 메인 프로그램, 번역 엔진, WinForms UI, 저장, 적용·RMK 내보내기, 용어집 도구와 패키징 도구를 C#/.NET 8 경로로 통합하고 사용자 실행의 PowerShell·Python·Node.js·Git 의존성을 제거했습니다.
+- Workshop과 RMK 구독본을 읽기 전용으로 분류하고, 로컬/RMK 적용 직전에 현재 원문·경로·reparse·토큰을 다시 검증합니다.
+- 적용 전 정확한 대상·행·파일·제외 수를 dry-run으로 표시하고 기본값 `아니요` 확인을 요구합니다.
+- 의미상 손상된 JSON의 백업 복구와 사용자 알림, revision-safe 저장, 실패·취소 뒤 재개, 다중 파일 롤백과 동시 변경 감지를 보강했습니다.
+- RMK Builder는 선택한 EXE의 identity·크기·SHA-256을 실행 직전에 확인하고 생성 파일을 transaction으로 게시하지만 sandbox는 아닙니다. 신뢰한 전체 작업 클론에서만 실행해야 합니다.
+- 프로젝트가 직접 작성한 기하 도형에서 재현 생성되는 9-size Windows 아이콘과 설명·제품·버전·저작권 메타데이터를 포함합니다. 외부 이미지·폰트·게임 자산은 아이콘에 사용하지 않았습니다.
+
+## 현재 실행의 기술 증거
+
+- 정착된 Phase 08 source/test/tools snapshot은 SHA-256 `7A777BD9D051E4209A7AF7CDF83028966B95F256A2DF3BC3C6D61D9478A51141`입니다.
+- 8개 프로젝트의 엄격한 Release 빌드가 경고 0·오류 0으로 완료됐습니다.
+- 같은 Release 테스트가 독립된 직렬 프로세스에서 80/80을 세 번 연속 통과했으며 flaky 실패는 0이었습니다.
+- 5,000행 합성 WinForms 상호작용, startup/close/cancellation, slow I/O/logger, same/cross-process lease, repository CAS, 접근성·명령·provider 경계와 MainForm 20-cycle 검증이 오류 출력과 잔류 제품 프로세스 없이 통과했습니다.
+- 실제 API 키, 실제 사용자 데이터, 실제 번역 provider와 유료 API는 사용하지 않았습니다. 공개 GitHub 상태도 변경하지 않았습니다.
+
+## 배포 제한과 알려진 blocker
+
+- 이 로컬 후보는 Authenticode 서명이 없습니다. Microsoft SmartScreen 경고가 나타날 수 있으며, 경고 유무는 안전성을 보증하지 않습니다.
+- self-contained 실행 파일은 .NET `8.0.28` runtime을 포함합니다. 시스템에 새 .NET을 설치해도 앱에 포함된 runtime은 갱신되지 않으므로, 보안 업데이트에는 새 후보를 다시 빌드하고 검증해야 합니다. 라이선스·고지 inventory는 `THIRD_PARTY_NOTICES.md`에 있습니다.
+- `glossary.generated.ko.json`은 RimWorld 공식 Core/DLC localization 관측에서 파생됐지만 재배포 권리가 확인되지 않았습니다. 이 파일은 로컬 RC ZIP에서 제외합니다.
+- 공식 파생 용어집을 제외하면 기본 용어 제안과 glossary-bearing AI request payload가 Golden Master와 달라집니다. 따라서 기능·요청 동등성과 전체 공개 품질 판정은 **BLOCKED**입니다. 합성 `sample-glossary.txt`나 사용자 용어집은 권리 문제를 대신 해결하거나 Golden parity를 증명하지 않습니다.
+- clean-PC, 실제 Microsoft Excel, 150%/200%·혼합 DPI, screen reader와 공개 전 최종 수동 검증은 별도 blocker로 남습니다.
+
+개인정보와 취약점 신고는 `PRIVACY.md`와 `SECURITY.md`를 확인하세요.
+
 # RimWorld AI Translator v1.0.0
 
 첫 안정화 릴리스입니다.

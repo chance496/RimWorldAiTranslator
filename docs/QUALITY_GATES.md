@@ -1,181 +1,118 @@
 # Quality Gates
 
-기준 시각: 2026-07-12 KST. 아래 명령은 저장소의 스크립트, README 또는 현재 지침에서 확인했고, 추측한 도구 이름은 넣지 않았다. 모든 명령은 제품 Git 루트에서 실행한다.
+모든 명령은 저장소 루트 `tools/RimWorldAiTranslator`에서 실행한다. 기본 테스트는 `%TEMP%` 합성 fixture만 사용하며 실제 Workshop, RMK, `%LOCALAPPDATA%\RimWorldAiTranslator`, API 키와 외부 네트워크를 쓰지 않는다.
 
-## 현재 존재하는 명령
+## 개발 환경
 
-### 오프라인 회귀 테스트
+- Windows 10/11 x64
+- .NET SDK 8.0.422 이상
+- 릴리스 사용자에게는 SDK나 .NET Runtime이 필요하지 않다.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-RegressionTests.ps1 -Suite All
+## 복원과 빌드
+
+```text
+dotnet restore RimWorldAiTranslator.sln --configfile NuGet.config
+dotnet build RimWorldAiTranslator.sln -c Release --no-restore -p:TreatWarningsAsErrors=true
 ```
 
-테스트는 합성 fixture를 고유한 `%TEMP%` 폴더에 복제하며 실제 사용자 프로젝트와 외부 네트워크를 사용하지 않는다. API 회귀는 루프백 TCP 가짜 서버를 쓴다. 작업 중에는 `-Suite Harness`, `Syntax`, `StateStore`, `SecretHandling`, `ProviderValidation`, `TranslationMemory`, `Diagnostics`, `UiTools`, `ProjectCleanup`, `DryRun`, `DefSafety`, `DuplicateIdentity`, `TokenSafety`, `ApiResilience`, `DirectOutput`, `LocalApply`, `LocalRollback`, `RmkExport`, `RmkHistory`처럼 가장 좁은 suite부터 실행한다.
+완료 조건: 모든 프로젝트가 빌드되고 경고 0, 오류 0.
 
-### 실행
+## 오프라인 회귀
 
-README와 실제 CMD 진입점:
+이 저장소의 회귀 runner는 테스트 SDK가 아니라 의존성 없는 콘솔 프로그램이다.
 
-```powershell
-.\Start-RimWorldAiTranslatorGui.cmd
+```text
+dotnet run --project tests/RimWorldAiTranslator.Tests/RimWorldAiTranslator.Tests.csproj -c Release --no-build --no-restore
 ```
 
-CMD는 다음 PowerShell 진입점을 호출한다.
+완료 조건: 출력된 전체 테스트가 모두 PASS이고 종료 코드가 0이다. 고정된 과거 개수를 완료 근거로 사용하지 않는다.
 
-```powershell
-powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Start-RimWorldAiTranslatorGui.ps1
+릴리스 후보의 연속 회귀 게이트는 빌드된 동일 Release DLL을 서로 다른 프로세스로 세 번 실행한다. 다음 세 명령이 모두 전체 PASS와 종료 코드 0이어야 하며, 한 번의 성공으로 대체하지 않는다.
+
+```text
+dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
+dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
+dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
 ```
 
-`Start-RimWorldAiTranslatorGui.ps1`는 다시 `Start-RimWorldAiReviewGui.ps1`를 `-NoProfile -STA -ExecutionPolicy Bypass`로 실행한다. 릴리스 사용자는 `RimWorldAiTranslator.exe`를 실행한다.
+## 성능 측정
 
-### 빌드 및 패키징
-
-README와 `build-package.ps1`에서 확인한 유일한 빌드/패키징 명령:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-package.ps1
+```text
+dotnet run --project .\tests\RimWorldAiTranslator.Benchmarks\RimWorldAiTranslator.Benchmarks.csproj -c Release --no-build -- --rows 5000 --iterations 5
 ```
 
-이 명령은 Windows .NET Framework `csc.exe`로 `launcher/RimWorldAiTranslatorLauncher.cs`와 `native/RimWorldTranslatorNative.cs`를 컴파일하고 `dist/RimWorldAiTranslator` 및 `dist/RimWorldAiTranslator.zip`을 다시 만든다. 별도의 build-only 명령은 없다.
+완료 조건: 추출·검수 로드 결과가 정확히 5,000행, 키 검색 1행, 상태 필터 5,000행이며 JSON 측정 결과와 종료 코드 0을 출력한다. Phase 08의 동등한 전후 측정에서 20%를 넘는 중대한 회귀, 반복되는 200ms 초과 UI 검색·필터 지연, 문서화된 취소 응답 목표 위반은 릴리스 게이트다. 서로 동등하지 않은 경로의 수치와 그 밖의 숫자는 설명용 참고치로만 사용한다.
 
-### PowerShell 정적 구문 검사
+## 격리 UI harness
 
-운영 지침에 요구되어 있고 이번 최종 점검에서 실제 실행해 소스·테스트 20개 스크립트 모두 통과한 명령:
-
-```powershell
-$failed = $false
-Get-ChildItem -LiteralPath . -Recurse -File -Filter '*.ps1' |
-Where-Object { $_.FullName -notlike '*\dist\*' } |
-Sort-Object FullName | ForEach-Object {
-    $tokens = $null
-    $errors = $null
-    [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
-    if ($errors.Count -gt 0) {
-        $failed = $true
-        $errors | ForEach-Object { Write-Error "$($_.Extent.StartLineNumber): $($_.Message)" }
-    }
-}
-if ($failed) { exit 1 }
+```text
+dotnet run --project tests/RimWorldAiTranslator.UiHarness/RimWorldAiTranslator.UiHarness.csproj -c Release --no-build --no-restore -- --slow-bootstrap
+dotnet run --project tests/RimWorldAiTranslator.UiHarness/RimWorldAiTranslator.UiHarness.csproj -c Release --no-build --no-restore -- --single-instance-probe
 ```
 
-동일 Parser 검사는 오프라인 회귀와 `build-package.ps1`의 패키지 복사 후 단계에 연결되어 있다.
+원시 App 명령은 기본 `%LOCALAPPDATA%`와 실제 discovery를 열 수 있으므로 품질 게이트로 직접 실행하지 않는다. UI harness는 고유한 임시 data/discovery root와 합성 fixture를 만들고 종료 시 그 루트만 정리한다. 실제 배포 EXE 시작·종료는 아래 C# package 명령의 격리 smoke에서만 검증한다. UI 변경은 최소 900x600과 일반 최대화 화면에서 밝음·어두움, 대시보드·설정·검수 화면, 글자 잘림, 목록 스크롤, 키보드와 중지 버튼을 확인한다.
 
-### UI·성능·접근성 감사
+## 자체 포함 패키지
 
-5,000행 합성 검수 프로젝트를 고유한 `%TEMP%` 작업공간과 격리 앱 데이터에서 실행한다. 시작 빈 상태·프로젝트·설정·검수·사전 점검·명령 팔레트·로딩·오류·취소·완료·품질·번역 메모리를 포함한 15개 상태, 다섯 디자인 컨셉, 밝음·어두움·고대비, 최소/일반/대형 창, 글자 크기 10/12의 PNG·접근성 JSON과 성능 JSON을 남기며 실제 사용자 프로젝트나 네트워크를 사용하지 않는다.
+로컬 RC를 만드는 유일한 개발 명령:
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-UiPerformanceAudit.ps1 `
-  -Rows 5000 `
-  -Iterations 5 `
-  -OutputRoot "$env:TEMP\RimWorldAiTranslator-ui-audit"
+```text
+dotnet run --project tools/RimWorldAiTranslator.Tooling -c Release --no-build --no-restore -- package
 ```
 
-검색 결과와 `미번역`/`번역됨` 필터 개수, 비어 있지 않은 화면, 보이는 상호작용 컨트롤의 접근성 이름, 부모 영역 잘림과 버튼·체크박스·콤보박스·고정 라벨의 실제 글자 잘림을 함께 단언한다. 보이는 5,000행 프로젝트 재로드는 원자 로딩 커버를 사용하고 15초 안에 끝나야 한다. 작업 상태 막대를 표시하고 숨기는 동안 `main` bounds가 그대로인지도 단언한다. 밝은 테마는 화면 캡처 경합으로 생기는 비정상 검은 영역도 차단한다. 첫 화면 준비 시점과 실제 DPI를 보고서에 기록한다.
+C# 도구는 다음을 순서대로 강제한다.
 
-한 상태만 재현할 때는 저장소가 제공하는 `-ScenarioName`을 사용한다.
+1. 외부 package source가 없는 복원, Release 솔루션 빌드와 전체 회귀.
+2. `dotnet publish -r win-x64 --self-contained true` 단일 EXE.
+3. EXE `FileVersion=1.0.1.0`, `ProductVersion=1.0.1-rc.1`.
+4. EXE, 원본+DLC 용어집, Def 규칙, 문서·라이선스·버전만 ZIP에 포함.
+5. `.ps1`, `.psm1`, `.cmd`, `.bat`, `powershell.exe`, `pwsh.exe` 패키지 유입 차단.
+6. 격리 data/discovery root에서 탐색 완료 ACK와 창 표시, 자식 프로세스 0개, 정상 종료와 ExitCode 0.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-UiPerformanceAudit.ps1 `
-  -Rows 5000 -Iterations 1 -ScenarioName quality-center-light `
-  -OutputRoot "$env:TEMP\RimWorldAiTranslator-quality-audit"
+용어집 도구의 합성 self-test도 패키지 전에 별도로 통과해야 한다.
+
+```text
+dotnet run --project tools/RimWorldAiTranslator.GlossaryTool -c Release --no-build --no-restore -- self-test
 ```
 
-패키지 EXE의 첫 화면은 움직이는 무한 진행 표시가 있는 준비 화면이 먼저 보이고, 메인 창은 `alpha=0` 초기화 상태를 거쳐 완성된 뒤에만 공개되어야 한다. 다음 감사는 실제 최대화 상태로 시작해 서로 다른 두 프레임의 진행 표시 픽셀 변화, 대시보드 명령 버튼의 오른쪽 여백, 준비 화면 공백, 조기 공개, 최종 화면 잘림과 비정상 종료를 차단한다.
+## 정적·릴리스 검사
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-StartupVisualAudit.ps1 `
-  -OutputRoot "$env:TEMP\RimWorldAiTranslator-startup-audit"
+```text
+rg -n -i "csk-|sk-[A-Za-z0-9_-]{20,}|api[_ -]?key" --glob '!dist/**' --glob '!bin/**' --glob '!obj/**'
+dotnet run --project tools/RimWorldAiTranslator.Tooling -c Release --no-build --no-restore -- verify-zero
+git diff --check
 ```
 
-### RMK XLSX 성능 benchmark
+- 키 검색 결과는 UI 라벨·테스트용 가짜 값·보안 규칙만 수동 판독한다. 실제 키 형태 값은 0개여야 한다.
+- `src`의 PowerShell 런타임 호출은 0개여야 한다.
+- `git diff --check` 오류는 0개여야 한다.
+- ZIP을 별도 임시 폴더에 풀어 EXE 버전, 필수 8개 항목, 금지 런타임 0개와 SHA-256을 다시 확인한다.
 
-고유한 `%TEMP%` 안에서만 5,000행 RMK XML/XLSX를 생성하고 같은 workbook 갱신을 반복한다. 생성·갱신 시간, 최악값, 자식 프로세스 최대 working set과 workbook 크기를 JSON으로 기록하고 XLSX ZIP 구조를 검증한다.
+## 2026-07-13 측정 스냅샷
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-RmkPerformanceBenchmark.ps1 `
-  -Rows 5000 `
-  -Iterations 3 `
-  -OutputPath "$env:TEMP\RimWorldAiTranslator-rmk-performance.json"
-```
+호스트 `CHANCE`, .NET 8.0.28, Release, 5,000행 합성 fixture. 측정치는 같은 호스트에서의 회귀 비교용이다.
 
-### CLI 번역/원문 로드
+| 항목 | 이전 PowerShell 기준 | C# v1.0.0 |
+|---|---:|---:|
+| 첫 창 표시 | 약 3.02~3.37초 | 2.239초 |
+| 같은 패키지 재실행 | 미측정 | 0.517초 |
+| 검수 프로젝트 열기 5,000행 | 840.7ms | 중앙 88.613ms, p95 124.435ms |
+| 원문 XML 추출 5,000행 | 별도 동일 측정 없음 | 중앙 19.292ms, p95 25.598ms |
+| 키 검색 5,000행 | 첫 1,153.9ms, 중앙 979.5ms | 중앙 9.229ms, p95 11.935ms |
+| 상태 필터 5,000행 | 결과만 검증 | 중앙 0.446ms, p95 0.578ms |
+| 사전 취소 추출 | 미측정 | 1.157ms |
+| 앱 작업 집합 | 238.9MiB | 첫 167.6MiB, 재실행 146.1MiB |
+| 정상 종료 | 미측정 | 0.313~0.395초, ExitCode 0 |
+| 배포 크기 | 약 356KiB(시스템 PowerShell 의존) | ZIP 66,369,738바이트(자체 포함) |
 
-README에 기록된 네트워크 키가 필요 없는 검수 출력 명령:
+검색 최대값 202.708ms는 JIT/GC가 포함된 단일 표본이므로 P2 계측 대상으로 남기고 중앙·p95와 분리한다.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-RimWorldAiTranslation.ps1 `
-  -ModRoot "<fixture-or-mod-path>" `
-  -TranslationProvider Google `
-  -ReviewOnly
-```
+## 릴리스 완료 조건
 
-`-SourceOnly`, `-DryRun`과 합성 검수 결정을 조합한 저장소 소유 회귀가 있으며 실제 사용자 모드나 네트워크를 자동 게이트에 사용하지 않는다. `-MockTranslations`의 배치 재시도·재개 검증은 P1에서 확장한다.
-
-### 검수 결과 적용
-
-README의 로컬 적용 명령이며, 안전 점검에서는 반드시 `-DryRun`을 추가한다.
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Apply-RimWorldAiReviewResults.ps1 `
-  -ModRoot "<fixture-mod-path>" `
-  -ReviewRoot "<fixture-review-path>" `
-  -Overwrite `
-  -ApplyStatus ApprovedOnly `
-  -DryRun
-```
-
-### RMK 내보내기
-
-README의 RMK 병합 명령이며, 안전 점검에서는 반드시 fixture와 `-DryRun`을 사용한다.
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Export-RimWorldAiReviewToRmk.ps1 `
-  -RmkEntryRoot "<fixture-rmk-entry-path>" `
-  -ReviewRoot "<fixture-review-path>" `
-  -SourceLanguage English `
-  -Overwrite `
-  -ApplyStatus ApprovedOnly `
-  -DryRun
-```
-
-## 존재하지 않는 게이트
-
-- Pester 테스트 프레임워크: 없음. 저장소 소유 `Run-RegressionTests.ps1` 통합 runner를 사용한다.
-- 린터/formatter: 없음
-- CI workflow: 없음
-- 패키지 ZIP 압축 해제 후 GUI smoke의 자동 빌드 연결: 없음. CLI 원문 추출은 빌드에 연결했고, 최종 점검에서는 패키지 스크립트와 EXE를 격리 앱 데이터로 별도 실행했다.
-- 125/150/200% 실제 DPI 자동 감사: 없음. 현재 runner는 실행 환경의 실제 DPI를 기록하지만 Windows 디스플레이 배율을 바꾸지 않는다.
-
-`testdata/SampleMod`의 기대 원문 7개, 내부 식별자 제외 1개, 로컬/RMK 적용과 롤백 기대값이 회귀 runner에 정의되어 있다.
-
-## 백업 복구
-
-- 기존 XML/XLSX를 교체하면 같은 경로의 `<파일>.bak`에 직전 버전이 남는다.
-- 앱과 RimWorld를 종료한 뒤 현재 파일을 별도 보관하고 `.bak`을 원래 파일명으로 복사하면 수동 복구할 수 있다.
-- 다중 파일 적용 도중 실패하면 해당 실행에서 이미 쓴 파일은 자동으로 직전 상태로 롤백된다. 롤백 자체가 실패하면 오류에 대상 경로가 표시되며 성공으로 처리하지 않는다.
-
-## 변경별 필수 게이트
-
-| 변경 영역 | 최소 필수 검증 |
-|---|---|
-| 문서/AGENTS만 | 링크·경로 확인, 바이트 크기, `git diff --check`, 제품 소스 무변경 확인 |
-| PowerShell 로직 | Parser, 대상 fixture 회귀, `git diff --check` |
-| Native C# | Parser가 아닌 `build-package.ps1`의 C# 컴파일, XML/XLSX fixture, 패키지 확인 |
-| 저장/적용/RMK | 손상·중단·경로 이탈·중복 키·원문 변경·토큰 사례, `DryRun`, 실패 주입, 백업/복구 확인 |
-| UI | Parser, 핵심 흐름, 최소/일반 창, 100/125/150/200% DPI, 밝음/어두움/고대비, 키보드, 전후 스크린샷 |
-| 성능 | 동일 fixture와 출력, warm/cold 조건 명시, 반복 수, 중앙값·최악값·메모리 전후 기록 |
-| 릴리스 | 전체 회귀, 패키지 빌드, 필수 파일 목록, 새 폴더 압축 해제, EXE 시작/종료, 소스-패키지 일치 |
-
-## 이번 점검 실행 결과
-
-- 오프라인 회귀: 20/20 PASS(최종 패키지 게이트 39.511초). 취소·부분 체크포인트·재시도·재개는 로컬 TCP 가짜 API로 검증했고 제공자 설정·번역 메모리·진단 privacy·UI/품질 순수 도구도 포함한다.
-- 패키지 빌드: PASS. native 검증 컴파일, 행 캐시 동일성·재설정·원본 무변형 smoke, 패키지 PowerShell Parser와 새 임시 폴더 ZIP 원문 추출 7행 smoke PASS. 패키지 PowerShell 17개, 전체 26개 파일, 필수 EXE·DLL과 356,491바이트 ZIP을 확인했다.
-- UI 감사: 15/15 PASS. 5,000행 검색 결과 295/5,000개 및 상태 필터 2,667/2,333개 일치, 모든 작업 상태와 도구 화면 포함, 잘림 0건, 접근성 이름 누락 0건. 로드 840.7ms, 첫 검색 1,153.9ms, 검색 중앙 979.5ms, 다음 31.7ms, 저장 447.6ms, 무변경 저장 0.152ms, working set 238.9MB다.
-- 품질 센터: 5,000행 첫 상태 화면 10.077→7.713초. 별도 동일 화면 반복은 7.153초였으며 희소 결정을 만들지 않고 필터는 캐시·가상 목록을 사용한다.
-- RMK benchmark: 5,000행 생성 7,089.816ms, 갱신 중앙 8,983.882ms/최악 9,429.046ms, 최대 working set 323.02MB.
-- 패키지 실행: 격리 앱 데이터로 준비 화면과 900×600 메인 화면을 렌더링했다. 애니메이션 변경 후 반복 실행에서 준비 화면 0.305~0.330초, 완성 공개 3.019~3.373초, 220ms 사이 진행 표시 변화 170픽셀, 숨은 초기화 7~12샘플, 중간 공백 0샘플, EXE `ExitCode=0`, 잘림 0건이다. 이전 감사 인수 없는 일반 경로도 2.951초에 공개되고 정상 종료됐다.
-- 시작 전환 변경 후 5,000행 UI 감사 15/15를 재실행했다. 접근성 이름 누락, 컨트롤 경계 잘림과 실제 글자 잘림은 모두 0건이다.
-- 최대화 시작 회귀: 논리 클라이언트 폭 1,536에서 명령 버튼 오른쪽 여백 28px, 진행 표시 변화 170픽셀, 완성 공개 4.453초, 숨은 초기화 27샘플, 중간 공백·잘림 0건, `ExitCode=0`이다. 최소 창 프로젝트 화면과 어두운 설정 화면 감사도 각각 통과했다.
-- 보이는 프로젝트 재로드: 5,000행에서 본문 로딩 커버 사용을 단언했고 996.076ms에 완료했다. 검색 결과 295개와 상태 필터 2,667/2,333개가 유지됐으며 전체 자식 창 `WM_SETREDRAW` 방식에서 발생했던 60초 정지는 재발하지 않았다.
-- 네트워크, 실제 API, Workshop, RMK 구독본과 `%LOCALAPPDATA%\RimWorldAiTranslator` 쓰기: 실행하지 않음.
+- 빌드 경고 0/오류 0.
+- 같은 Release DLL의 전체 오프라인 회귀를 별도 프로세스로 3회 연속 실행해 매번 전체 PASS와 종료 코드 0.
+- 5,000행 벤치마크 행·검색 결과 일치.
+- UI harness 및 실제 배포 EXE 정상 표시·취소·종료.
+- ZIP 금지 런타임 0개, PowerShell 자식 0개, 정확한 버전과 SHA-256.
+- README, 패키지 안내, 릴리스 노트, VERSION, PE와 ZIP이 같은 로컬 후보 `v1.0.1-rc.1`을 가리킨다.
+- 공개 v1.0.0의 tag/Release/asset은 변경하지 않으며 로컬 RC 작업에서 외부 배포를 수행하지 않는다.

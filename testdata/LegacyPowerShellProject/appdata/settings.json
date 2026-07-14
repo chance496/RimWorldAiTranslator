@@ -1,0 +1,21 @@
+{
+  "version": 3,
+  "themeMode": "System",
+  "designPreset": "Professional",
+  "textSize": 10,
+  "highContrast": false,
+  "autoSave": true,
+  "rmkWorkspaceRoot": "__RMK_ROOT__",
+  "rmkUseExisting": true,
+  "apiProviderId": "Custom",
+  "apiProviders": {
+    "Custom": {
+      "name": "Fixture Provider",
+      "url": "http://127.0.0.1:1/v1/chat/completions",
+      "model": "fixture-model",
+      "temperature": 0.1,
+      "legacyProviderMetadata": "preserve-or-ignore"
+    }
+  },
+  "legacySettingsMetadata": "preserve-or-ignore"
+}

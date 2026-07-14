@@ -8,16 +8,18 @@
 #   원문 => 번역
 #   원문<Tab>번역<Tab>메모
 #
-# 이 파일은 샘플입니다. 기본 실행은 공식 본편+DLC 용어집만 사용합니다.
-# GUI에서 "추가 용어집 로드"로 이 파일 또는 직접 만든 TXT/JSON 파일을 선택하면 적용됩니다.
+# 아래 항목은 형식 설명을 위해 이 프로젝트에서 만든 합성 placeholder입니다.
+# 게임, DLC, 모드 또는 번역 프로젝트에서 가져온 문자열이 아닙니다.
+# GUI에서 "추가 용어집 로드"로 이 파일 또는 직접 만든 TXT/TSV/CSV/JSON 파일을 선택하면 적용됩니다.
+# 공식 파생 기본 용어집은 재배포 권리가 확인되지 않아 로컬 RC ZIP에서 제외됩니다.
 
-Milira=밀리라
-Milira Imperium=밀리라 제국
-Milian=밀리언
-Lustrous Steel=광휘강
-Feather Thread=깃털 원단
-Solar Crystal=태양 수정
-Imperial Token=제국 징표
-Reserves points=예비 점수
-privateer fleet=사선대
-Shroud=장막
+Example Widget=예시 장치
+Synthetic Alloy=합성 합금
+Demo Relay=데모 중계기
+Placeholder Token=자리표시자 토큰
+Fictional Beacon=가상 신호기
+Sample Thread=샘플 원단
+Training Crystal=훈련용 결정
+Reserved demo points=예약된 데모 점수
+Example Fleet=예시 함대
+Demo Status=데모 상태

@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <!-- Global public type names and P/Invoke visibility are retained for v1.0.0
+         script-host/API compatibility while the linked native source is migrated. -->
+    <NoWarn>$(NoWarn);CA1050;CA1401</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\native\RimWorldTranslatorNative.cs" Link="RimWorldTranslatorNative.cs" />
+  </ItemGroup>
+
+</Project>
