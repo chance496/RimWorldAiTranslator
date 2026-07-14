@@ -2,7 +2,7 @@
 
 ## Objective and fixed boundaries
 
-- Current user-authorized integration override (2026-07-14): after the compatibility/startup repair passes its relevant gates, commit and normally push `main`, verify candidate containment, then delete `origin/codex/csharp-migration`. PR, tag, Release, asset, metadata, Actions dispatch and deployment remain prohibited.
+- Current user-authorized integration override (2026-07-14, completed): after the compatibility/startup repair passed its relevant gates, `main` was committed and normally pushed, candidate containment was verified, and `origin/codex/csharp-migration` was deleted. PR, tag, Release, asset, metadata, Actions dispatch and deployment remain prohibited and were not performed.
 
 - Golden Master: `4c7d11b49126ba3987e9d49bd16944d4376ba0bc`.
 - Candidate basis: `891d135bb9b37e7d56dd4c29336bb20d277841bc` plus the preserved pre-existing working tree and evidence-backed local Phase 04-10 fixes.

@@ -6,9 +6,9 @@
 - Branch/worktree: `main` / `%USERPROFILE%\Documents\Rimworld\tools\RimWorldAiTranslator`
 - Evidence root: `artifacts/release-readiness/20260713-195509/`
 - Golden comparison root: `%TEMP%\RimWorldAiTranslator-rr-20260713-195509\baseline`
-- Last updated: `2026-07-14 22:18:18 +09:00`
+- Last updated: `2026-07-14 22:20:05 +09:00`
 - Final verdict: **BLOCKED**
-- Remote changes performed: **YES — user-requested source branch push only**
+- Remote changes performed: **YES — user-requested `main` source push and superseded candidate-branch deletion only**
 
 ## Phase status
 
@@ -45,13 +45,14 @@
 
 ## Git safety snapshot
 
-- Branch: local `main` at merge commit `d6ecf9e99697df7cffe39988b51ffd0283f88258`; upstream `origin/main`; current fixes are not yet committed at this checkpoint.
+- Branch: local `main` and `origin/main` both at `6a977a16913922313d2da7e0679e3c0983a607a9`; superseded local/remote `codex/csharp-migration` deleted after containment verification.
 - The former disconnected local `main` was preserved as `backup/local-main-b49f217-20260714` before tracking `origin/main` and merging the C# candidate. No `git add .`, `git add -A`, reset, restore, amend, clean, force push or history rewrite was used.
 - Existing user changes preserved: **YES**. The complete coherent C# candidate was published because a startup-only commit would omit required new source and test dependencies from the remote branch.
 
 ## External action audit
 
-- Push: **YES historically — candidate branch only; current `main` push and candidate-branch deletion are user-authorized but pending at this checkpoint**
+- Push: **YES — `6a977a16913922313d2da7e0679e3c0983a607a9` to `origin/main`, explicitly requested by the user**
+- Branch deletion: **YES — `origin/codex/csharp-migration` and its local branch, only after `origin/main` was verified to contain tip `7e0eb0addd56b41d0b3d1443911f919e7567f406`**
 - PR / tag / Release / asset / repository metadata / manual GitHub Actions: **NO**
 - External upload / paid API / real provider API: **NO**
 - Real user data / real API key used: **READ-ONLY ISOLATED COPY / NO**. An actual legacy project copy was used only in a temporary isolated compatibility probe; originals were not modified, the temporary copy was removed after verification, and no user content was committed or retained in fixtures.
