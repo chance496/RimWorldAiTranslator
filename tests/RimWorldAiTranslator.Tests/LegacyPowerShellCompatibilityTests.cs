@@ -79,7 +79,7 @@ internal static partial class Program
             Assert(workbookData.Rows.Count == 3
                    && workbookData.Map.Count == 2
                    && workbookData.Map["Keyed+Legacy.Message"].Translation == "안녕하세요 {0}",
-                "A passive showFormulas setting or stable PowerShell duplicate history row blocked the legacy RMK workbook.");
+                "A passive showFormulas setting, conditional-formatting formula, or stable PowerShell duplicate history row blocked the legacy RMK workbook.");
 
             var reviewService = new ReviewWorkspaceService(store, CreateExtractor(), paths.Reviews);
             var workspace = reviewService.Load(reviewRoot, project);
@@ -209,6 +209,16 @@ internal static partial class Program
                 cell.SetAttributeValue("r", reference.TrimEnd('2') + "4");
             }
             sheetData.Add(duplicate);
+            var spreadsheet = sheetData.Name.Namespace;
+            sheetData.AddAfterSelf(
+                new XElement(
+                    spreadsheet + "conditionalFormatting",
+                    new XAttribute("sqref", "D2:D4"),
+                    new XElement(
+                        spreadsheet + "cfRule",
+                        new XAttribute("type", "expression"),
+                        new XAttribute("priority", "1"),
+                        new XElement(spreadsheet + "formula", "LEN($D2)>0"))));
         });
     }
 

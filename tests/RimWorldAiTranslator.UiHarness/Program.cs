@@ -1193,6 +1193,8 @@ internal static class Program
         RimWorldModDiscoveryService discovery)
     {
         RunStartupPresentationHarness(Path.Combine(root, "startup-presentation"), discovery);
+        RunLoadingOverlayTerminalStateHarness();
+        RunDashboardProjectSelectionHarness(root);
         RunPhaseOneStartupFailureHarness(Path.Combine(root, "phase-one-startup-failure"), discovery);
         RunMainFormStartupFailureHarness(Path.Combine(root, "main-startup-failure"), discovery);
         RunUiActionTruthfulnessHarness(Path.Combine(root, "ui-action-error"), discovery);
@@ -1215,6 +1217,9 @@ internal static class Program
         Exception? harnessFailure = null;
         var presentationChecked = false;
         var postRevealControlAdditions = 0;
+        var deferredGlossaryCompleted = 0;
+        using var deferredGlossaryStarted = new ManualResetEventSlim(false);
+        using var releaseDeferredGlossary = new ManualResetEventSlim(false);
 
         Task<AppStartupState> CreateState(CancellationToken cancellationToken)
         {
@@ -1224,7 +1229,19 @@ internal static class Program
 
         var bootstrap = new StartupBootstrapForm(
             CreateState,
-            startupFailurePresenter: exception => harnessFailure ??= exception);
+            startupFailurePresenter: exception => harnessFailure ??= exception,
+            mainFormFactoryForTesting: state => new MainForm(
+                state.Services,
+                state.ProjectStats,
+                state.IsolationAcknowledgementPath,
+                ioHooks: new UiIoHooks(
+                    LoadGlossary: token =>
+                    {
+                        deferredGlossaryStarted.Set();
+                        releaseDeferredGlossary.Wait(token);
+                        Interlocked.Exchange(ref deferredGlossaryCompleted, 1);
+                        return [];
+                    })));
         using var watchdog = new System.Windows.Forms.Timer { Interval = 5_000 };
         watchdog.Tick += (_, _) =>
         {
@@ -1257,6 +1274,21 @@ internal static class Program
                             throw new InvalidOperationException("Visible controls changed size, position, or visibility after the first main-form frame.");
                         if (Volatile.Read(ref postRevealControlAdditions) != 0)
                             throw new InvalidOperationException("Controls were added after the first main-form frame became visible.");
+                        if (!deferredGlossaryStarted.IsSet
+                            || Volatile.Read(ref deferredGlossaryCompleted) != 0)
+                        {
+                            throw new InvalidOperationException(
+                                "The main form waited for deferred glossary loading before revealing its completed first frame.");
+                        }
+                        releaseDeferredGlossary.Set();
+                        var glossaryDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+                        while (Volatile.Read(ref deferredGlossaryCompleted) == 0
+                               && DateTime.UtcNow < glossaryDeadline)
+                        {
+                            await Task.Delay(10);
+                        }
+                        if (Volatile.Read(ref deferredGlossaryCompleted) == 0)
+                            throw new TimeoutException("Deferred glossary loading did not complete after the startup frame was revealed.");
                         presentationChecked = true;
                     }
                     catch (Exception exception)
@@ -1265,6 +1297,7 @@ internal static class Program
                     }
                     finally
                     {
+                        releaseDeferredGlossary.Set();
                         watchdog.Stop();
                         await form.DisposeAfterFailedBootstrapAsync();
                         if (!bootstrap.IsDisposed) bootstrap.Close();
@@ -1294,6 +1327,57 @@ internal static class Program
             throw new InvalidOperationException("The completed first-frame startup transition was not observed.");
         if (createdState is null)
             throw new InvalidOperationException("The startup presentation probe did not create application state.");
+    }
+
+    private static void RunLoadingOverlayTerminalStateHarness()
+    {
+        using var host = new Form { ClientSize = new Size(1_200, 700) };
+        using var overlay = new LoadingOverlay();
+        host.Controls.Add(overlay);
+        overlay.Show("원문 분석 중", "합성 입력을 확인하고 있습니다.", ThemeManager.Current, cancellable: true);
+        overlay.Complete(
+            "error",
+            "원문 분석에 실패했습니다",
+            "입력 상태를 확인한 뒤 다시 시도하세요.",
+            canRetry: true);
+        if (!overlay.TitleForTesting.Equals("원문 분석에 실패했습니다", StringComparison.Ordinal)
+            || !overlay.StageForTesting.Equals("실패", StringComparison.Ordinal)
+            || !overlay.CountForTesting.Equals("실패 · 다시 시도 가능", StringComparison.Ordinal)
+            || overlay.SpinnerVisibleForTesting)
+        {
+            throw new InvalidOperationException(
+                "A failed operation retained its running title, spinner, or inaccurate retry state.");
+        }
+
+        overlay.Show("다음 작업 실행", "새 작업을 준비합니다.", ThemeManager.Current, cancellable: true);
+        if (!overlay.SpinnerVisibleForTesting)
+            throw new InvalidOperationException("A new operation did not restore its running indicator.");
+    }
+
+    private static void RunDashboardProjectSelectionHarness(string root)
+    {
+        using var dashboard = new ProjectDashboardControl();
+        var firstPath = Path.Combine(root, "mods", "first");
+        var projectPath = Path.Combine(root, "mods", "project");
+        var first = new RimWorldModInfo(
+            "First [W:100]", "First", firstPath, "Synthetic", "first", "synthetic.first", "100", "first");
+        var projectMod = new RimWorldModInfo(
+            "Project [W:200]", "Project", projectPath, "Synthetic", "project", "synthetic.project", "200", "project");
+        var project = new TranslationProject
+        {
+            Id = "synthetic-project",
+            Name = "Project",
+            ModRoot = projectPath,
+            PackageId = projectMod.PackageId,
+            WorkshopId = projectMod.WorkshopId
+        };
+        dashboard.SetData([first, projectMod], [project]);
+        dashboard.SelectProjectMod(project);
+        if (!dashboard.SelectedModPathForTesting.Equals(projectPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Opening a saved project left an unrelated mod selected in the dashboard picker.");
+        }
     }
 
     private static string[] CaptureVisibleControlLayout(Control root) =>

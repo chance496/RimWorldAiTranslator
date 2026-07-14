@@ -2,10 +2,12 @@
 
 ## Objective and fixed boundaries
 
+- Current user-authorized integration override (2026-07-14): after the compatibility/startup repair passes its relevant gates, commit and normally push `main`, verify candidate containment, then delete `origin/codex/csharp-migration`. PR, tag, Release, asset, metadata, Actions dispatch and deployment remain prohibited.
+
 - Golden Master: `4c7d11b49126ba3987e9d49bd16944d4376ba0bc`.
 - Candidate basis: `891d135bb9b37e7d56dd4c29336bb20d277841bc` plus the preserved pre-existing working tree and evidence-backed local Phase 04-10 fixes.
-- Goal: a local self-contained `win-x64` C# RC with active product/build/test/package PowerShell 0, Golden behavior/data/UI compatibility, and no public GitHub change.
-- Out of scope/prohibited: push, PR, tag, Release, asset, metadata, Actions dispatch, upload, paid or real provider API, real user/Workshop/RMK-subscription mutation, signing, display/system setting changes, restart and public distribution. Existing `v1.0.0` is immutable.
+- Goal: a local self-contained `win-x64` C# build with active product/build/test/package PowerShell 0 and Golden behavior/data/UI compatibility, integrated into `main` under the current user authorization.
+- Out of scope/prohibited: PR, tag, Release, asset, metadata, Actions dispatch, upload beyond the authorized source push, paid or real provider API, real user/Workshop/RMK-subscription mutation, signing, display/system setting changes, restart and public distribution. Existing `v1.0.0` is immutable.
 - The user authorized one computer shutdown only after genuine completion or terminal stop. It is the final operational action, not a quality gate.
 
 ## Ordered phase plan

@@ -88,6 +88,7 @@ internal sealed class LoadingOverlay : BufferedPanel
     private readonly System.Windows.Forms.Timer timer;
     private readonly System.Windows.Forms.Timer dismissTimer;
     private int frame;
+    private bool spinnerActive;
 
     public LoadingOverlay()
     {
@@ -148,6 +149,8 @@ internal sealed class LoadingOverlay : BufferedPanel
     public void Show(string heading, string message, ThemePalette theme, bool cancellable = false)
     {
         dismissTimer.Stop();
+        spinnerActive = true;
+        spinner.Visible = true;
         if (Parent is not null)
         {
             var workspace = Parent.Controls.OfType<ReviewWorkspaceControl>().FirstOrDefault(control => control.Visible);
@@ -245,13 +248,22 @@ internal sealed class LoadingOverlay : BufferedPanel
     {
         dismissTimer.Stop();
         timer.Stop();
-        stage.Text = heading;
+        spinnerActive = false;
+        spinner.Visible = false;
+        title.Text = heading;
+        stage.Text = kind switch
+        {
+            "completed" => "완료",
+            "cancelled" => "중단됨",
+            _ => "실패"
+        };
         detail.Text = message;
         count.Text = kind switch
         {
             "completed" => "결과 저장됨",
             "cancelled" => "완료분 보존",
-            _ => "실패 · 재시도 가능"
+            _ when canRetry => "실패 · 다시 시도 가능",
+            _ => "실패 · 입력 확인 필요"
         };
         progress.Style = ProgressBarStyle.Continuous;
         progress.MarqueeAnimationSpeed = 0;
@@ -271,10 +283,19 @@ internal sealed class LoadingOverlay : BufferedPanel
         }
     }
 
+    internal string TitleForTesting => title.Text;
+
+    internal string StageForTesting => stage.Text;
+
+    internal string CountForTesting => count.Text;
+
+    internal bool SpinnerVisibleForTesting => spinnerActive;
+
     public void HideOverlay()
     {
         dismissTimer.Stop();
         timer.Stop();
+        spinnerActive = false;
         cancel.Visible = false;
         retry.Visible = false;
         review.Visible = false;

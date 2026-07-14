@@ -396,3 +396,13 @@
 - strict Release build는 경고/오류 0/0, Phase08 UI truthfulness, slow bootstrap 성공/취소, transition failure, provider URL/settings, legacy PowerShell compatibility와 project cleanup이 통과했다. 전체 기능 suite는 82/83이며 유일한 실패는 이번 범위 밖의 기존 `Phase08.ForcedExitRecovery` 1,000-target 시간 상한으로 69.723초/60초였다.
 - 사용자 전달용 r4는 `artifacts/local-builds/RimWorldAiTranslator-legacy-compat-win-x64-r4/RimWorldAiTranslator.exe`, 155,588,155 bytes, SHA-256 `FED024E75B2417E039BE3EAA3A7FF4BE46759A2DCC9B9349A710AD38F32ED23B`다. 고유 격리 data/discovery root에서 responsive main window와 acknowledgement, 정상 close/exit 0을 확인했고 임시 root를 제거했다. Release/tag/asset은 생성하거나 수정하지 않았다.
 - 사용자 요청에 따라 검증된 현재 C# 후보 215개 경로를 커밋 `d641d0fae445ed38d57ca379518aaca736f172cc`로 만들고 `origin/codex/csharp-migration`에 새 원격 브랜치로 push했다. 빌드 산출물과 실제 사용자 데이터는 포함하지 않았고 PR, tag, Release, asset, 배포는 만들거나 수정하지 않았다.
+
+## 2026-07-14 - 구형 RMK 조건부 서식·시작 지연·실패 화면 교정
+
+- 실제 PowerShell-era RMK 통합문서의 격리 복사본에서 `InvalidDataException`을 다시 재현했다. 정확한 거부 위치는 `xl/worksheets/sheet1.xml`의 SpreadsheetML `conditionalFormatting/cfRule/formula`였으며, PowerShell 안정판은 이 표시 규칙을 사전 거부하지 않았다. 원본은 해시와 수정 시간이 유지됐고 진단 복사본은 검증 뒤 제거했다.
+- C# reader는 정확한 `cfRule/formula`만 수동 조건부 서식으로 읽도록 좁혔다. `WEBSERVICE`, `HYPERLINK`, RTD/DDE/CALL/REGISTER.ID, URL·UNC 참조 같은 외부 동작은 계속 `InvalidDataException`으로 거부하고, 셀 `f`, validation/table/defined-name 수식과 active relationship/content type 거부도 유지한다.
+- 익명 합성 PowerShell fixture에 정상 조건부 서식 수식을 추가했다. 해당 fixture는 기존 프로젝트·설정·review·RMK 로드, marker 없음/구형 marker 읽기 전용 열기, 원문 분석, 열기 무쓰기, 백업 마이그레이션·재실행, 삭제 경계, 손상 JSON/XLSX 무변경 거부를 함께 검증한다.
+- 실패 overlay가 `원문 분석 중` 제목과 회전 표시를 남기던 문제를 고쳐 최종 제목·실패 단계·재시도 가능 여부를 표시하고 spinner를 멈춘다. 저장 프로젝트 열기 시 dashboard의 선택 모드도 해당 프로젝트 경로로 동기화해 다른 모드가 선택된 것처럼 보이지 않게 했다.
+- 시작 화면은 최초 공개에 필요하지 않은 glossary 로드를 완성 프레임 공개 뒤 백그라운드 작업으로 옮겼다. 느린 glossary를 의도적으로 막은 UI 회귀에서 메인 폼의 완성 프레임이 먼저 안정적으로 노출되고 공개 뒤 컨트롤 추가·위치 변화가 0임을 확인했다.
+- strict Release 빌드는 경고/오류 0/0이다. `Compatibility.LegacyPowerShellProject`, `--phase08-ui-truthfulness`, `--slow-bootstrap`은 모두 PASS했고 전체 회귀는 기능·보안 82/83 PASS다. 유일한 실패는 범위 밖의 기존 `Phase08.ForcedExitRecovery` 1,000-target 성능 계약으로 85.836초/60초였으며 테스트를 완화하거나 성능 작업을 추가하지 않았다.
+- 전달용 로컬 빌드는 `artifacts/local-builds/RimWorldAiTranslator-legacy-compat-win-x64-r7/RimWorldAiTranslator.exe`, 155,589,691 bytes, SHA-256 `55EFBD6A7E5BC780E2B6EEB8FA1D1A4B2783ED826254D7327FD49B5A16456B26`이다. 고유 격리 data/discovery/profile/TEMP에서 5.512초 내 startup acknowledgement, responsive main window, 정상 close/exit 0과 임시 root 제거를 확인했다. 이 빌드는 로컬 전달본이며 RC/Release asset이 아니다.

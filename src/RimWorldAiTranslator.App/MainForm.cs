@@ -72,6 +72,7 @@ internal sealed class MainForm : Form
     private bool startupPreparationInProgress;
     private bool preparedForFirstShow;
     private bool firstFrameRevealed;
+    private bool deferredStartupWorkStarted;
 
     internal event EventHandler<MainFormStartupFailureEventArgs>? StartupFailed;
 
@@ -407,6 +408,11 @@ internal sealed class MainForm : Form
     {
         if (!firstFrameRevealed || closing || IsDisposed) return;
         ShowRecoveryNotices();
+        if (!deferredStartupWorkStarted)
+        {
+            deferredStartupWorkStarted = true;
+            TryStartUiWorkflow("용어집 준비", LoadGlossaryAsync);
+        }
     }
 
     private async Task StartAsync(CancellationToken cancellationToken)
@@ -449,7 +455,6 @@ internal sealed class MainForm : Form
             if (closing) return;
             UpdateDashboardProviderStatus();
             dashboard.SetData(mods, services.ProjectStore.Projects, projectStats);
-            await LoadGlossaryAsync(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             if (!string.IsNullOrWhiteSpace(isolationAcknowledgementPath))
             {
@@ -510,9 +515,11 @@ internal sealed class MainForm : Form
         {
             var generatedGlossaryPath = Path.Combine(services.ContentRoot, "glossary.generated.ko.json");
             var customGlossaryPath = services.Settings.CustomGlossaryPath;
+            var testLoader = ioHooks.LoadGlossary;
             var terms = await Task.Run(() =>
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (testLoader is not null) return testLoader(cancellationToken);
                 var glossary = new GlossaryService();
                 return glossary.Load(
                     generatedGlossaryPath,
@@ -888,6 +895,7 @@ internal sealed class MainForm : Form
 
     private async Task OpenProjectAsync(TranslationProject project, CancellationToken cancellationToken)
     {
+        dashboard.SelectProjectMod(project);
         var latestReviewRoot = project.LatestReviewRoot;
         var modRoot = project.ModRoot;
         var paths = await Task.Run(

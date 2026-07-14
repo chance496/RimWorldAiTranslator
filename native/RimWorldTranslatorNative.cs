@@ -236,6 +236,8 @@ public static class RimWorldTranslatorValidation
 
 public static class RimWorldTranslatorRmkXlsxReader
 {
+    private const string SpreadsheetMarkupNamespace =
+        "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
     private const long Mebibyte = 1024 * 1024;
     private const long XmlFileLimit = 64 * Mebibyte;
     private const long WorkbookXmlLimit = 16 * Mebibyte;
@@ -1358,9 +1360,43 @@ public static class RimWorldTranslatorRmkXlsxReader
     {
         return elementLocalName.Equals("sheetView", StringComparison.OrdinalIgnoreCase)
             && elementNamespace.Equals(
-                "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+                SpreadsheetMarkupNamespace,
                 StringComparison.Ordinal)
             && attributeLocalName.Equals("showFormulas", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPassiveConditionalFormattingFormula(
+        string elementLocalName,
+        string elementNamespace,
+        string parentLocalName,
+        string parentNamespace)
+    {
+        return elementLocalName.Equals("formula", StringComparison.OrdinalIgnoreCase)
+            && elementNamespace.Equals(SpreadsheetMarkupNamespace, StringComparison.Ordinal)
+            && parentLocalName.Equals("cfRule", StringComparison.OrdinalIgnoreCase)
+            && parentNamespace.Equals(SpreadsheetMarkupNamespace, StringComparison.Ordinal);
+    }
+
+    private static bool ContainsExternalConditionalFormattingAction(string formula)
+    {
+        string[] activeFunctionNames = new string[] {
+            "WEBSERVICE", "HYPERLINK", "RTD", "DDE", "CALL", "REGISTER.ID"
+        };
+        foreach (string functionName in activeFunctionNames)
+        {
+            int searchStart = 0;
+            while (searchStart < formula.Length)
+            {
+                int match = formula.IndexOf(functionName, searchStart, StringComparison.OrdinalIgnoreCase);
+                if (match < 0) break;
+                int cursor = match + functionName.Length;
+                while (cursor < formula.Length && Char.IsWhiteSpace(formula[cursor])) cursor++;
+                if (cursor < formula.Length && formula[cursor] == '(') return true;
+                searchStart = match + 1;
+            }
+        }
+        return formula.Contains("://", StringComparison.Ordinal)
+            || formula.Contains("\\\\", StringComparison.Ordinal);
     }
 
     private static bool LooksLikeExternalReference(string value)
@@ -1389,6 +1425,10 @@ public static class RimWorldTranslatorRmkXlsxReader
         bool rejectFormulaMarkup)
     {
         using XmlReader reader = OpenEntryReader(entry, maximumLength, observeProcessingInstructions: true);
+        Stack<(int Depth, string LocalName, string Namespace)> ancestors =
+            new Stack<(int Depth, string LocalName, string Namespace)>();
+        StringBuilder? conditionalFormattingFormula = null;
+        int conditionalFormattingFormulaDepth = -1;
         while (reader.Read())
         {
             if (reader.NodeType == XmlNodeType.ProcessingInstruction
@@ -1396,13 +1436,48 @@ public static class RimWorldTranslatorRmkXlsxReader
             {
                 throw new InvalidDataException("RMK workbook XML parts must not contain external stylesheet processing instructions.");
             }
+            if (reader.NodeType is XmlNodeType.Text or XmlNodeType.CDATA
+                && conditionalFormattingFormula is not null)
+            {
+                conditionalFormattingFormula.Append(reader.Value);
+                continue;
+            }
+            if (reader.NodeType == XmlNodeType.EndElement
+                && reader.Depth == conditionalFormattingFormulaDepth
+                && conditionalFormattingFormula is not null)
+            {
+                if (ContainsExternalConditionalFormattingAction(conditionalFormattingFormula.ToString()))
+                {
+                    throw new InvalidDataException(
+                        "RMK workbooks containing external-action spreadsheet formulas are not accepted.");
+                }
+                conditionalFormattingFormula = null;
+                conditionalFormattingFormulaDepth = -1;
+                continue;
+            }
             if (reader.NodeType != XmlNodeType.Element) continue;
+            while (ancestors.Count > 0 && ancestors.Peek().Depth >= reader.Depth)
+                ancestors.Pop();
             string elementLocalName = reader.LocalName;
             string elementNamespace = reader.NamespaceURI;
-            if (rejectFormulaMarkup && IsFormulaBearingMarkupName(elementLocalName))
+            string parentLocalName = ancestors.Count > 0 ? ancestors.Peek().LocalName : String.Empty;
+            string parentNamespace = ancestors.Count > 0 ? ancestors.Peek().Namespace : String.Empty;
+            bool passiveConditionalFormattingFormula = IsPassiveConditionalFormattingFormula(
+                elementLocalName,
+                elementNamespace,
+                parentLocalName,
+                parentNamespace);
+            if (rejectFormulaMarkup
+                && IsFormulaBearingMarkupName(elementLocalName)
+                && !passiveConditionalFormattingFormula)
             {
                 throw new InvalidDataException(
                     "RMK workbooks containing formula-bearing spreadsheet content are not accepted because formulas can execute external actions when opened.");
+            }
+            if (rejectFormulaMarkup && passiveConditionalFormattingFormula && !reader.IsEmptyElement)
+            {
+                conditionalFormattingFormula = new StringBuilder();
+                conditionalFormattingFormulaDepth = reader.Depth;
             }
             if (!reader.HasAttributes) continue;
             while (reader.MoveToNextAttribute())
@@ -1424,6 +1499,8 @@ public static class RimWorldTranslatorRmkXlsxReader
                 }
             }
             reader.MoveToElement();
+            if (!reader.IsEmptyElement)
+                ancestors.Push((reader.Depth, elementLocalName, elementNamespace));
         }
     }
 

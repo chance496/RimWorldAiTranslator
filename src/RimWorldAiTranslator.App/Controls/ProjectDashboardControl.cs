@@ -193,6 +193,17 @@ internal sealed class ProjectDashboardControl : UserControl
         RenderCards(force: true);
     }
 
+    public void SelectProjectMod(TranslationProject project)
+    {
+        ArgumentNullException.ThrowIfNull(project);
+        var selected = mods.FirstOrDefault(mod =>
+            mod.Path.Equals(project.ModRoot, StringComparison.OrdinalIgnoreCase));
+        if (selected is not null) modPicker.SelectedItem = selected;
+    }
+
+    internal string SelectedModPathForTesting =>
+        (modPicker.SelectedItem as RimWorldModInfo)?.Path ?? string.Empty;
+
     public void SetBusy(bool busy)
     {
         create.Enabled = !busy && modPicker.SelectedItem is RimWorldModInfo;

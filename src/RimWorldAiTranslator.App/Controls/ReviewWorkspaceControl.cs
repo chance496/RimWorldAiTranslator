@@ -22,7 +22,8 @@ internal sealed record UiIoHooks(
     Action<string>? ErrorPresenter = null,
     Func<string, DialogResult>? ProjectDeleteConfirmation = null,
     Action<ProjectStatsCacheDocument>? SaveProjectStatsCache = null,
-    Action<string>? WarningPresenter = null);
+    Action<string>? WarningPresenter = null,
+    Func<CancellationToken, IReadOnlyList<GlossaryTerm>>? LoadGlossary = null);
 
 internal sealed class ReviewWorkspaceControl : UserControl
 {
