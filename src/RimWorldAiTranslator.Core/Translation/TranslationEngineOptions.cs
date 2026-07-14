@@ -4,6 +4,8 @@ namespace RimWorldAiTranslator.Core.Translation;
 
 public sealed class TranslationEngineOptions
 {
+    public const int DefaultMaxResponseBytes = 4 * 1024 * 1024;
+
     public required string ModRoot { get; init; }
     public IReadOnlyList<string> ApiKeys { get; init; } = [];
     public ApiProviderProfile Provider { get; init; } = ApiProviderCatalog.Get("Cerebras");
@@ -28,6 +30,8 @@ public sealed class TranslationEngineOptions
     public string ReasoningEffort { get; init; } = "none";
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(180);
     public int MaxRetries { get; init; } = 4;
+    public int MaxProviderRequestsPerRun { get; init; } = 2_000;
+    public int MaxResponseBytes { get; init; } = DefaultMaxResponseBytes;
     public int Limit { get; init; }
     public bool IncludePatches { get; init; }
     public bool Overwrite { get; init; }
@@ -70,3 +74,23 @@ public sealed record TranslationRunResult(
     int SkippedUnsafe,
     int TokenWarnings,
     bool Cancelled = false);
+
+public sealed class TranslationRunCanceledException : OperationCanceledException
+{
+    public TranslationRunCanceledException(
+        TranslationRunResult partialResult,
+        bool checkpointPersisted,
+        CancellationToken cancellationToken)
+        : base(
+            checkpointPersisted
+                ? "Translation was canceled after preserving partial results."
+                : "Translation was canceled before partial results could be persisted.",
+            cancellationToken)
+    {
+        PartialResult = partialResult;
+        CheckpointPersisted = checkpointPersisted;
+    }
+
+    public TranslationRunResult PartialResult { get; }
+    public bool CheckpointPersisted { get; }
+}

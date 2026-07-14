@@ -1,6 +1,6 @@
 # Architecture
 
-기준: v1.0.0 C# 네이티브 런타임
+기준: v1.0.1-rc.1 로컬 C# 후보 (공개 v1.0.0 보존)
 
 ## 실행 구조
 
@@ -20,7 +20,7 @@ RimWorldAiTranslator.exe (WinExe, net8.0-windows, self-contained win-x64)
      -> 안전한 XML 및 RMK XLSX 저수준 처리
 ```
 
-사용자 실행 경로에는 PowerShell, Python, Node.js, 콘솔 또는 별도 .NET 설치가 없다. `build-package.ps1`과 `Build-RimWorldGlossary.ps1`은 저장소 개발자용 보조 도구이며 ZIP에 포함하지 않는다.
+사용자 실행 경로와 활성 build/test/glossary/package 경로에는 PowerShell, Python, Node.js, 콘솔 스크립트 또는 별도 .NET 설치 의존성이 없다. 개발 도구는 `tools/RimWorldAiTranslator.GlossaryTool`과 `tools/RimWorldAiTranslator.Tooling`의 C# 실행 파일이다.
 
 ## 계층 책임
 
@@ -32,6 +32,7 @@ RimWorldAiTranslator.exe (WinExe, net8.0-windows, self-contained win-x64)
 | Tests | `tests/RimWorldAiTranslator.Tests` | 임시 fixture 기반 오프라인 회귀 30개 |
 | UI harness | `tests/RimWorldAiTranslator.UiHarness` | 실제 WinForms 화면을 격리 데이터 루트로 실행 |
 | Benchmarks | `tests/RimWorldAiTranslator.Benchmarks` | 5,000행 추출·검수 로드·검색·필터·취소 측정 |
+| Tools | `tools/RimWorldAiTranslator.*` | 결정적 용어집 생성·self-test, 오프라인 로컬 RC package와 zero audit |
 
 `AppServices`가 저장소와 Core 서비스를 한 번 조립한다. `MainForm`은 화면 전환과 작업 수명만 관리하고, 실제 데이터 규칙은 Core에 둔다. 긴 작업은 `Task`와 `CancellationToken`을 사용하며 표시 중인 검수 화면과 중지 버튼을 유지한다.
 
@@ -55,7 +56,8 @@ RimWorldAiTranslator.exe (WinExe, net8.0-windows, self-contained win-x64)
 
 | 위치 | 기본 동작 | 쓰기 조건 |
 |---|---|---|
-| Workshop/로컬 원본 모드 | 읽기 전용 | 사용자가 로컬 적용을 명시했을 때 `Languages\Korean`만 |
+| Workshop 구독본 | 항상 읽기 전용 | 없음 |
+| 사용자가 지정한 로컬 모드 | 기본 읽기 전용 | dry-run 미리보기와 명시적 확인 뒤 `Languages\Korean`만 |
 | RMK 구독본 | 항상 읽기 전용 | 없음 |
 | RMK Git 작업 클론 | 읽기/쓰기 대상 후보 | 사용자가 `RMK에 적용`을 선택했을 때만 |
 | 앱 데이터 루트 | 앱 소유 | 프로젝트·설정·검수·캐시·비민감 로그 |
@@ -72,4 +74,4 @@ RimWorldAiTranslator.exe (WinExe, net8.0-windows, self-contained win-x64)
 
 ## 배포
 
-`build-package.ps1`은 솔루션 빌드, 30개 오프라인 회귀, `dotnet publish -r win-x64 --self-contained true`, 버전 검사, 허용 파일 패키징, ZIP 실행·정상 종료와 PowerShell 자식 프로세스 0개를 확인한다. 배포 ZIP은 평면 구조의 단일 EXE, 원본+DLC 용어집, 규칙과 문서만 포함한다. 추가 용어집은 사용자가 설정에서 로컬 파일을 선택한다.
+`RimWorldAiTranslator.Tooling package`는 소스가 없는 오프라인 복원, 경고 0 빌드, 전체 회귀, `win-x64` 자체 포함 publish, 버전·허용목록·ZIP 검증과 격리 탐색/정상 종료 smoke를 수행한다. ZIP은 평면 구조의 단일 EXE, 경로가 제거된 원본+DLC 용어집, 규칙과 문서만 포함한다. 추가 용어집은 사용자가 설정에서 로컬 파일을 선택한다.

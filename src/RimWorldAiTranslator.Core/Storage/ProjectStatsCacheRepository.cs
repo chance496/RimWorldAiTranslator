@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using RimWorldAiTranslator.Core.Review;
+using RimWorldAiTranslator.Core.Safety;
 
 namespace RimWorldAiTranslator.Core.Storage;
 
@@ -68,10 +69,15 @@ public sealed class ProjectStatsCacheRepository
         this.paths = paths;
     }
 
-    public ProjectStatsCacheDocument Load()
+    public ProjectStatsCacheDocument Load(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (!store.Exists(paths.ProjectStats)) return new ProjectStatsCacheDocument();
-        var document = store.Read<ProjectStatsCacheDocument>(paths.ProjectStats) ?? new ProjectStatsCacheDocument();
+        var document = store.Read<ProjectStatsCacheDocument>(
+                           paths.ProjectStats,
+                           cancellationToken: cancellationToken)
+                       ?? new ProjectStatsCacheDocument();
+        cancellationToken.ThrowIfCancellationRequested();
         if (document.Version != 1 || document.Entries is null) return new ProjectStatsCacheDocument();
         document.Entries = document.Entries
             .Where(entry => !string.IsNullOrWhiteSpace(entry.ProjectId) && !string.IsNullOrWhiteSpace(entry.Stamp))
@@ -90,10 +96,19 @@ public sealed class ProjectStatsCacheRepository
 
     public static string CreateStamp(string reviewRoot)
     {
-        if (string.IsNullOrWhiteSpace(reviewRoot) || !Directory.Exists(reviewRoot)) return string.Empty;
+        if (string.IsNullOrWhiteSpace(reviewRoot)
+            || PathSafety.IsNetworkPath(reviewRoot)
+            || !Directory.Exists(reviewRoot))
+        {
+            return string.Empty;
+        }
         string comparison;
         try { comparison = ReviewWorkspaceService.FindComparisonFile(reviewRoot); }
-        catch { return string.Empty; }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Project statistics stamp failed closed ({exception.GetType().Name}).");
+            return string.Empty;
+        }
         return string.Join('|', Stamp(comparison), Stamp(ReviewRepository.GetDecisionPath(reviewRoot)));
     }
 

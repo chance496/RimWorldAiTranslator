@@ -1,78 +1,386 @@
+using RimWorldAiTranslator.Core.Safety;
+
 namespace RimWorldAiTranslator.Core.Storage;
 
 public static class FileTransaction
 {
-    public static void Execute(IEnumerable<string> paths, Action action, string operationName)
+    public static void Execute(
+        IEnumerable<string> paths,
+        Action action,
+        string operationName,
+        CancellationToken cancellationToken = default) =>
+        Execute(
+            paths,
+            action,
+            operationName,
+            File.Delete,
+            (source, destination) => CopySnapshotBounded(source, destination, cancellationToken),
+            null,
+            null,
+            cancellationToken);
+
+    internal static void Execute(
+        IEnumerable<string> paths,
+        Action action,
+        string operationName,
+        Action beforeRollback) =>
+        Execute(paths, action, operationName, File.Delete, CopySnapshotBounded, beforeRollback, null, CancellationToken.None);
+
+    internal static void Execute(
+        IEnumerable<string> paths,
+        Action action,
+        string operationName,
+        Action beforeRollback,
+        CancellationToken cancellationToken) =>
+        Execute(
+            paths,
+            action,
+            operationName,
+            File.Delete,
+            (source, destination) => CopySnapshotBounded(source, destination, cancellationToken),
+            beforeRollback,
+            null,
+            cancellationToken);
+
+    internal static void Execute(
+        IEnumerable<string> paths,
+        Action action,
+        string operationName,
+        Action beforeRollback,
+        FileTransactionRecoverySession recoverySession,
+        CancellationToken cancellationToken) =>
+        Execute(
+            paths,
+            action,
+            operationName,
+            File.Delete,
+            (source, destination) => CopySnapshotBounded(source, destination, cancellationToken),
+            beforeRollback,
+            recoverySession,
+            cancellationToken);
+
+    internal static void Execute(
+        IEnumerable<string> paths,
+        Action action,
+        string operationName,
+        Action beforeRollback,
+        PathSafety.TrustedWriteBoundary trustedWriteBoundary,
+        FileTransactionRecoverySession recoverySession,
+        CancellationToken cancellationToken) =>
+        Execute(
+            paths,
+            action,
+            operationName,
+            File.Delete,
+            (source, destination) => CopySnapshotBounded(source, destination, cancellationToken),
+            beforeRollback,
+            recoverySession,
+            cancellationToken,
+            trustedWriteBoundary);
+
+    internal static void Execute(
+        IEnumerable<string> paths,
+        Action action,
+        string operationName,
+        Action<string> deleteSnapshot) =>
+        Execute(paths, action, operationName, deleteSnapshot, CopySnapshotBounded, null, null, CancellationToken.None);
+
+    internal static void Execute(
+        IEnumerable<string> paths,
+        Action action,
+        string operationName,
+        Action<string> deleteSnapshot,
+        Action<string, string> copySnapshot) =>
+        Execute(paths, action, operationName, deleteSnapshot, copySnapshot, null, null, CancellationToken.None);
+
+    private static void Execute(
+        IEnumerable<string> paths,
+        Action action,
+        string operationName,
+        Action<string> deleteSnapshot,
+        Action<string, string> copySnapshot,
+        Action? beforeRollback,
+        FileTransactionRecoverySession? suppliedRecoverySession,
+        CancellationToken cancellationToken,
+        PathSafety.TrustedWriteBoundary? trustedWriteBoundary = null)
     {
-        var journal = paths.Select(Path.GetFullPath).Distinct(StringComparer.OrdinalIgnoreCase).Select(Capture).ToArray();
+        var materializedPaths = paths.Select(Path.GetFullPath).ToArray();
+        var recoverySession = suppliedRecoverySession
+                              ?? FileTransactionRecoverySession.CreateDisabled();
+        var ownsRecoverySession = suppliedRecoverySession is null;
+        FileSnapshotEntry[]? journal = null;
+        IDisposable? activation = null;
+        var preserveSnapshots = false;
+        var operationCompleted = false;
         try
         {
+            journal = FileSnapshotJournal.Capture(
+                materializedPaths,
+                operationName,
+                copySnapshot,
+                deleteSnapshot,
+                recoverySession,
+                cancellationToken);
+            activation = recoverySession.Activate();
             action();
+            activation.Dispose();
+            activation = null;
+            operationCompleted = true;
+            recoverySession.MarkResolved(trustedWriteBoundary, CancellationToken.None);
         }
         catch (Exception operationError)
         {
-            var rollbackErrors = new List<string>();
-            for (var index = journal.Length - 1; index >= 0; index--)
+            activation?.Dispose();
+            activation = null;
+            if (journal is null) throw;
+            if (operationCompleted || recoverySession.ShouldDeferRecovery)
             {
-                try
-                {
-                    Restore(journal[index]);
-                }
-                catch (Exception ex)
-                {
-                    rollbackErrors.Add($"{journal[index].Path}: {ex.Message}");
-                }
+                preserveSnapshots = true;
+                recoverySession.DetachPreservedEvidence();
+                throw new IOException(
+                    $"{operationName} completed but durable resolution was deferred; recovery evidence was preserved.",
+                    operationError);
             }
-            if (rollbackErrors.Count > 0)
+            beforeRollback?.Invoke();
+            IReadOnlySet<string>? concurrentPaths = operationError is ConcurrentLeafChangeException concurrent
+                ? concurrent.PreservedPaths
+                : null;
+            var rollback = recoverySession.IsEnabled
+                ? recoverySession.RollbackDurably(concurrentPaths)
+                : FileSnapshotJournal.Rollback(
+                    FileSnapshotJournal.CaptureRollbackState(journal, CancellationToken.None),
+                    concurrentPaths,
+                    CancellationToken.None);
+            if (rollback.Errors.Count > 0)
             {
-                throw new IOException($"{operationName} failed and rollback was incomplete. Error: {operationError.Message} Rollback errors: {string.Join(" | ", rollbackErrors)}", operationError);
+                preserveSnapshots = true;
+                recoverySession.DetachPreservedEvidence();
+                throw new IOException(
+                    $"{operationName} failed and rollback was incomplete ({operationError.GetType().Name}). Rollback errors: {string.Join(" | ", rollback.Errors)}. Recovery snapshots were preserved.",
+                    operationError);
             }
-            throw new IOException($"{operationName} failed; all files written by this run were rolled back. {operationError.Message}", operationError);
+            if (rollback.ConcurrentPaths.Count > 0)
+            {
+                preserveSnapshots = true;
+                recoverySession.DetachPreservedEvidence();
+                throw new ConcurrentLeafChangeException(
+                    $"{operationName} stopped because rollback detected a concurrent save; current files and recovery snapshots were preserved: {string.Join(" | ", rollback.ConcurrentPaths)}.",
+                    operationError,
+                    [.. rollback.ConcurrentPaths, .. rollback.RecoveryPaths]);
+            }
+            if (!recoverySession.IsEnabled)
+                recoverySession.MarkRollbackResolved(CancellationToken.None);
+            if (operationError is OperationCanceledException) throw;
+            throw new IOException(
+                $"{operationName} failed; all files written by this run were rolled back ({operationError.GetType().Name}).",
+                operationError);
         }
         finally
         {
-            foreach (var entry in journal)
+            activation?.Dispose();
+            if (journal is not null)
             {
-                if (entry.SnapshotPath is not null && File.Exists(entry.SnapshotPath)) File.Delete(entry.SnapshotPath);
+                var cleanupFailures = recoverySession.IsEnabled
+                    ? Array.Empty<string>()
+                    : FileSnapshotJournal.Cleanup(
+                        journal,
+                        deleteSnapshot,
+                        preserveSnapshots,
+                        "Transaction");
+                recoverySession.Finish(
+                    preserveSnapshots || recoverySession.ShouldDeferRecovery,
+                    cleanupFailures);
             }
+            if (ownsRecoverySession) recoverySession.Dispose();
         }
     }
 
-    private static Entry Capture(string path)
-    {
-        var exists = File.Exists(path);
-        string? snapshot = null;
-        if (exists)
-        {
-            var directory = Path.GetDirectoryName(path)!;
-            snapshot = Path.Combine(directory, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.transaction.bak");
-            AtomicFile.CopyFlushed(path, snapshot);
-        }
-        return new Entry(path, exists, snapshot);
-    }
+    public static async Task<T> ExecuteAsync<T>(
+        IEnumerable<string> paths,
+        Func<Task<T>> action,
+        string operationName,
+        CancellationToken cancellationToken = default) =>
+        await ExecuteAsyncCore(
+                paths,
+                action,
+                operationName,
+                File.Delete,
+                (source, destination) => CopySnapshotBounded(source, destination, cancellationToken),
+                null,
+                cancellationToken)
+            .ConfigureAwait(false);
 
-    private static void Restore(Entry entry)
+    internal static Task<T> ExecuteAsync<T>(
+        IEnumerable<string> paths,
+        Func<Task<T>> action,
+        string operationName,
+        Action<string> deleteSnapshot) =>
+        ExecuteAsyncCore(
+            paths,
+            action,
+            operationName,
+            deleteSnapshot,
+            CopySnapshotBounded,
+            null,
+            CancellationToken.None);
+
+    internal static async Task<T> ExecuteAsync<T>(
+        IEnumerable<string> paths,
+        Func<Task<T>> action,
+        string operationName,
+        Action<string> deleteSnapshot,
+        Action<string, string> copySnapshot,
+        CancellationToken cancellationToken = default) =>
+        await ExecuteAsyncCore(
+                paths,
+                action,
+                operationName,
+                deleteSnapshot,
+                copySnapshot,
+                null,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    internal static async Task<T> ExecuteAsync<T>(
+        IEnumerable<string> paths,
+        Func<Task<T>> action,
+        string operationName,
+        Action<string> deleteSnapshot,
+        Action<string, string> copySnapshot,
+        FileTransactionRecoverySession recoverySession,
+        CancellationToken cancellationToken = default) =>
+        await ExecuteAsyncCore(
+                paths,
+                action,
+                operationName,
+                deleteSnapshot,
+                copySnapshot,
+                recoverySession,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    private static async Task<T> ExecuteAsyncCore<T>(
+        IEnumerable<string> paths,
+        Func<Task<T>> action,
+        string operationName,
+        Action<string> deleteSnapshot,
+        Action<string, string> copySnapshot,
+        FileTransactionRecoverySession? suppliedRecoverySession,
+        CancellationToken cancellationToken)
     {
-        if (!entry.Existed)
-        {
-            if (File.Exists(entry.Path)) File.Delete(entry.Path);
-            return;
-        }
-        var directory = Path.GetDirectoryName(entry.Path)!;
-        var restore = Path.Combine(directory, $".{Path.GetFileName(entry.Path)}.{Guid.NewGuid():N}.restore.tmp");
-        var discard = Path.Combine(directory, $".{Path.GetFileName(entry.Path)}.{Guid.NewGuid():N}.failed.tmp");
+        var materializedPaths = paths.Select(Path.GetFullPath).ToArray();
+        var recoverySession = suppliedRecoverySession
+                              ?? FileTransactionRecoverySession.CreateDisabled();
+        var ownsRecoverySession = suppliedRecoverySession is null;
+        FileSnapshotEntry[]? journal = null;
+        IDisposable? activation = null;
+        var preserveSnapshots = false;
+        var operationCompleted = false;
         try
         {
-            AtomicFile.CopyFlushed(entry.SnapshotPath!, restore);
-            if (File.Exists(entry.Path)) File.Replace(restore, entry.Path, discard, true);
-            else File.Move(restore, entry.Path);
+            journal = FileSnapshotJournal.Capture(
+                materializedPaths,
+                operationName,
+                copySnapshot,
+                deleteSnapshot,
+                recoverySession,
+                cancellationToken);
+            activation = recoverySession.Activate();
+            var result = await action().ConfigureAwait(false);
+            activation.Dispose();
+            activation = null;
+            operationCompleted = true;
+            recoverySession.MarkResolved(CancellationToken.None);
+            return result;
+        }
+        catch (Exception operationError)
+        {
+            activation?.Dispose();
+            activation = null;
+            if (journal is null) throw;
+            if (operationCompleted || recoverySession.ShouldDeferRecovery)
+            {
+                preserveSnapshots = true;
+                recoverySession.DetachPreservedEvidence();
+                throw new IOException(
+                    $"{operationName} completed but durable resolution was deferred; recovery evidence was preserved.",
+                    operationError);
+            }
+            var rollback = recoverySession.IsEnabled
+                ? recoverySession.RollbackDurably()
+                : FileSnapshotJournal.Rollback(
+                    FileSnapshotJournal.CaptureRollbackState(journal, CancellationToken.None),
+                    cancellationToken: CancellationToken.None);
+            if (rollback.Errors.Count > 0)
+            {
+                preserveSnapshots = true;
+                recoverySession.DetachPreservedEvidence();
+                throw new IOException(
+                    $"{operationName} failed and rollback was incomplete ({operationError.GetType().Name}). Rollback errors: {string.Join(" | ", rollback.Errors)}. Recovery snapshots were preserved.",
+                    operationError);
+            }
+            if (rollback.ConcurrentPaths.Count > 0)
+            {
+                preserveSnapshots = true;
+                recoverySession.DetachPreservedEvidence();
+                throw new ConcurrentLeafChangeException(
+                    $"{operationName} stopped because rollback detected a concurrent save; current files and recovery snapshots were preserved: {string.Join(" | ", rollback.ConcurrentPaths)}.",
+                    operationError,
+                    [.. rollback.ConcurrentPaths, .. rollback.RecoveryPaths]);
+            }
+            if (!recoverySession.IsEnabled)
+                recoverySession.MarkRollbackResolved(CancellationToken.None);
+            if (operationError is OperationCanceledException) throw;
+            throw new IOException(
+                $"{operationName} failed; all files written by this run were rolled back ({operationError.GetType().Name}).",
+                operationError);
         }
         finally
         {
-            if (File.Exists(restore)) File.Delete(restore);
-            if (File.Exists(discard)) File.Delete(discard);
+            activation?.Dispose();
+            if (journal is not null)
+            {
+                var cleanupFailures = recoverySession.IsEnabled
+                    ? Array.Empty<string>()
+                    : FileSnapshotJournal.Cleanup(
+                        journal,
+                        deleteSnapshot,
+                        preserveSnapshots,
+                        "Transaction");
+                recoverySession.Finish(
+                    preserveSnapshots || recoverySession.ShouldDeferRecovery,
+                    cleanupFailures);
+            }
+            if (ownsRecoverySession) recoverySession.Dispose();
         }
     }
 
-    private sealed record Entry(string Path, bool Existed, string? SnapshotPath);
+    internal static FileTransactionRecoverySession AcquireRecoveryLease(
+        FileTransactionRecoveryAuthority? authority,
+        string targetRoot,
+        CancellationToken cancellationToken = default) =>
+        authority?.Acquire(targetRoot, cancellationToken)
+        ?? FileTransactionRecoverySession.CreateDisabled();
+
+    internal static void RecoverPending(
+        FileTransactionRecoveryAuthority authority,
+        string targetRoot,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+        authority.RecoverPending(targetRoot, cancellationToken);
+    }
+
+    private static void CopySnapshotBounded(string sourcePath, string destinationPath) =>
+        CopySnapshotBounded(sourcePath, destinationPath, CancellationToken.None);
+
+    private static void CopySnapshotBounded(
+        string sourcePath,
+        string destinationPath,
+        CancellationToken cancellationToken) =>
+        AtomicFile.CopyFlushedBounded(
+            sourcePath,
+            destinationPath,
+            PathSafety.MaximumTrustedLeafBytes,
+            cancellationToken);
 }

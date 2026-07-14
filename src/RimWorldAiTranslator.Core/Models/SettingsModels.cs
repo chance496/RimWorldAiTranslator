@@ -5,8 +5,10 @@ namespace RimWorldAiTranslator.Core.Models;
 
 public sealed class AppSettingsDocument
 {
+    public const int CurrentVersion = 4;
+
     [JsonPropertyName("version")]
-    public int Version { get; set; } = 4;
+    public int Version { get; set; } = CurrentVersion;
 
     [JsonPropertyName("themeMode")]
     public string ThemeMode { get; set; } = "System";

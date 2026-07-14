@@ -1,7 +1,11 @@
+using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using RimWorldAiTranslator.Core.Models;
+using RimWorldAiTranslator.Core.Safety;
+using RimWorldAiTranslator.Core.Storage;
 
 namespace RimWorldAiTranslator.Core.Translation;
 
@@ -40,6 +44,10 @@ public sealed class GlossaryDocument
 
 public sealed class GlossaryService
 {
+    internal const long MaximumFileBytes = 16L * 1024 * 1024;
+    internal const int MaximumTerms = 100_000;
+    internal const int MaximumTermCharacters = 8_192;
+    private static readonly UTF8Encoding Utf8Strict = new(false, true);
     private readonly List<GlossaryTerm> always = [];
     private readonly List<IndexedTerm> generated = [];
     private readonly Dictionary<string, List<IndexedTerm>> prefixIndex = new(StringComparer.Ordinal);
@@ -122,15 +130,22 @@ public sealed class GlossaryService
 
     private IEnumerable<GlossaryTerm> Import(string? path, bool alwaysInclude, string category)
     {
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        if (string.IsNullOrWhiteSpace(path))
         {
             yield break;
         }
+        if (PathSafety.IsNetworkPath(path))
+            throw new InvalidDataException("Glossary files must use a local path.");
+        if (!File.Exists(path)) yield break;
 
         var extension = Path.GetExtension(path).ToLowerInvariant();
+        var bytes = BoundedFileReader.ReadAllBytes(path, MaximumFileBytes, "Glossary file");
         if (extension is ".txt" or ".tsv" or ".csv")
         {
-            foreach (var raw in File.ReadAllLines(path))
+            var text = Utf8Strict.GetString(bytes);
+            using var reader = new StringReader(text);
+            var imported = 0;
+            while (reader.ReadLine() is { } raw)
             {
                 var line = raw.Trim();
                 if (line.Length == 0 || line.StartsWith('#') || line.StartsWith("//", StringComparison.Ordinal)) continue;
@@ -152,6 +167,9 @@ public sealed class GlossaryService
                     if (parts.Length >= 3) note = parts[2].Trim();
                 }
                 if (source.Length == 0 || korean.Length == 0) continue;
+                ValidateTermLength(source, korean, note);
+                if (++imported > MaximumTerms)
+                    throw new InvalidDataException($"Glossary contains more than {MaximumTerms:N0} terms.");
                 yield return new GlossaryTerm
                 {
                     Source = source,
@@ -167,14 +185,95 @@ public sealed class GlossaryService
             yield break;
         }
 
-        var document = JsonSerializer.Deserialize<GlossaryDocument>(File.ReadAllText(path), new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-            ?? new GlossaryDocument();
-        foreach (var term in document.Terms.Where(term => !string.IsNullOrWhiteSpace(term.Source) && !string.IsNullOrWhiteSpace(term.Korean)))
+        using var document = JsonDocument.Parse(bytes, new JsonDocumentOptions
         {
+            MaxDepth = 64,
+            CommentHandling = JsonCommentHandling.Disallow,
+            AllowTrailingCommas = false
+        });
+        if (document.RootElement.ValueKind != JsonValueKind.Object
+            || !TryGetProperty(document.RootElement, "terms", out var terms)
+            || terms.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            yield break;
+        }
+
+        IReadOnlyList<JsonElement> elements = terms.ValueKind switch
+        {
+            JsonValueKind.Array => terms.EnumerateArray().ToArray(),
+            JsonValueKind.Object => new[] { terms },
+            _ => Array.Empty<JsonElement>()
+        };
+        if (elements.Count > MaximumTerms)
+            throw new InvalidDataException($"Glossary contains more than {MaximumTerms:N0} terms.");
+        foreach (var element in elements)
+        {
+            if (element.ValueKind != JsonValueKind.Object) continue;
+            var term = new GlossaryTerm
+            {
+                Source = ReadString(element, "source"),
+                Korean = ReadString(element, "ko"),
+                Note = ReadString(element, "note"),
+                Priority = ReadInt32(element, "priority", 1000),
+                Count = ReadInt32(element, "count", 1),
+                Origin = ReadString(element, "origin")
+            };
+            if (string.IsNullOrWhiteSpace(term.Source) || string.IsNullOrWhiteSpace(term.Korean)) continue;
+            ValidateTermLength(term.Source, term.Korean, term.Note);
             term.AlwaysInclude = alwaysInclude;
             term.Category = category;
             yield return term;
         }
+    }
+
+    private static void ValidateTermLength(string source, string korean, string note)
+    {
+        if (source.Length > MaximumTermCharacters
+            || korean.Length > MaximumTermCharacters
+            || note.Length > MaximumTermCharacters)
+        {
+            throw new InvalidDataException($"Glossary terms must not exceed {MaximumTermCharacters:N0} characters per field.");
+        }
+    }
+
+    private static bool TryGetProperty(JsonElement element, string name, out JsonElement value)
+    {
+        foreach (var property in element.EnumerateObject())
+        {
+            if (!property.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) continue;
+            value = property.Value;
+            return true;
+        }
+        value = default;
+        return false;
+    }
+
+    private static string ReadString(JsonElement element, string name)
+    {
+        if (!TryGetProperty(element, name, out var value)
+            || value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return string.Empty;
+        }
+        return value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? string.Empty
+            : value.ToString();
+    }
+
+    private static int ReadInt32(JsonElement element, string name, int defaultValue)
+    {
+        if (!TryGetProperty(element, name, out var value)
+            || value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return defaultValue;
+        }
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number)) return number;
+        if (value.ValueKind == JsonValueKind.String
+            && int.TryParse(value.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out number))
+        {
+            return number;
+        }
+        throw new JsonException($"Glossary property '{name}' must be an integer or null.");
     }
 
     private void BuildIndex(IEnumerable<GlossaryTerm> terms)

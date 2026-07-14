@@ -3,7 +3,9 @@
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <Nullable>disable</Nullable>
+    <!-- Global public type names and P/Invoke visibility are retained for v1.0.0
+         script-host/API compatibility while the linked native source is migrated. -->
+    <NoWarn>$(NoWarn);CA1050;CA1401</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

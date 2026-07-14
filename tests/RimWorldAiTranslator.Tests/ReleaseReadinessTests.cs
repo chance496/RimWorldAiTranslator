@@ -21,7 +21,7 @@ internal static partial class Program
             paths.EnsureExists();
             var review = Path.Combine(paths.Reviews, "run");
             Directory.CreateDirectory(review);
-            new ReviewRepository(new AtomicJsonStore()).Save(review, new ReviewDecisionDocument
+            new AtomicJsonStore().Write(ReviewRepository.GetDecisionPath(review), new ReviewDecisionDocument
             {
                 Items =
                 [
@@ -106,7 +106,9 @@ internal static partial class Program
             Directory.CreateDirectory(audit);
             File.WriteAllText(Path.Combine(audit, "fixture-comparison.json"), "[]");
             var decisionPath = ReviewRepository.GetDecisionPath(review);
-            new ReviewRepository(new AtomicJsonStore()).Save(review, new ReviewDecisionDocument());
+            new AtomicJsonStore().Write(
+                ReviewRepository.GetDecisionPath(review),
+                new ReviewDecisionDocument());
             var firstStamp = ProjectStatsCacheRepository.CreateStamp(review);
             var repository = new ProjectStatsCacheRepository(new AtomicJsonStore(), paths);
             repository.Save(new ProjectStatsCacheDocument
@@ -141,6 +143,7 @@ internal static partial class Program
             var workspace = Path.Combine(localMods, "RMK");
             Directory.CreateDirectory(Path.Combine(workspace, "Data"));
             Directory.CreateDirectory(Path.Combine(workspace, ".git"));
+            File.WriteAllText(Path.Combine(workspace, ".git", "HEAD"), "ref: refs/heads/bus\n", new System.Text.UTF8Encoding(false));
             File.WriteAllText(Path.Combine(workspace, "ModList.tsv"), "");
             var service = new RmkWorkspaceService();
             Assert(service.FindSubscriptionRoot([steam]).Equals(Path.GetFullPath(subscription), StringComparison.OrdinalIgnoreCase), "RMK subscription was not found.");

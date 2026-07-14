@@ -1,9 +1,5 @@
 {
-    "generatedAt":  "2026-07-08T23:34:38.6262704+09:00",
-    "tool":  "Build-RimWorldGlossary.ps1",
-    "rimWorldDataRoot":  "E:\\SteamLibrary\\steamapps\\common\\RimWorld\\Data",
-    "rmkRoot":  "E:\\SteamLibrary\\steamapps\\workshop\\content\\294100\\3079466972",
-    "workshopRoot":  "E:\\SteamLibrary\\steamapps\\workshop\\content\\294100",
+    "tool":  "legacy-glossary-sanitized",
     "gameVersion":  "1.6",
     "priorityOrder":  [
                           {
@@ -23,7 +19,6 @@
                     "includeRmk":  false
                 },
     "stats":  {
-                  "elapsedSeconds":  46.563,
                   "observations":  3833,
                   "officialObservations":  3833,
                   "rmkObservations":  0,

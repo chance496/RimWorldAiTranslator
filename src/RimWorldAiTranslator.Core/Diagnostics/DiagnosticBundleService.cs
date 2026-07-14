@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using RimWorldAiTranslator.Core.Models;
+using RimWorldAiTranslator.Core.Safety;
 using RimWorldAiTranslator.Core.Storage;
 
 namespace RimWorldAiTranslator.Core.Diagnostics;
@@ -25,6 +26,7 @@ public sealed class DiagnosticBundleService
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
+        PropertyNameCaseInsensitive = true,
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
@@ -43,119 +45,156 @@ public sealed class DiagnosticBundleService
         if (File.Exists(output) && !options.Force)
             throw new IOException("같은 이름의 진단 번들이 이미 있습니다.");
 
-        var tempBase = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        var workspace = Path.GetFullPath(Path.Combine(tempBase, "RimWorldAiTranslator-diagnostics-" + Guid.NewGuid().ToString("N")));
-        var expectedPrefix = tempBase + Path.DirectorySeparatorChar + "RimWorldAiTranslator-diagnostics-";
-        if (!workspace.StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("진단 임시 폴더가 안전 경계를 벗어났습니다.");
-        Directory.CreateDirectory(workspace);
-        var temporaryZip = Path.Combine(parent, Path.GetFileName(output) + ".tmp-" + Guid.NewGuid().ToString("N"));
-
-        try
+        var readErrors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var providerSummaries = options.Settings.ApiProviders
+            .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(pair => new
+            {
+                id = KnownValue(pair.Key, ProviderIds),
+                url = UrlSummary(pair.Value.Url),
+                modelConfigured = !string.IsNullOrWhiteSpace(pair.Value.Model),
+                modelHash12 = string.IsNullOrWhiteSpace(pair.Value.Model) ? string.Empty : Sha256(pair.Value.Model)[..12],
+                temperature = pair.Value.Temperature
+            }).ToArray();
+        var settingsSummary = new
         {
-            var readErrors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            var providerSummaries = options.Settings.ApiProviders
-                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
-                .Select(pair => new
-                {
-                    id = KnownValue(pair.Key, ProviderIds),
-                    url = UrlSummary(pair.Value.Url),
-                    modelConfigured = !string.IsNullOrWhiteSpace(pair.Value.Model),
-                    modelHash12 = string.IsNullOrWhiteSpace(pair.Value.Model) ? string.Empty : Sha256(pair.Value.Model)[..12],
-                    temperature = pair.Value.Temperature
-                }).ToArray();
-            var settingsSummary = new
-            {
-                present = true,
-                schemaVersion = options.Settings.Version,
-                themeMode = KnownValue(options.Settings.ThemeMode, ["System", "Light", "Dark"]),
-                designPreset = KnownValue(options.Settings.DesignPreset, ["Professional", "SciFi", "Vivid", "Studio", "Frontier"]),
-                textSize = options.Settings.TextSize,
-                highContrast = options.Settings.HighContrast,
-                autoSave = options.Settings.AutoSave,
-                selectedProvider = KnownValue(options.Settings.ApiProviderId, ProviderIds),
-                rmkWorkspaceConfigured = !string.IsNullOrWhiteSpace(options.Settings.RmkWorkspaceRoot),
-                rmkUseExisting = options.Settings.RmkUseExisting,
-                providers = providerSummaries
-            };
+            present = true,
+            schemaVersion = options.Settings.Version,
+            themeMode = KnownValue(options.Settings.ThemeMode, ["System", "Light", "Dark"]),
+            designPreset = KnownValue(options.Settings.DesignPreset, ["Professional", "SciFi", "Vivid", "Studio", "Frontier"]),
+            textSize = options.Settings.TextSize,
+            highContrast = options.Settings.HighContrast,
+            autoSave = options.Settings.AutoSave,
+            selectedProvider = KnownValue(options.Settings.ApiProviderId, ProviderIds),
+            rmkWorkspaceConfigured = !string.IsNullOrWhiteSpace(options.Settings.RmkWorkspaceRoot),
+            rmkUseExisting = options.Settings.RmkUseExisting,
+            providers = providerSummaries
+        };
 
-            var languages = options.Projects.Projects
-                .GroupBy(project => LanguageCategory(project.SourceLanguageFolder), StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
-            var projectSummary = new
-            {
-                present = true,
-                schemaVersion = options.Projects.Version,
-                count = options.Projects.Projects.Count,
-                withReview = options.Projects.Projects.Count(project => !string.IsNullOrWhiteSpace(project.LatestReviewRoot)),
-                sourceLanguages = languages
-            };
+        var languages = options.Projects.Projects
+            .GroupBy(project => LanguageCategory(project.SourceLanguageFolder), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        var projectSummary = new
+        {
+            present = true,
+            schemaVersion = options.Projects.Version,
+            count = options.Projects.Projects.Count,
+            withReview = options.Projects.Projects.Count(project => !string.IsNullOrWhiteSpace(project.LatestReviewRoot)),
+            sourceLanguages = languages
+        };
 
-            var reviewSummary = BuildReviewSummary(options.Paths.Reviews, readErrors, cancellationToken);
-            var integrity = BuildIntegrity(options.ProductRoot, cancellationToken);
-            var manifest = new
+        var reviewSummary = BuildReviewSummary(options.Paths.Reviews, readErrors, cancellationToken);
+        var integrity = BuildIntegrity(options.ProductRoot, cancellationToken);
+        var manifest = new
+        {
+            schemaVersion = 1,
+            generatedAtUtc = DateTimeOffset.UtcNow.ToString("O"),
+            privacy = new
             {
-                schemaVersion = 1,
-                generatedAtUtc = DateTimeOffset.UtcNow.ToString("O"),
-                privacy = new
-                {
-                    includesSourceText = false,
-                    includesTranslationText = false,
-                    includesLocalizationKeys = false,
-                    includesApiKeys = false,
-                    includesRawLogs = false,
-                    includesAbsolutePaths = false
-                },
-                runtime = new
-                {
-                    osVersion = Environment.OSVersion.VersionString,
-                    dotnetVersion = Environment.Version.ToString(),
-                    process64Bit = Environment.Is64BitProcess,
-                    os64Bit = Environment.Is64BitOperatingSystem,
-                    culture = CultureInfo.CurrentCulture.Name,
-                    uiCulture = CultureInfo.CurrentUICulture.Name
-                },
-                readErrors
-            };
-
-            var entries = new Dictionary<string, object>
+                includesSourceText = false,
+                includesTranslationText = false,
+                includesLocalizationKeys = false,
+                includesApiKeys = false,
+                includesRawLogs = false,
+                includesAbsolutePaths = false
+            },
+            runtime = new
             {
-                ["manifest.json"] = manifest,
-                ["settings-summary.json"] = settingsSummary,
-                ["projects-summary.json"] = projectSummary,
-                ["reviews-summary.json"] = reviewSummary,
-                ["errors-summary.json"] = BuildErrorSummary(options.RuntimeLogLines),
-                ["product-integrity.json"] = integrity
-            };
+                osVersion = Environment.OSVersion.VersionString,
+                dotnetVersion = Environment.Version.ToString(),
+                process64Bit = Environment.Is64BitProcess,
+                os64Bit = Environment.Is64BitOperatingSystem,
+                culture = CultureInfo.CurrentCulture.Name,
+                uiCulture = CultureInfo.CurrentUICulture.Name
+            },
+            readErrors
+        };
 
-            foreach (var entry in entries)
+        var sourceEntries = new Dictionary<string, object>
+        {
+            ["manifest.json"] = manifest,
+            ["settings-summary.json"] = settingsSummary,
+            ["projects-summary.json"] = projectSummary,
+            ["reviews-summary.json"] = reviewSummary,
+            ["errors-summary.json"] = BuildErrorSummary(options.RuntimeLogLines),
+            ["product-integrity.json"] = integrity
+        };
+        var entries = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        foreach (var entry in sourceEntries)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var json = JsonSerializer.Serialize(entry.Value, JsonOptions);
+            if (ContainsPrivateContent(json))
+                throw new InvalidDataException($"개인정보 보호 검사에서 {entry.Key} 생성을 차단했습니다.");
+            entries[entry.Key] = Encoding.UTF8.GetBytes(json);
+        }
+
+        var archiveBytes = CreateArchive(entries, cancellationToken);
+        using var writeBoundary = PathSafety.AcquireTrustedWriteBoundary(parent, [output], cancellationToken);
+        if (writeBoundary.TargetExisted(output) && !options.Force)
+            throw new IOException("같은 이름의 진단 번들이 이미 있습니다.");
+        AtomicFile.WriteBytesValidated(
+            output,
+            archiveBytes,
+            temporaryPath => ValidateArchive(temporaryPath, entries, cancellationToken),
+            writeBoundary,
+            keepBackup: true);
+        return new DiagnosticBundleResult(output, entries.Count, archiveBytes.LongLength);
+    }
+
+    private static byte[] CreateArchive(
+        IReadOnlyDictionary<string, byte[]> entries,
+        CancellationToken cancellationToken)
+    {
+        using var output = new MemoryStream();
+        using (var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            foreach (var entry in entries.OrderBy(pair => pair.Key, StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var json = JsonSerializer.Serialize(entry.Value, JsonOptions);
-                if (ContainsPrivateContent(json))
-                    throw new InvalidDataException($"개인정보 보호 검사에서 {entry.Key} 생성을 차단했습니다.");
-                File.WriteAllText(Path.Combine(workspace, entry.Key), json, new UTF8Encoding(false));
+                var archiveEntry = archive.CreateEntry(entry.Key, CompressionLevel.Optimal);
+                archiveEntry.LastWriteTime = new DateTimeOffset(1980, 1, 1, 0, 0, 0, TimeSpan.Zero);
+                using var destination = archiveEntry.Open();
+                destination.Write(entry.Value);
             }
-
-            if (File.Exists(temporaryZip)) File.Delete(temporaryZip);
-            ZipFile.CreateFromDirectory(workspace, temporaryZip, CompressionLevel.Optimal, false);
-            using (var archive = ZipFile.OpenRead(temporaryZip))
-            {
-                var names = archive.Entries.Select(entry => entry.FullName).ToHashSet(StringComparer.Ordinal);
-                foreach (var required in entries.Keys)
-                    if (!names.Contains(required)) throw new InvalidDataException($"진단 번들에 {required} 파일이 없습니다.");
-            }
-
-            if (File.Exists(output)) File.Replace(temporaryZip, output, output + ".bak", true);
-            else File.Move(temporaryZip, output);
-            return new DiagnosticBundleResult(output, entries.Count, new FileInfo(output).Length);
         }
-        finally
+        cancellationToken.ThrowIfCancellationRequested();
+        return output.ToArray();
+    }
+
+    private static void ValidateArchive(
+        string path,
+        IReadOnlyDictionary<string, byte[]> expectedEntries,
+        CancellationToken cancellationToken)
+    {
+        using var archive = ZipFile.OpenRead(path);
+        if (archive.Entries.Count != expectedEntries.Count)
+            throw new InvalidDataException("진단 번들의 파일 수가 예상과 다릅니다.");
+
+        var observedNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in archive.Entries)
         {
-            if (File.Exists(temporaryZip)) File.Delete(temporaryZip);
-            if (workspace.StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase) && Directory.Exists(workspace))
-                Directory.Delete(workspace, true);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!observedNames.Add(entry.FullName)
+                || !expectedEntries.TryGetValue(entry.FullName, out var expected)
+                || entry.Length != expected.LongLength
+                || entry.FullName.EndsWith('/'))
+            {
+                throw new InvalidDataException("진단 번들에 예상하지 않은 파일이 있습니다.");
+            }
+
+            var actual = new byte[expected.Length];
+            using var source = entry.Open();
+            source.ReadExactly(actual);
+            if (source.ReadByte() != -1 || !actual.AsSpan().SequenceEqual(expected))
+                throw new InvalidDataException($"진단 번들의 {entry.FullName} 내용이 검증된 값과 다릅니다.");
+            var json = Encoding.UTF8.GetString(actual);
+            if (ContainsPrivateContent(json))
+                throw new InvalidDataException($"개인정보 보호 검사에서 {entry.FullName} 커밋을 차단했습니다.");
         }
+
+        if (observedNames.Count != expectedEntries.Count)
+            throw new InvalidDataException("진단 번들에 필수 파일이 없습니다.");
     }
 
     private static object BuildReviewSummary(string reviewsRoot, IDictionary<string, string> readErrors, CancellationToken cancellationToken)
@@ -178,8 +217,12 @@ public sealed class DiagnosticBundleService
                 decisionFiles++;
                 try
                 {
-                    if (new FileInfo(path).Length > 16 * 1024 * 1024) throw new InvalidDataException("JSONTooLarge");
-                    var document = JsonSerializer.Deserialize<ReviewDecisionDocument>(File.ReadAllText(path), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    var bytes = BoundedFileReader.ReadAllBytes(
+                        path,
+                        16L * 1024 * 1024,
+                        "Diagnostic review summary input",
+                        cancellationToken: cancellationToken);
+                    var document = JsonSerializer.Deserialize<ReviewDecisionDocument>(bytes, JsonOptions);
                     if (document is null) throw new InvalidDataException("EmptyJson");
                     foreach (var item in document.Items)
                     {
@@ -188,6 +231,10 @@ public sealed class DiagnosticBundleService
                         Increment(origins, KnownValue(item.TranslationOrigin, ["ai", "local", "rmk", "mod", "existing", "google"]));
                         if (item.SourceChanged) sourceChanged++;
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -217,8 +264,13 @@ public sealed class DiagnosticBundleService
             var file = new FileInfo(path);
             string version;
             try { version = FileVersionInfo.GetVersionInfo(path).FileVersion ?? string.Empty; }
-            catch { version = "unavailable"; }
-            return new { name, present = true, bytes = file.Length, sha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant(), fileVersion = version };
+            catch (Exception exception)
+            {
+                System.Diagnostics.Debug.WriteLine($"Diagnostic file version unavailable ({exception.GetType().Name}).");
+                version = "unavailable";
+            }
+            using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+            return new { name, present = true, bytes = file.Length, sha256 = Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant(), fileVersion = version };
         }).ToArray();
     }
 

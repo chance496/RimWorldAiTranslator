@@ -18,7 +18,7 @@ internal static partial class Program
             SaveReviewDecisions(run, [(defRow, "시험 작업대")]);
 
             var root = Directory.GetParent(modRoot)!.FullName;
-            var rmkRoot = Path.Combine(root, "RmkEntry");
+            var workspaceRoot = CreateRmkWorkspace(root, "RmkEntry", out var rmkRoot);
             var defPath = Path.Combine(rmkRoot, "Languages", "Korean", "DefInjected", "ThingDef", "CodexAI.xml");
             Directory.CreateDirectory(Path.GetDirectoryName(defPath)!);
             File.WriteAllText(defPath,
@@ -30,8 +30,10 @@ internal static partial class Program
 
             var first = service.Export(new RmkExportOptions
             {
+                RmkWorkspaceRoot = workspaceRoot,
                 RmkEntryRoot = rmkRoot,
                 ReviewRoot = run.ReviewRoot!,
+                ModRoot = modRoot,
                 RmkLanguageFolderName = "Korean",
                 WorkbookPath = workbookPath,
                 Overwrite = true
@@ -41,15 +43,20 @@ internal static partial class Program
             Assert(File.Exists(defPath + ".bak"), "RMK XML backup was not retained.");
             Assert(File.ReadAllBytes(defPath + ".bak").SequenceEqual(originalDef), "RMK XML backup did not preserve the prior file.");
             var defBeforeFailure = File.ReadAllBytes(defPath);
+            var defBackupBeforeFailure = File.ReadAllBytes(defPath + ".bak");
             var workbookBeforeFailure = File.ReadAllBytes(workbookPath);
+            var workbookBackupPath = workbookPath + ".bak";
+            Assert(!File.Exists(workbookBackupPath), "New RMK workbook unexpectedly started with a backup sidecar.");
 
             SaveReviewDecisions(run, [(defRow, "시험 작업대"), (keyedRow, "번역 시작")]);
             var blockedTarget = Path.Combine(rmkRoot, "Languages", "Korean", "Keyed", "SampleKeys.xml");
             Directory.CreateDirectory(blockedTarget);
             var error = CaptureException<IOException>(() => service.Export(new RmkExportOptions
             {
+                RmkWorkspaceRoot = workspaceRoot,
                 RmkEntryRoot = rmkRoot,
                 ReviewRoot = run.ReviewRoot!,
+                ModRoot = modRoot,
                 RmkLanguageFolderName = "Korean",
                 WorkbookPath = workbookPath,
                 Overwrite = true
@@ -57,20 +64,49 @@ internal static partial class Program
             Assert(error.Message.Contains("rolled back", StringComparison.OrdinalIgnoreCase), "RMK failure did not report rollback.");
             Assert(File.ReadAllBytes(defPath).SequenceEqual(defBeforeFailure), "RMK XML was not restored after failure.");
             Assert(File.ReadAllBytes(workbookPath).SequenceEqual(workbookBeforeFailure), "RMK workbook was not restored after failure.");
+            Assert(File.ReadAllBytes(defPath + ".bak").SequenceEqual(defBackupBeforeFailure),
+                "RMK XML's pre-existing backup sidecar was not restored after failure.");
+            Assert(!File.Exists(workbookBackupPath),
+                "RMK rollback retained a workbook backup sidecar that did not exist before the transaction.");
             Assert(Directory.Exists(blockedTarget), "RMK rollback modified the blocking directory.");
             Assert(!Directory.EnumerateFiles(rmkRoot, "*.transaction.bak", SearchOption.AllDirectories).Any(), "RMK transaction snapshots were left behind.");
+
+            File.WriteAllBytes(workbookBackupPath, [0x52, 0x4d, 0x4b, 0x00, 0xff]);
+            var workbookBackupBeforeSecondFailure = File.ReadAllBytes(workbookBackupPath);
+            var secondError = CaptureException<IOException>(() => service.Export(new RmkExportOptions
+            {
+                RmkWorkspaceRoot = workspaceRoot,
+                RmkEntryRoot = rmkRoot,
+                ReviewRoot = run.ReviewRoot!,
+                ModRoot = modRoot,
+                RmkLanguageFolderName = "Korean",
+                WorkbookPath = workbookPath,
+                Overwrite = true
+            }));
+            Assert(secondError.Message.Contains("rolled back", StringComparison.OrdinalIgnoreCase)
+                   && File.ReadAllBytes(defPath).SequenceEqual(defBeforeFailure)
+                   && File.ReadAllBytes(defPath + ".bak").SequenceEqual(defBackupBeforeFailure)
+                   && File.ReadAllBytes(workbookPath).SequenceEqual(workbookBeforeFailure)
+                   && File.ReadAllBytes(workbookBackupPath).SequenceEqual(workbookBackupBeforeSecondFailure)
+                   && TransactionSnapshots(rmkRoot).Length == 0,
+                "RMK rollback did not exactly restore a pre-existing native workbook backup sidecar.");
 
             Directory.Delete(blockedTarget);
             var recovered = service.Export(new RmkExportOptions
             {
+                RmkWorkspaceRoot = workspaceRoot,
                 RmkEntryRoot = rmkRoot,
                 ReviewRoot = run.ReviewRoot!,
+                ModRoot = modRoot,
                 RmkLanguageFolderName = "Korean",
                 WorkbookPath = workbookPath,
                 Overwrite = true
             });
             Assert(recovered.EligibleEntries == 2 && File.Exists(blockedTarget), "RMK export did not recover after rollback.");
             Assert(RimWorldTranslatorRmkXlsxReader.Read(workbookPath).Rows.Count >= 2, "RMK workbook is unreadable or incomplete.");
+            Assert(File.ReadAllBytes(defPath + ".bak").SequenceEqual(defBeforeFailure)
+                   && File.ReadAllBytes(workbookBackupPath).SequenceEqual(workbookBeforeFailure),
+                "Successful RMK export changed XML or workbook backup-retention semantics.");
         });
     }
 
@@ -84,14 +120,15 @@ internal static partial class Program
             SaveReviewDecisions(initial, [(initialRow, translation)]);
 
             var root = Directory.GetParent(modRoot)!.FullName;
-            var rmkRoot = Path.Combine(root, "RmkHistoryEntry");
-            Directory.CreateDirectory(rmkRoot);
+            var workspaceRoot = CreateRmkWorkspace(root, "RmkHistoryEntry", out var rmkRoot);
             var workbookPath = Path.Combine(rmkRoot, "history.xlsx");
             var service = CreateRmkExportService();
             service.Export(new RmkExportOptions
             {
+                RmkWorkspaceRoot = workspaceRoot,
                 RmkEntryRoot = rmkRoot,
                 ReviewRoot = initial.ReviewRoot!,
+                ModRoot = modRoot,
                 RmkLanguageFolderName = "Korean",
                 WorkbookPath = workbookPath,
                 SourceLanguage = "English",
@@ -99,7 +136,7 @@ internal static partial class Program
             });
 
             var englishPath = Path.Combine(modRoot, "Languages", "English", "Keyed", "SampleKeys.xml");
-            var english = File.ReadAllText(englishPath).Replace("Translate now", "Translate immediately", StringComparison.Ordinal);
+            var english = File.ReadAllText(englishPath).Replace("Translate now", " Translate now ", StringComparison.Ordinal);
             File.WriteAllText(englishPath, english, new System.Text.UTF8Encoding(false));
             var referenceRoot = Path.Combine(rmkRoot, "Languages", "Korean");
             var updated = new TranslationEngine(RepositoryRoot(), CreateExtractor()).RunAsync(new TranslationEngineOptions
@@ -114,15 +151,17 @@ internal static partial class Program
             }).GetAwaiter().GetResult();
             var updatedRow = updated.Rows.Single(row => row.Key == "CodexTranslator.SampleButton");
             Assert(updatedRow.Existing == translation && updatedRow.ExistingOrigin == "rmk", "RMK translation origin was not restored.");
-            Assert(updatedRow.RmkSourceChanged, "RMK source change was not detected.");
+            Assert(updatedRow.RmkSourceChanged, "An RMK source change consisting only of edge whitespace was not detected.");
             Assert(updatedRow.RmkHistoricalSource == "Translate now", "Translation-time RMK source was overwritten.");
-            Assert(updatedRow.RmkCurrentSource == "Translate immediately", "Current RMK source was not captured.");
+            Assert(updatedRow.RmkCurrentSource == " Translate now ", "The exact current RMK source whitespace was not captured.");
 
             SaveReviewDecisions(updated, [(updatedRow, translation, ReviewStatuses.Pending, true, updatedRow.RmkHistoricalSource)]);
             service.Export(new RmkExportOptions
             {
+                RmkWorkspaceRoot = workspaceRoot,
                 RmkEntryRoot = rmkRoot,
                 ReviewRoot = updated.ReviewRoot!,
+                ModRoot = modRoot,
                 RmkLanguageFolderName = "Korean",
                 WorkbookPath = workbookPath,
                 SourceLanguage = "English",
@@ -164,6 +203,23 @@ internal static partial class Program
     private static RmkExportService CreateRmkExportService() =>
         new(new AtomicJsonStore(), new LanguageFileService(), CreateExtractor());
 
+    private static string CreateRmkWorkspace(string root, string entryName, out string entryRoot)
+    {
+        var workspaceRoot = Path.Combine(root, "RmkWorkspace-" + entryName);
+        Directory.CreateDirectory(Path.Combine(workspaceRoot, "Data"));
+        Directory.CreateDirectory(Path.Combine(workspaceRoot, "About"));
+        Directory.CreateDirectory(Path.Combine(workspaceRoot, ".git"));
+        File.WriteAllText(Path.Combine(workspaceRoot, ".git", "HEAD"), "ref: refs/heads/bus\n", new System.Text.UTF8Encoding(false));
+        File.WriteAllText(
+            Path.Combine(workspaceRoot, "About", "About.xml"),
+            "<ModMetaData><supportedVersions><li>1.6</li></supportedVersions></ModMetaData>",
+            new System.Text.UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(workspaceRoot, "ModList.tsv"), string.Empty, new System.Text.UTF8Encoding(false));
+        entryRoot = Path.Combine(workspaceRoot, "Data", entryName);
+        Directory.CreateDirectory(entryRoot);
+        return workspaceRoot;
+    }
+
     private static void SaveReviewDecisions(
         TranslationRunResult run,
         IEnumerable<(ReviewComparisonRow Row, string Text, string Status, bool SourceChanged, string PreviousSource)> items)
@@ -185,7 +241,7 @@ internal static partial class Program
                 PreviousSourceText = item.PreviousSource
             }).ToList()
         };
-        new ReviewRepository(new AtomicJsonStore()).Save(run.ReviewRoot!, document);
+        SaveBoundReviewDocument(new AtomicJsonStore(), run.ReviewRoot!, document);
     }
 
     private static void SaveReviewDecisions(

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using RimWorldAiTranslator.Core.Apply;
 using RimWorldAiTranslator.Core.Discovery;
 using RimWorldAiTranslator.Core.Diagnostics;
@@ -13,29 +14,65 @@ using RimWorldAiTranslator.Core.Xml;
 
 namespace RimWorldAiTranslator.App;
 
-internal sealed class AppServices : IDisposable
+internal sealed class AppServices : IDisposable, IAsyncDisposable
 {
-    public AppServices(string? dataRoot = null)
+    private readonly ConcurrentQueue<JsonRecoveryNotice> recoveryNotices = new();
+    private int disposalStarted;
+
+    public AppServices(string? dataRoot = null, RimWorldModDiscoveryService? discovery = null)
+        : this(dataRoot, discovery, loggerFactory: null, CancellationToken.None)
     {
+    }
+
+    internal AppServices(
+        string? dataRoot,
+        RimWorldModDiscoveryService? discovery,
+        Func<string, AppLogger>? loggerFactory,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         ContentRoot = FindContentRoot();
         Paths = new AppDataPaths(dataRoot ?? Environment.GetEnvironmentVariable("RIMWORLD_TRANSLATOR_DATA_ROOT"));
         Paths.EnsureExists();
+        cancellationToken.ThrowIfCancellationRequested();
         Store = new AtomicJsonStore();
+        Store.RecoveredFromBackup += (_, notice) => recoveryNotices.Enqueue(notice);
         ProjectRepository = new ProjectRepository(Store, Paths);
         ProjectStats = new ProjectStatsCacheRepository(Store, Paths);
         SettingsRepository = new SettingsRepository(Store, Paths);
-        Discovery = new RimWorldModDiscoveryService();
+        Discovery = discovery ?? new RimWorldModDiscoveryService();
         Extractor = new SourceExtractor(Path.Combine(ContentRoot, "rimworld-def-field-rules.txt"));
         LanguageFiles = new LanguageFileService();
         Projects = new ProjectService(ProjectRepository, Discovery, new ProjectCleanupService());
-        Reviews = new ReviewWorkspaceService(Store, Extractor);
-        Apply = new ReviewApplyService(Store, LanguageFiles, Extractor);
-        Rmk = new RmkExportService(Store, LanguageFiles, Extractor);
-        RmkWorkspace = new RmkWorkspaceService();
+        Activity = new ActivityService(Store, Paths.Reviews);
+        Reviews = new ReviewWorkspaceService(Store, Extractor, Paths.Reviews);
+        ReviewSaves = new ReviewSaveCoordinator(Reviews);
+        TranslationArtifacts = new TranslationRunArtifactService(Paths.Temp, Paths.Reviews);
+        IsolationAcknowledgements = new IsolatedDiscoveryAcknowledgementService();
+        RecoveryAuthority = new FileTransactionRecoveryAuthority(Paths.RecoveryAuthority);
+        RmkWorkspace = new RmkWorkspaceService(RecoveryAuthority, Paths.RmkBuilderStaging);
+        Apply = new ReviewApplyService(
+            Store,
+            LanguageFiles,
+            Extractor,
+            Paths.Reviews,
+            RecoveryAuthority);
+        Rmk = new RmkExportService(
+            Store,
+            LanguageFiles,
+            Extractor,
+            RmkWorkspace,
+            Paths.Reviews,
+            RecoveryAuthority);
         Diagnostics = new DiagnosticBundleService();
-        Logger = new AppLogger(Paths.Logs);
-        Settings = LoadSettings();
-        ProjectStore = Projects.Load();
+        Settings = LoadSettings(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        ProjectStore = Projects.Load(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        // Open the persistent log only after recoverable state has loaded. If state
+        // construction fails, no logger handle can escape from a failed constructor.
+        Logger = (loggerFactory ?? (static path => new AppLogger(path)))(Paths.Logs)
+            ?? throw new InvalidOperationException("The logger factory returned no logger.");
     }
 
     public string ContentRoot { get; }
@@ -48,30 +85,56 @@ internal sealed class AppServices : IDisposable
     public SourceExtractor Extractor { get; }
     public LanguageFileService LanguageFiles { get; }
     public ProjectService Projects { get; }
+    public ActivityService Activity { get; }
     public ReviewWorkspaceService Reviews { get; }
+    public ReviewSaveCoordinator ReviewSaves { get; }
+    public TranslationRunArtifactService TranslationArtifacts { get; }
+    public IsolatedDiscoveryAcknowledgementService IsolationAcknowledgements { get; }
+    public FileTransactionRecoveryAuthority RecoveryAuthority { get; }
     public ReviewApplyService Apply { get; }
     public RmkExportService Rmk { get; }
     public RmkWorkspaceService RmkWorkspace { get; }
     public DiagnosticBundleService Diagnostics { get; }
     public AppLogger Logger { get; }
     public AppSettingsDocument Settings { get; private set; }
+    public bool StoredSettingsCredentialCorrectionRequired { get; private set; }
     public ProjectStoreDocument ProjectStore { get; }
     public Dictionary<string, string> ApiKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-    public TranslationEngine CreateTranslationEngine() => new(ContentRoot, Extractor, LanguageFiles);
-
-    public void SaveSettings(AppSettingsDocument settings)
+    public IReadOnlyList<JsonRecoveryNotice> DrainRecoveryNotices()
     {
-        Settings = settings;
-        SettingsRepository.Save(settings);
+        var notices = new List<JsonRecoveryNotice>();
+        while (recoveryNotices.TryDequeue(out var notice)) notices.Add(notice);
+        return notices;
     }
 
-    private AppSettingsDocument LoadSettings()
+    public TranslationEngine CreateTranslationEngine() =>
+        new(ContentRoot, Extractor, LanguageFiles, recoveryAuthority: RecoveryAuthority);
+
+    public async Task SaveSettingsAsync(
+        AppSettingsDocument settings,
+        CancellationToken cancellationToken = default)
     {
-        var settings = SettingsRepository.Load();
+        await SettingsRepository.SaveAsync(settings, cancellationToken).ConfigureAwait(false);
+        Settings = settings;
+        StoredSettingsCredentialCorrectionRequired =
+            SettingsRepository.StoredCredentialCorrectionRequired();
+    }
+
+    public Task FlushSettingsAsync(CancellationToken cancellationToken = default) =>
+        SettingsRepository.FlushAsync(cancellationToken);
+
+    private AppSettingsDocument LoadSettings(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var settings = SettingsRepository.Load(cancellationToken);
+        StoredSettingsCredentialCorrectionRequired =
+            SettingsRepository.UnsafeExtensionDataExcludedOnLastLoad
+            || SettingsRepository.StoredCredentialCorrectionRequired();
         var defaults = ApiProviderCatalog.CreateDefaultSettings();
         foreach (var pair in defaults)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!settings.ApiProviders.ContainsKey(pair.Key)) settings.ApiProviders[pair.Key] = pair.Value;
         }
         if (!ApiProviderCatalog.All.Any(profile => profile.Id.Equals(settings.ApiProviderId, StringComparison.OrdinalIgnoreCase)))
@@ -93,5 +156,39 @@ internal sealed class AppServices : IDisposable
         return AppContext.BaseDirectory;
     }
 
-    public void Dispose() => Logger.Dispose();
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref disposalStarted, 1) != 0) return;
+        DisposeSupportingServices();
+        try { Logger.Dispose(); }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Logger disposal failed ({exception.GetType().Name}).");
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref disposalStarted, 1) != 0) return;
+        await Task.Run(DisposeSupportingServices).ConfigureAwait(false);
+        try { await Logger.DisposeAsync().ConfigureAwait(false); }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Logger async disposal failed ({exception.GetType().Name}).");
+        }
+    }
+
+    private void DisposeSupportingServices()
+    {
+        try { ReviewSaves.Dispose(); }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Review save service disposal failed ({exception.GetType().Name}).");
+        }
+        try { SettingsRepository.Dispose(); }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Settings service disposal failed ({exception.GetType().Name}).");
+        }
+    }
 }

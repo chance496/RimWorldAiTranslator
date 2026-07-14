@@ -5,11 +5,22 @@ namespace RimWorldAiTranslator.Core.Models;
 
 public sealed class ProjectStoreDocument
 {
+    public const int CurrentVersion = 3;
+
     [JsonPropertyName("version")]
     public int Version { get; set; } = 2;
 
     [JsonPropertyName("updatedAt")]
     public string UpdatedAt { get; set; } = string.Empty;
+
+    [JsonPropertyName("revision")]
+    public long Revision { get; set; }
+
+    [JsonIgnore]
+    public string? ObservedContentSha256 { get; set; }
+
+    [JsonIgnore]
+    public bool ObservedMissing { get; set; }
 
     [JsonPropertyName("projects")]
     public List<TranslationProject> Projects { get; set; } = [];
@@ -28,6 +39,9 @@ public sealed class TranslationProject
 
     [JsonPropertyName("modRoot")]
     public string ModRoot { get; set; } = string.Empty;
+
+    [JsonPropertyName("sourceKind")]
+    public string SourceKind { get; set; } = string.Empty;
 
     [JsonPropertyName("packageId")]
     public string PackageId { get; set; } = string.Empty;

@@ -19,6 +19,12 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.UiHarn
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.Benchmarks", "tests\RimWorldAiTranslator.Benchmarks\RimWorldAiTranslator.Benchmarks.csproj", "{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{BC70362D-E14D-4FF4-B5B8-B58E8511A38C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.GlossaryTool", "tools\RimWorldAiTranslator.GlossaryTool\RimWorldAiTranslator.GlossaryTool.csproj", "{C8AFEC39-86D9-4B12-83BB-CB89873B70CE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RimWorldAiTranslator.Tooling", "tools\RimWorldAiTranslator.Tooling\RimWorldAiTranslator.Tooling.csproj", "{D4F3E8C1-5678-43F8-A903-FAF2B96FB0DF}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -52,6 +58,14 @@ Global
 		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C8AFEC39-86D9-4B12-83BB-CB89873B70CE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C8AFEC39-86D9-4B12-83BB-CB89873B70CE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C8AFEC39-86D9-4B12-83BB-CB89873B70CE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C8AFEC39-86D9-4B12-83BB-CB89873B70CE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D4F3E8C1-5678-43F8-A903-FAF2B96FB0DF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D4F3E8C1-5678-43F8-A903-FAF2B96FB0DF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D4F3E8C1-5678-43F8-A903-FAF2B96FB0DF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D4F3E8C1-5678-43F8-A903-FAF2B96FB0DF}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{3DB4A7E8-3580-4AC1-86A9-B020D06DC7F4} = {44C4FD8C-C6C1-46D6-AF27-EAF787F78B16}
@@ -60,5 +74,7 @@ Global
 		{281F7E8F-C01B-49F4-908B-1CEDE0167384} = {8131235E-A452-4878-8973-DBDF9B0E8096}
 		{6E2B46BB-D9AE-4DED-99F0-5AD1518DF1BA} = {8131235E-A452-4878-8973-DBDF9B0E8096}
 		{A34A8E3E-6128-4322-B5B3-DA08369C2EE4} = {8131235E-A452-4878-8973-DBDF9B0E8096}
+		{C8AFEC39-86D9-4B12-83BB-CB89873B70CE} = {BC70362D-E14D-4FF4-B5B8-B58E8511A38C}
+		{D4F3E8C1-5678-43F8-A903-FAF2B96FB0DF} = {BC70362D-E14D-4FF4-B5B8-B58E8511A38C}
 	EndGlobalSection
 EndGlobal

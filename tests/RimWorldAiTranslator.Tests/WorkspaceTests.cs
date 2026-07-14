@@ -71,12 +71,41 @@ internal static partial class Program
             Assert(item.Decision.SourceChanged && item.EffectiveStatus == ReviewStatuses.Pending, "Updated source was not demoted to changed/pending.");
             Assert(item.Decision.PreviousSourceText == "Translate now", "Previous source snapshot was not preserved.");
             Assert(item.Row.Source == "Translate immediately", "Current source was not loaded.");
+            var accessibleItemText = item.ToString();
+            Assert(accessibleItemText.Contains("Translate immediately", StringComparison.Ordinal)
+                   && accessibleItemText.Contains("변경됨", StringComparison.Ordinal)
+                   && accessibleItemText.Contains("번역 시작", StringComparison.Ordinal),
+                "Owner-drawn review item text is not available to accessibility clients.");
             Assert(workspace.ImportedDecisions >= 1 && workspace.ChangedSources >= 1, "Inheritance counters changed.");
 
             service.Save(workspace);
             var reloaded = service.Load(updated.ReviewRoot!, project);
             var reloadedItem = reloaded.Items.Single(value => value.Row.Key == "CodexTranslator.SampleButton");
             Assert(reloadedItem.Decision.Text == "번역 시작" && reloadedItem.Decision.SourceChanged, "Saved inherited state did not round-trip.");
+
+            service.SetStatus(reloaded, reloadedItem, ReviewStatuses.Approved);
+            service.Save(reloaded);
+            Assert(!reloadedItem.Decision.SourceChanged
+                   && reloadedItem.Decision.PreviousSourceText == "Translate now",
+                "Approving the first source change lost its historical source.");
+            project.LatestReviewRoot = updated.ReviewRoot!;
+            project.Runs.Add(new ProjectRun
+            {
+                ReviewRoot = updated.ReviewRoot!,
+                CreatedAt = DateTimeOffset.Now.ToString("O")
+            });
+            File.WriteAllText(englishPath,
+                File.ReadAllText(englishPath).Replace("Translate immediately", "Translate finally", StringComparison.Ordinal),
+                new System.Text.UTF8Encoding(false));
+            var changedAgain = CreateSourceOnlyReview(modRoot, "reviews-inheritance-changed-again");
+            var changedAgainWorkspace = service.Load(changedAgain.ReviewRoot!, project);
+            var changedAgainItem = changedAgainWorkspace.Items.Single(value => value.Row.Key == "CodexTranslator.SampleButton");
+            Assert(changedAgainItem.Decision.Text == "번역 시작"
+                   && changedAgainItem.Decision.SourceChanged
+                   && changedAgainItem.EffectiveStatus == ReviewStatuses.Pending
+                   && changedAgainItem.Decision.PreviousSourceText == "Translate immediately"
+                   && changedAgainItem.Row.Source == "Translate finally",
+                "A second source change retained the older A source instead of the approved B source.");
         });
     }
 }

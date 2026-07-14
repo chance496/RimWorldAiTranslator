@@ -10,9 +10,9 @@
 
 ## 복원과 빌드
 
-```powershell
-dotnet restore .\RimWorldAiTranslator.sln
-dotnet build .\RimWorldAiTranslator.sln -c Release --no-restore
+```text
+dotnet restore RimWorldAiTranslator.sln --configfile NuGet.config
+dotnet build RimWorldAiTranslator.sln -c Release --no-restore -p:TreatWarningsAsErrors=true
 ```
 
 완료 조건: 모든 프로젝트가 빌드되고 경고 0, 오류 0.
@@ -21,53 +21,65 @@ dotnet build .\RimWorldAiTranslator.sln -c Release --no-restore
 
 이 저장소의 회귀 runner는 테스트 SDK가 아니라 의존성 없는 콘솔 프로그램이다.
 
-```powershell
-dotnet run --project .\tests\RimWorldAiTranslator.Tests\RimWorldAiTranslator.Tests.csproj -c Release --no-build
+```text
+dotnet run --project tests/RimWorldAiTranslator.Tests/RimWorldAiTranslator.Tests.csproj -c Release --no-build --no-restore
 ```
 
-완료 조건: `30/30 tests passed.`와 종료 코드 0. 저장·복구, 키 비저장, 선택형 추가 용어집, XML/Def 안전, 다중 키·재시도, 취소·재개, 로컬 적용, RMK 트랜잭션·원문 이력, 진단 개인정보를 포함한다.
+완료 조건: 출력된 전체 테스트가 모두 PASS이고 종료 코드가 0이다. 고정된 과거 개수를 완료 근거로 사용하지 않는다.
+
+릴리스 후보의 연속 회귀 게이트는 빌드된 동일 Release DLL을 서로 다른 프로세스로 세 번 실행한다. 다음 세 명령이 모두 전체 PASS와 종료 코드 0이어야 하며, 한 번의 성공으로 대체하지 않는다.
+
+```text
+dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
+dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
+dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
+```
 
 ## 성능 측정
 
-```powershell
+```text
 dotnet run --project .\tests\RimWorldAiTranslator.Benchmarks\RimWorldAiTranslator.Benchmarks.csproj -c Release --no-build -- --rows 5000 --iterations 5
 ```
 
-완료 조건: 추출·검수 로드 결과가 정확히 5,000행, 키 검색 1행, 상태 필터 5,000행이며 JSON 측정 결과와 종료 코드 0을 출력한다. 성능 수치는 회귀 참고치이며 절대 통과 한계로 사용하지 않는다.
+완료 조건: 추출·검수 로드 결과가 정확히 5,000행, 키 검색 1행, 상태 필터 5,000행이며 JSON 측정 결과와 종료 코드 0을 출력한다. Phase 08의 동등한 전후 측정에서 20%를 넘는 중대한 회귀, 반복되는 200ms 초과 UI 검색·필터 지연, 문서화된 취소 응답 목표 위반은 릴리스 게이트다. 서로 동등하지 않은 경로의 수치와 그 밖의 숫자는 설명용 참고치로만 사용한다.
 
-## 소스 실행과 UI harness
+## 격리 UI harness
 
-```powershell
-dotnet run --project .\src\RimWorldAiTranslator.App\RimWorldAiTranslator.App.csproj -c Release
-dotnet run --project .\tests\RimWorldAiTranslator.UiHarness\RimWorldAiTranslator.UiHarness.csproj -c Release
+```text
+dotnet run --project tests/RimWorldAiTranslator.UiHarness/RimWorldAiTranslator.UiHarness.csproj -c Release --no-build --no-restore -- --slow-bootstrap
+dotnet run --project tests/RimWorldAiTranslator.UiHarness/RimWorldAiTranslator.UiHarness.csproj -c Release --no-build --no-restore -- --single-instance-probe
 ```
 
-UI harness는 고유한 임시 데이터 루트를 만들고 종료 시 그 루트만 정리한다. UI 변경은 최소 900x600과 일반 최대화 화면에서 밝음·어두움, 대시보드·설정·검수 화면, 글자 잘림, 목록 스크롤, 키보드와 중지 버튼을 확인한다.
+원시 App 명령은 기본 `%LOCALAPPDATA%`와 실제 discovery를 열 수 있으므로 품질 게이트로 직접 실행하지 않는다. UI harness는 고유한 임시 data/discovery root와 합성 fixture를 만들고 종료 시 그 루트만 정리한다. 실제 배포 EXE 시작·종료는 아래 C# package 명령의 격리 smoke에서만 검증한다. UI 변경은 최소 900x600과 일반 최대화 화면에서 밝음·어두움, 대시보드·설정·검수 화면, 글자 잘림, 목록 스크롤, 키보드와 중지 버튼을 확인한다.
 
 ## 자체 포함 패키지
 
-실제로 확인한 개발 보조 명령:
+로컬 RC를 만드는 유일한 개발 명령:
 
-```powershell
-& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\build-package.ps1
+```text
+dotnet run --project tools/RimWorldAiTranslator.Tooling -c Release --no-build --no-restore -- package
 ```
 
-스크립트는 다음을 순서대로 강제한다.
+C# 도구는 다음을 순서대로 강제한다.
 
-1. Release 솔루션 빌드와 30개 회귀.
+1. 외부 package source가 없는 복원, Release 솔루션 빌드와 전체 회귀.
 2. `dotnet publish -r win-x64 --self-contained true` 단일 EXE.
-3. EXE `FileVersion=1.0.0.0`, `ProductVersion=1.0.0`.
+3. EXE `FileVersion=1.0.1.0`, `ProductVersion=1.0.1-rc.1`.
 4. EXE, 원본+DLC 용어집, Def 규칙, 문서·라이선스·버전만 ZIP에 포함.
 5. `.ps1`, `.psm1`, `.cmd`, `.bat`, `powershell.exe`, `pwsh.exe` 패키지 유입 차단.
-6. 격리 데이터 루트에서 창 표시, PowerShell 자식 0개, 10초 안 정상 종료와 ExitCode 0.
+6. 격리 data/discovery root에서 탐색 완료 ACK와 창 표시, 자식 프로세스 0개, 정상 종료와 ExitCode 0.
 
-`build-package.ps1`은 개발 도구일 뿐 배포 ZIP이나 사용자 실행 경로에 포함되지 않는다.
+용어집 도구의 합성 self-test도 패키지 전에 별도로 통과해야 한다.
+
+```text
+dotnet run --project tools/RimWorldAiTranslator.GlossaryTool -c Release --no-build --no-restore -- self-test
+```
 
 ## 정적·릴리스 검사
 
-```powershell
+```text
 rg -n -i "csk-|sk-[A-Za-z0-9_-]{20,}|api[_ -]?key" --glob '!dist/**' --glob '!bin/**' --glob '!obj/**'
-rg -n -i "powershell|pwsh|\.ps1" src
+dotnet run --project tools/RimWorldAiTranslator.Tooling -c Release --no-build --no-restore -- verify-zero
 git diff --check
 ```
 
@@ -98,8 +110,9 @@ git diff --check
 ## 릴리스 완료 조건
 
 - 빌드 경고 0/오류 0.
-- 오프라인 회귀 30/30.
+- 같은 Release DLL의 전체 오프라인 회귀를 별도 프로세스로 3회 연속 실행해 매번 전체 PASS와 종료 코드 0.
 - 5,000행 벤치마크 행·검색 결과 일치.
 - UI harness 및 실제 배포 EXE 정상 표시·취소·종료.
 - ZIP 금지 런타임 0개, PowerShell 자식 0개, 정확한 버전과 SHA-256.
-- README, 패키지 안내, 릴리스 노트, GitHub 설명과 태그가 같은 `v1.0.0`을 가리킨다.
+- README, 패키지 안내, 릴리스 노트, VERSION, PE와 ZIP이 같은 로컬 후보 `v1.0.1-rc.1`을 가리킨다.
+- 공개 v1.0.0의 tag/Release/asset은 변경하지 않으며 로컬 RC 작업에서 외부 배포를 수행하지 않는다.

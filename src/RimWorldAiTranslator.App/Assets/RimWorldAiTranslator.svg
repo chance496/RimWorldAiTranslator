@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!--
+    Original project artwork for RimWorld AI Translator.
+    Copyright (c) 2026 wjdck. SPDX-License-Identifier: MIT.
+    This geometric mark uses no external image, font, game asset, or third-party artwork.
+  -->
+  <polygon fill="#1F2933" points="10,2 54,2 62,10 62,54 54,62 10,62 2,54 2,10" />
+  <polygon fill="#F5F7FA" points="9,12 27,12 32,17 32,45 9,45" />
+  <polygon fill="#2D7F98" points="32,19 50,19 55,24 55,52 32,52" />
+  <rect fill="#1F2933" x="14" y="19" width="12" height="3" />
+  <rect fill="#1F2933" x="14" y="26" width="9" height="3" />
+  <rect fill="#1F2933" x="14" y="33" width="12" height="3" />
+  <rect fill="#F5F7FA" x="38" y="28" width="11" height="3" />
+  <rect fill="#F5F7FA" x="38" y="35" width="8" height="3" />
+  <rect fill="#F5F7FA" x="38" y="42" width="11" height="3" />
+  <polygon fill="#F5F7FA" points="24,43 31,36 31,40 40,40 40,46 31,46 31,50" />
+</svg>

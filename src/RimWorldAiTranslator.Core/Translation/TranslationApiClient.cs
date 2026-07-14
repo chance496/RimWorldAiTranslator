@@ -5,24 +5,61 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using RimWorldAiTranslator.Core.Models;
+using RimWorldAiTranslator.Core.Validation;
 
 namespace RimWorldAiTranslator.Core.Translation;
 
 public sealed partial class TranslationApiClient : IDisposable
 {
+    internal const int MaximumRequestBytes = 4 * 1024 * 1024;
+    private static readonly UTF8Encoding Utf8Strict = new(false, true);
     private readonly HttpClient httpClient;
     private readonly bool ownsClient;
     private readonly List<KeyState> keyStates;
     private readonly object keyLock = new();
+    private readonly Func<TimeSpan, CancellationToken, Task> delayAsync;
+    private readonly TimeProvider timeProvider;
+    private int requestAttemptCount;
+    private int requestAttemptLimit = int.MaxValue;
 
     public TranslationApiClient(IEnumerable<string> keys, HttpMessageHandler? handler = null)
+        : this(keys, handler, null)
+    {
+    }
+
+    internal TranslationApiClient(
+        IEnumerable<string> keys,
+        HttpMessageHandler? handler,
+        Func<TimeSpan, CancellationToken, Task>? delayAsync,
+        TimeProvider? timeProvider = null)
     {
         var unique = keys.Where(key => !string.IsNullOrWhiteSpace(key)).Select(key => key.Trim()).Distinct(StringComparer.Ordinal).ToArray();
-        keyStates = unique.Select((key, index) => new KeyState(key, index)).ToList();
-        httpClient = handler is null ? new HttpClient() : new HttpClient(handler, false);
+        this.timeProvider = timeProvider ?? TimeProvider.System;
+        var initialTimestamp = this.timeProvider.GetTimestamp();
+        keyStates = unique.Select((key, index) => new KeyState(key, index, initialTimestamp)).ToList();
+        httpClient = handler is null
+            ? new HttpClient(CreateProductionHandler(), disposeHandler: true)
+            : new HttpClient(handler, disposeHandler: false);
         ownsClient = true;
+        httpClient.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("RimWorldAiTranslator/1.0");
+        this.delayAsync = delayAsync ?? (static (delay, token) => Task.Delay(delay, token));
     }
+
+    internal TimeSpan TransportTimeout => httpClient.Timeout;
+
+    internal void SetRequestAttemptLimit(int maximumRequests)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumRequests);
+        requestAttemptLimit = maximumRequests;
+        requestAttemptCount = 0;
+    }
+
+    internal static HttpClientHandler CreateProductionHandler() => new()
+    {
+        AllowAutoRedirect = false,
+        UseCookies = false
+    };
 
     public async Task<Dictionary<string, string>> TranslateOpenAiAsync(
         TranslationEngineOptions options,
@@ -36,16 +73,25 @@ public sealed partial class TranslationApiClient : IDisposable
             throw new InvalidOperationException($"No API key provided for {options.Provider.Name}.");
         }
         ValidateEndpoint(options.ProviderSettings.Url, options.AllowInsecureLoopback);
+        var endpoint = GetChatCompletionsUrl(options.ProviderSettings.Url);
+        ValidateEndpoint(endpoint, options.AllowInsecureLoopback);
+        if (options.MaxResponseBytes <= 0)
+            throw new InvalidDataException("MaxResponseBytes must be positive.");
         var body = TranslationPrompt.CreateRequestBody(options, systemPrompt, TranslationPrompt.CreateUserPayload(batch));
         var json = body.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
         var estimatedInputTokens = EstimateTokens(json) + 256;
+        if (Utf8Strict.GetByteCount(json) > MaximumRequestBytes)
+            throw new InvalidDataException($"Provider request exceeds the {MaximumRequestBytes:N0}-byte limit.");
+        if (options.MaxInputTokensPerBatch > 0 && estimatedInputTokens > options.MaxInputTokensPerBatch)
+            throw new InvalidDataException(
+                $"Provider request estimate ({estimatedInputTokens:N0} tokens) exceeds the configured batch limit ({options.MaxInputTokensPerBatch:N0}).");
         Exception? lastError = null;
 
         for (var attempt = 1; attempt <= options.MaxRetries; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var keyState = await GetNextKeyAsync(options, estimatedInputTokens, progress, cancellationToken).ConfigureAwait(false);
-            using var request = new HttpRequestMessage(HttpMethod.Post, options.ProviderSettings.Url)
+            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
             {
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
@@ -54,17 +100,19 @@ public sealed partial class TranslationApiClient : IDisposable
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeout.CancelAfter(options.Timeout);
-                using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
-                var raw = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
+                ReserveRequestAttempt();
+                using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
                 if (!response.IsSuccessStatusCode)
                 {
-                    var summary = SafeErrorSummary(raw);
+                    var summary = SafeErrorSummary(response.StatusCode);
                     HandleFailure(keyState, response.StatusCode, options.InputTokensPerMinutePerKey);
                     throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {summary}", null, response.StatusCode);
                 }
 
+                var raw = await ReadBoundedResponseAsync(response.Content, options.MaxResponseBytes, timeout.Token).ConfigureAwait(false);
                 UpdateUsage(keyState, raw, estimatedInputTokens, options.DailyTokenBudgetPerKey);
-                return TranslationPrompt.ParseResponse(raw);
+                var result = TranslationPrompt.ParseResponse(raw, batch.Select(entry => entry.Id));
+                return result;
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
@@ -78,12 +126,19 @@ public sealed partial class TranslationApiClient : IDisposable
             keyState.Failures++;
             if (attempt < options.MaxRetries)
             {
-                progress?.Report(new TranslationProgress("retry", $"Batch request failed on attempt {attempt}; retrying. {Compact(lastError?.Message)}", attempt, options.MaxRetries, true));
-                await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(30_000, 2_000 * attempt)), cancellationToken).ConfigureAwait(false);
+                progress?.Report(new TranslationProgress(
+                    "retry",
+                    $"Provider request failed; retrying attempt {attempt + 1} of {options.MaxRetries}.",
+                    attempt + 1,
+                    options.MaxRetries,
+                    true));
+                await delayAsync(TimeSpan.FromMilliseconds(Math.Min(30_000, 2_000 * attempt)), cancellationToken).ConfigureAwait(false);
             }
         }
 
-        throw new InvalidOperationException($"Request failed after {options.MaxRetries} attempts. Last error: {Compact(lastError?.Message)}", lastError);
+        throw new InvalidOperationException(
+            $"Provider request failed after {options.MaxRetries} attempts ({SafeExceptionType(lastError)}).",
+            lastError);
     }
 
     public async Task<string> TranslateGoogleAsync(
@@ -105,13 +160,18 @@ public sealed partial class TranslationApiClient : IDisposable
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    var url = $"{endpoint}?client=gtx&sl=auto&tl=ko&dt=t&q={Uri.EscapeDataString(chunk)}";
+                    var separator = endpoint.Contains('?') ? '&' : '?';
+                    var url = $"{endpoint}{separator}client=gtx&sl=auto&tl=ko&dt=t&q={Uri.EscapeDataString(chunk)}";
                     using var request = new HttpRequestMessage(HttpMethod.Get, url);
                     using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                     timeoutSource.CancelAfter(timeout);
-                    using var response = await httpClient.SendAsync(request, timeoutSource.Token).ConfigureAwait(false);
-                    var raw = await response.Content.ReadAsStringAsync(timeoutSource.Token).ConfigureAwait(false);
+                    ReserveRequestAttempt();
+                    using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutSource.Token).ConfigureAwait(false);
                     response.EnsureSuccessStatusCode();
+                    var raw = await ReadBoundedResponseAsync(
+                        response.Content,
+                        TranslationEngineOptions.DefaultMaxResponseBytes,
+                        timeoutSource.Token).ConfigureAwait(false);
                     translated.Append(ParseGoogleResponse(raw));
                     lastError = null;
                     break;
@@ -120,17 +180,17 @@ public sealed partial class TranslationApiClient : IDisposable
                 {
                     lastError = new TimeoutException($"Google request timed out after {timeout.TotalSeconds:0} seconds.");
                 }
-                catch (Exception ex) when (ex is HttpRequestException or JsonException)
+                catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException)
                 {
                     lastError = ex;
                 }
                 if (attempt < maxRetries)
                 {
-                    await Task.Delay(Math.Min(10_000, 1_000 * (1 + attempt)), cancellationToken).ConfigureAwait(false);
+                    await delayAsync(TimeSpan.FromMilliseconds(Math.Min(10_000, 1_000 * (1 + attempt))), cancellationToken).ConfigureAwait(false);
                 }
             }
             if (lastError is not null) throw lastError;
-            await Task.Delay(120, cancellationToken).ConfigureAwait(false);
+            await delayAsync(TimeSpan.FromMilliseconds(120), cancellationToken).ConfigureAwait(false);
         }
         return RestoreTokens(translated.ToString().Replace("\r\n", "\n").Replace('\r', '\n'), protectedText.Map);
     }
@@ -163,6 +223,25 @@ public sealed partial class TranslationApiClient : IDisposable
         return keys;
     }
 
+    internal static string GetChatCompletionsUrl(string value)
+    {
+        var trimmed = value.Trim();
+        var componentIndex = trimmed.IndexOfAny(['?', '#']);
+        var endpointPath = (componentIndex < 0 ? trimmed : trimmed[..componentIndex]).TrimEnd('/');
+        var trailingComponents = componentIndex < 0 ? string.Empty : trimmed[componentIndex..];
+        if (endpointPath.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase))
+            return endpointPath + trailingComponents;
+        if (endpointPath.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)
+            || endpointPath.EndsWith("/v1beta/openai", StringComparison.OrdinalIgnoreCase)
+            || endpointPath.EndsWith("/compatible-mode/v1", StringComparison.OrdinalIgnoreCase)
+            || endpointPath.EndsWith("/api/v1", StringComparison.OrdinalIgnoreCase)
+            || endpointPath.EndsWith("/paas/v4", StringComparison.OrdinalIgnoreCase))
+        {
+            return endpointPath + "/chat/completions" + trailingComponents;
+        }
+        return endpointPath + "/v1/chat/completions" + trailingComponents;
+    }
+
     public void Dispose()
     {
         if (ownsClient) httpClient.Dispose();
@@ -182,12 +261,13 @@ public sealed partial class TranslationApiClient : IDisposable
         while (true)
         {
             KeyState state;
-            DateTimeOffset readyAt;
+            long readyAt;
             lock (keyLock)
             {
+                var now = timeProvider.GetTimestamp();
                 foreach (var candidate in keyStates.Where(candidate => !candidate.Disabled))
                 {
-                    ResetWindow(candidate);
+                    ResetWindow(candidate, now);
                     if (options.DailyTokenBudgetPerKey > 0 && candidate.DailyTokensUsed + estimatedInputTokens > options.DailyTokenBudgetPerKey)
                     {
                         candidate.Disabled = true;
@@ -200,50 +280,48 @@ public sealed partial class TranslationApiClient : IDisposable
                     .ThenBy(candidate => candidate.Index)
                     .First();
                 readyAt = ReadyAt(state, estimatedInputTokens, options.InputTokensPerMinutePerKey);
-                if (readyAt <= DateTimeOffset.UtcNow)
+                if (readyAt <= now)
                 {
-                    ResetWindow(state);
-                    state.AvailableAt = options.RequestsPerMinutePerKey > 0
-                        ? DateTimeOffset.UtcNow.AddSeconds(Math.Ceiling(60.0 / options.RequestsPerMinutePerKey))
-                        : DateTimeOffset.UtcNow;
+                    ResetWindow(state, now);
+                    state.AvailableAtTimestamp = options.RequestsPerMinutePerKey > 0
+                        ? AddDuration(now, TimeSpan.FromSeconds(Math.Ceiling(60.0 / options.RequestsPerMinutePerKey)))
+                        : now;
                     state.InputTokensInWindow += estimatedInputTokens;
                     state.Requests++;
                     return state;
                 }
             }
 
-            var delay = readyAt - DateTimeOffset.UtcNow;
+            var delay = DurationUntil(readyAt, timeProvider.GetTimestamp());
             if (delay > TimeSpan.Zero)
             {
                 progress?.Report(new TranslationProgress("rate-limit", $"Waiting {delay.TotalSeconds:0.0}s for API request/input-token limits."));
-                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                await delayAsync(delay, cancellationToken).ConfigureAwait(false);
             }
         }
     }
 
-    private static DateTimeOffset ReadyAt(KeyState state, int inputTokens, int inputLimit)
+    private long ReadyAt(KeyState state, int inputTokens, int inputLimit)
     {
-        ResetWindow(state);
-        var ready = state.AvailableAt;
+        var ready = state.AvailableAtTimestamp;
         if (inputLimit > 0 && state.InputTokensInWindow + inputTokens > inputLimit)
         {
-            var tokenReady = state.InputWindowStart.AddMinutes(1);
+            var tokenReady = AddDuration(state.InputWindowStartTimestamp, TimeSpan.FromMinutes(1));
             if (tokenReady > ready) ready = tokenReady;
         }
         return ready;
     }
 
-    private static void ResetWindow(KeyState state)
+    private void ResetWindow(KeyState state, long now)
     {
-        var now = DateTimeOffset.UtcNow;
-        if (now - state.InputWindowStart >= TimeSpan.FromMinutes(1))
+        if (timeProvider.GetElapsedTime(state.InputWindowStartTimestamp, now) >= TimeSpan.FromMinutes(1))
         {
-            state.InputWindowStart = now;
+            state.InputWindowStartTimestamp = now;
             state.InputTokensInWindow = 0;
         }
     }
 
-    private static void HandleFailure(KeyState state, HttpStatusCode statusCode, int inputLimit)
+    private void HandleFailure(KeyState state, HttpStatusCode statusCode, int inputLimit)
     {
         if (statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
         {
@@ -251,10 +329,23 @@ public sealed partial class TranslationApiClient : IDisposable
         }
         else if ((int)statusCode == 429)
         {
-            state.AvailableAt = DateTimeOffset.UtcNow.AddMinutes(1);
-            state.InputWindowStart = DateTimeOffset.UtcNow;
+            var now = timeProvider.GetTimestamp();
+            state.AvailableAtTimestamp = AddDuration(now, TimeSpan.FromMinutes(1));
+            state.InputWindowStartTimestamp = now;
             state.InputTokensInWindow = inputLimit;
         }
+    }
+
+    private long AddDuration(long timestamp, TimeSpan duration)
+    {
+        var delta = (long)Math.Ceiling(duration.TotalSeconds * timeProvider.TimestampFrequency);
+        return timestamp > long.MaxValue - delta ? long.MaxValue : timestamp + delta;
+    }
+
+    private TimeSpan DurationUntil(long readyTimestamp, long nowTimestamp)
+    {
+        if (readyTimestamp <= nowTimestamp) return TimeSpan.Zero;
+        return TimeSpan.FromSeconds((readyTimestamp - nowTimestamp) / (double)timeProvider.TimestampFrequency);
     }
 
     private static void UpdateUsage(KeyState state, string responseJson, int estimatedInputTokens, long dailyBudget)
@@ -264,14 +355,25 @@ public sealed partial class TranslationApiClient : IDisposable
         try
         {
             using var document = JsonDocument.Parse(responseJson);
-            if (document.RootElement.TryGetProperty("usage", out var usage))
+            if (document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty("usage", out var usage)
+                && usage.ValueKind == JsonValueKind.Object)
             {
-                if (usage.TryGetProperty("prompt_tokens", out var prompt)) promptTokens = prompt.GetInt32();
-                if (usage.TryGetProperty("total_tokens", out var total)) totalTokens = total.GetInt32();
+                if (usage.TryGetProperty("prompt_tokens", out var prompt)
+                    && prompt.ValueKind == JsonValueKind.Number)
+                {
+                    prompt.TryGetInt32(out promptTokens);
+                }
+                if (usage.TryGetProperty("total_tokens", out var total)
+                    && total.ValueKind == JsonValueKind.Number)
+                {
+                    total.TryGetInt32(out totalTokens);
+                }
             }
         }
-        catch (JsonException)
+        catch (JsonException exception)
         {
+            System.Diagnostics.Debug.WriteLine($"Provider usage metadata ignored ({exception.GetType().Name}).");
         }
         if (promptTokens > 0) state.InputTokensInWindow = Math.Max(0, state.InputTokensInWindow + promptTokens - estimatedInputTokens);
         state.DailyTokensUsed += totalTokens > 0 ? totalTokens : Math.Max(estimatedInputTokens, promptTokens);
@@ -330,55 +432,76 @@ public sealed partial class TranslationApiClient : IDisposable
 
     private static int EstimateTokens(string text) => string.IsNullOrEmpty(text) ? 0 : (int)Math.Ceiling(text.Length / 3.0);
 
-    private static string SafeErrorSummary(string body)
+    private static async Task<string> ReadBoundedResponseAsync(
+        HttpContent content,
+        int maxBytes,
+        CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(body)) return string.Empty;
-        var summary = body.Trim();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxBytes);
+        if (content.Headers.ContentLength is long declaredLength && declaredLength > maxBytes)
+            throw new InvalidDataException($"Provider response exceeded the {maxBytes} byte limit.");
+
+        await using var source = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using var output = new MemoryStream(Math.Min(maxBytes, 81_920));
+        var buffer = new byte[81_920];
+        var total = 0;
+        while (true)
+        {
+            var requested = (int)Math.Min(buffer.Length, (long)maxBytes - total + 1);
+            var read = await source.ReadAsync(buffer.AsMemory(0, requested), cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            total += read;
+            if (total > maxBytes)
+                throw new InvalidDataException($"Provider response exceeded the {maxBytes} byte limit.");
+            await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+        }
+
         try
         {
-            using var document = JsonDocument.Parse(summary);
-            var error = document.RootElement.TryGetProperty("error", out var errorValue) ? errorValue : document.RootElement;
-            var values = new[] { "message", "type", "code" }
-                .Select(name => error.ValueKind == JsonValueKind.Object && error.TryGetProperty(name, out var value) ? value.ToString() : string.Empty)
-                .Where(value => !string.IsNullOrWhiteSpace(value))
-                .Distinct(StringComparer.Ordinal)
-                .ToArray();
-            if (values.Length > 0) summary = string.Join(" | ", values);
+            return Utf8Strict.GetString(output.GetBuffer(), 0, total);
         }
-        catch (JsonException)
+        catch (DecoderFallbackException exception)
         {
+            throw new InvalidDataException("Provider response was not valid UTF-8.", exception);
         }
-        summary = WhitespaceRegex().Replace(summary, " ").Trim();
-        return summary.Length > 1200 ? summary[..1200] + "..." : summary;
     }
 
-    private static string Compact(string? message)
+    private void ReserveRequestAttempt()
     {
-        var value = WhitespaceRegex().Replace(message ?? "unknown error", " ").Trim();
-        return value.Length > 320 ? value[..320] + "..." : value;
+        if (Interlocked.Increment(ref requestAttemptCount) <= requestAttemptLimit) return;
+        throw new ProviderRequestBudgetExceededException(requestAttemptLimit);
     }
+
+    private static string SafeErrorSummary(HttpStatusCode statusCode) => statusCode switch
+    {
+        HttpStatusCode.BadRequest => "The provider rejected the request.",
+        HttpStatusCode.Unauthorized => "The provider rejected authentication.",
+        HttpStatusCode.Forbidden => "The provider refused this request.",
+        HttpStatusCode.NotFound => "The configured provider endpoint was not found.",
+        HttpStatusCode.RequestTimeout => "The provider timed out the request.",
+        HttpStatusCode.TooManyRequests => "The provider rate limit was reached.",
+        _ when (int)statusCode >= 500 => "The provider is temporarily unavailable.",
+        _ => "The provider returned an error; response details were omitted for privacy."
+    };
+
+    private static string SafeExceptionType(Exception? exception) => exception switch
+    {
+        TimeoutException => nameof(TimeoutException),
+        HttpRequestException => nameof(HttpRequestException),
+        JsonException => nameof(JsonException),
+        InvalidDataException => nameof(InvalidDataException),
+        _ => nameof(Exception)
+    };
 
     public static void ValidateEndpoint(string value, bool allowLoopbackHttp)
-    {
-        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)) throw new InvalidDataException("API URL is invalid.");
-        var loopback = uri.IsLoopback || uri.Host is "localhost" or "127.0.0.1" or "::1";
-        if (!uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
-            && !(allowLoopbackHttp && loopback && uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)))
-        {
-            throw new InvalidDataException("API URL must use HTTPS.");
-        }
-        if (!string.IsNullOrEmpty(uri.UserInfo) || CredentialQueryRegex().IsMatch(uri.Query))
-        {
-            throw new InvalidDataException("API URL must not contain credentials.");
-        }
-    }
+        => ProviderValidator.EnsureValidEndpoint(value, allowLoopbackHttp);
 
-    private sealed class KeyState(string key, int index)
+    private sealed class KeyState(string key, int index, long initialTimestamp)
     {
         public string Key { get; } = key;
         public int Index { get; } = index;
-        public DateTimeOffset AvailableAt { get; set; } = DateTimeOffset.UtcNow;
-        public DateTimeOffset InputWindowStart { get; set; } = DateTimeOffset.UtcNow;
+        public long AvailableAtTimestamp { get; set; } = initialTimestamp;
+        public long InputWindowStartTimestamp { get; set; } = initialTimestamp;
         public int InputTokensInWindow { get; set; }
         public long DailyTokensUsed { get; set; }
         public int Requests { get; set; }
@@ -388,6 +511,12 @@ public sealed partial class TranslationApiClient : IDisposable
 
     [GeneratedRegex("^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.+)\\s*$", RegexOptions.CultureInvariant)] private static partial Regex KeyAssignmentRegex();
     [GeneratedRegex("^(CEREBRAS_API_KEY|CEREBRAS_KEY|OPENAI_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|DEEPSEEK_API_KEY|DASHSCOPE_API_KEY|GROQ_API_KEY|MISTRAL_API_KEY|OPENROUTER_API_KEY|ZAI_API_KEY|API_KEY|KEY|RIMWORLD_TRANSLATOR_API_KEYS)$", RegexOptions.CultureInvariant)] private static partial Regex AllowedKeyNameRegex();
-    [GeneratedRegex("(?i)(api[_-]?key|token|authorization|secret)=", RegexOptions.CultureInvariant)] private static partial Regex CredentialQueryRegex();
-    [GeneratedRegex("[\\r\\n\\t\\s]+", RegexOptions.CultureInvariant)] private static partial Regex WhitespaceRegex();
+}
+
+internal sealed class ProviderRequestBudgetExceededException : InvalidOperationException
+{
+    public ProviderRequestBudgetExceededException(int maximumRequests)
+        : base($"Provider request budget of {maximumRequests:N0} attempts was exhausted.")
+    {
+    }
 }

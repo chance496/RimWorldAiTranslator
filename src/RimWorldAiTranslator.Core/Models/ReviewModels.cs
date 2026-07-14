@@ -12,8 +12,10 @@ public static class ReviewStatuses
 
 public sealed class ReviewDecisionDocument
 {
+    public const int CurrentVersion = 6;
+
     [JsonPropertyName("version")]
-    public int Version { get; set; } = 5;
+    public int Version { get; set; } = 1;
 
     [JsonPropertyName("sparse")]
     public bool Sparse { get; set; } = true;
@@ -24,11 +26,17 @@ public sealed class ReviewDecisionDocument
     [JsonPropertyName("comparison")]
     public string Comparison { get; set; } = string.Empty;
 
+    [JsonPropertyName("comparisonSha256")]
+    public string ComparisonSha256 { get; set; } = string.Empty;
+
     [JsonPropertyName("updatedAt")]
     public string UpdatedAt { get; set; } = string.Empty;
 
     [JsonPropertyName("items")]
     public List<ReviewDecision> Items { get; set; } = [];
+
+    [JsonPropertyName("quarantinedItems")]
+    public List<ReviewDecision> QuarantinedItems { get; set; } = [];
 
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtensionData { get; set; }
@@ -44,6 +52,12 @@ public sealed class ReviewDecision
 
     [JsonPropertyName("target")]
     public string Target { get; set; } = string.Empty;
+
+    [JsonPropertyName("defClass")]
+    public string DefClass { get; set; } = string.Empty;
+
+    [JsonPropertyName("node")]
+    public string Node { get; set; } = string.Empty;
 
     [JsonPropertyName("status")]
     public string Status { get; set; } = ReviewStatuses.Pending;
@@ -107,6 +121,18 @@ public sealed class ReviewComparisonRow
 
     [JsonPropertyName("existing")]
     public string Existing { get; set; } = string.Empty;
+
+    [JsonPropertyName("existingSourceChanged")]
+    public bool ExistingSourceChanged { get; set; }
+
+    [JsonPropertyName("existingSourceHash")]
+    public string ExistingSourceHash { get; set; } = string.Empty;
+
+    [JsonPropertyName("existingSourceText")]
+    public string ExistingSourceText { get; set; } = string.Empty;
+
+    [JsonPropertyName("existingPreviousSourceText")]
+    public string ExistingPreviousSourceText { get; set; } = string.Empty;
 
     [JsonPropertyName("candidate")]
     public string Candidate { get; set; } = string.Empty;

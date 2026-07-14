@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using System.Text.Json.Serialization;
+using RimWorldAiTranslator.Core.Storage;
 using RimWorldAiTranslator.Core.Validation;
 
 namespace RimWorldAiTranslator.Core.Quality;
@@ -59,6 +60,9 @@ public sealed record QualityReportResult(string Path, string? BackupPath, Qualit
 
 public static class QualityService
 {
+    private const int MaximumQualityReportBytes = 16 * 1024 * 1024;
+    private static readonly UTF8Encoding StrictUtf8NoBom = new(false, true);
+
     public static IReadOnlyList<QualityIssue> FindIssues(IEnumerable<QualityEntry> sourceEntries)
     {
         var entries = sourceEntries.ToArray();
@@ -157,43 +161,46 @@ public static class QualityService
 
         var model = CreateReport(entries, issues);
         var html = ToHtml(model);
-        var directory = Path.GetDirectoryName(fullPath) ?? throw new InvalidOperationException("Report path has no parent directory.");
-        Directory.CreateDirectory(directory);
-        var tempPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.{Guid.NewGuid():N}.tmp");
         var backupPath = fullPath + ".bak";
-        try
-        {
-            using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.WriteThrough))
-            using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
-            {
-                writer.Write(html);
-                writer.Flush();
-                stream.Flush(true);
-            }
-
-            if (File.Exists(fullPath))
-            {
-                File.Replace(tempPath, fullPath, backupPath, true);
-            }
-            else
-            {
-                File.Move(tempPath, fullPath);
-            }
-        }
-        finally
-        {
-            if (File.Exists(tempPath))
-            {
-                File.Delete(tempPath);
-            }
-        }
+        AtomicFile.WriteUtf8Validated(
+            fullPath,
+            html,
+            temporaryPath => ValidatePreparedReport(temporaryPath, html),
+            keepBackup: true);
 
         return new QualityReportResult(fullPath, File.Exists(backupPath) ? backupPath : null, model);
     }
 
+    private static void ValidatePreparedReport(string path, string expectedHtml)
+    {
+        var bytes = BoundedFileReader.ReadAllBytes(
+            path,
+            MaximumQualityReportBytes,
+            "quality report output");
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            throw new InvalidDataException("The flushed quality report unexpectedly contains a UTF-8 BOM.");
+
+        string actualHtml;
+        try
+        {
+            actualHtml = StrictUtf8NoBom.GetString(bytes);
+        }
+        catch (DecoderFallbackException exception)
+        {
+            throw new InvalidDataException("The flushed quality report is not valid UTF-8.", exception);
+        }
+
+        if (!actualHtml.Equals(expectedHtml, StringComparison.Ordinal)
+            || !actualHtml.Contains("<meta charset=\"utf-8\">", StringComparison.OrdinalIgnoreCase)
+            || !actualHtml.Contains("이 보고서는 집계 수치만 포함합니다.", StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("The flushed quality report failed semantic validation.");
+        }
+    }
+
     public static string ToHtml(QualityReportModel model)
     {
-        static string Encode(object? value) => WebUtility.HtmlEncode(Convert.ToString(value) ?? string.Empty);
+        static string Encode(object? value) => WebUtility.HtmlEncode(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty);
         static string Rows(IReadOnlyDictionary<string, int> values) => string.Concat(values.OrderBy(pair => pair.Key, StringComparer.Ordinal)
             .Select(pair => $"<tr><td>{Encode(pair.Key)}</td><td>{pair.Value}</td></tr>"));
 

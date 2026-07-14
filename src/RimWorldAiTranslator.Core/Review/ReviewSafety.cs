@@ -31,10 +31,16 @@ public static class ReviewSafety
     public static bool DecisionSourceChanged(ReviewDecision decision, ReviewComparisonRow row)
     {
         var source = Normalize(row.Source);
-        if (!string.IsNullOrWhiteSpace(decision.SourceHash)) return !decision.SourceHash.Equals(StableIdentity.Sha256(source), StringComparison.OrdinalIgnoreCase);
-        if (!string.IsNullOrWhiteSpace(decision.SourceText)) return !Normalize(decision.SourceText).Equals(source, StringComparison.Ordinal);
+        if (!string.IsNullOrWhiteSpace(decision.SourceHash)
+            && !decision.SourceHash.Equals(StableIdentity.Sha256(source), StringComparison.OrdinalIgnoreCase)) return true;
+        if (!string.IsNullOrEmpty(decision.SourceText)
+            && !Normalize(decision.SourceText).Equals(source, StringComparison.Ordinal)) return true;
         return false;
     }
+
+    public static bool HasDecisionSourceEvidence(ReviewDecision decision) =>
+        !string.IsNullOrWhiteSpace(decision.SourceHash)
+        || !string.IsNullOrEmpty(decision.SourceText);
 
     public static string Normalize(string? value) => (value ?? string.Empty).Replace("\r\n", "\n").Replace('\r', '\n');
 }

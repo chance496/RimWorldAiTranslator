@@ -7,6 +7,10 @@
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <RootNamespace>RimWorldAiTranslator.Core</RootNamespace>
+    <!-- Service instances and abstraction-typed helpers are intentional compatibility
+         seams used by the UI and fixtures; converting them to static/concrete APIs
+         would add churn without changing the recommended analyzer safety coverage. -->
+    <NoWarn>$(NoWarn);CA1822;CA1859</NoWarn>
   </PropertyGroup>
 
 </Project>

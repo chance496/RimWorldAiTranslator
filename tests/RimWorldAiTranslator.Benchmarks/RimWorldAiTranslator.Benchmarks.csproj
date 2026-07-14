@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <ProjectReference Include="..\..\src\RimWorldAiTranslator.Core\RimWorldAiTranslator.Core.csproj" />
+    <ProjectReference Include="..\..\src\RimWorldAiTranslator.Native\RimWorldAiTranslator.Native.csproj" />
   </ItemGroup>
   <PropertyGroup>
     <OutputType>Exe</OutputType>

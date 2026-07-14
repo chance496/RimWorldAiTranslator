@@ -1,0 +1,152 @@
+name: Local CI candidate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Offline build and regression
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: cmd
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up pinned .NET SDK
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v4.3.1
+        with:
+          global-json-file: global.json
+
+      - name: Restore from repository policy
+        run: >-
+          dotnet restore RimWorldAiTranslator.sln --configfile NuGet.config
+          --disable-build-servers --nologo
+
+      - name: Strict Release build
+        run: >-
+          dotnet build RimWorldAiTranslator.sln --configuration Release --no-restore
+          --disable-build-servers --nologo -p:TreatWarningsAsErrors=true
+          -p:AnalysisMode=Recommended -p:UseSharedCompilation=false
+
+      - name: Format policy
+        run: >-
+          dotnet format RimWorldAiTranslator.sln --verify-no-changes --no-restore
+          --severity info
+
+      - name: Application dependency inventory
+        run: |
+          dotnet list RimWorldAiTranslator.sln package --include-transitive
+          if errorlevel 1 exit /b 1
+          dotnet list RimWorldAiTranslator.sln package --include-transitive --vulnerable
+          if errorlevel 1 exit /b 1
+          dotnet list RimWorldAiTranslator.sln package --include-transitive --deprecated
+          if errorlevel 1 exit /b 1
+          git grep -n -E "<PackageReference([[:space:]>])" -- "*.csproj" "*.props" "*.targets" > "%TEMP%\package-reference-findings.txt"
+          if not errorlevel 1 (type "%TEMP%\package-reference-findings.txt" & exit /b 1)
+          if errorlevel 2 exit /b 2
+          exit /b 0
+
+      - name: Credential-pattern source policy
+        run: |
+          (echo tests/RimWorldAiTranslator.Tests/Phase07SecurityTests.cs& echo tests/RimWorldAiTranslator.Tests/Program.cs& echo tests/RimWorldAiTranslator.Tests/SafetyIntegrationTests.cs& echo tests/RimWorldAiTranslator.UiHarness/Program.cs) | sort > "%TEMP%\expected-credential-paths.txt"
+          git grep -l -I -E -i "(csk|sk)-[A-Za-z0-9_-]{12,}|Authorization[[:space:]]*[=:][[:space:]]*[A-Za-z0-9._~-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----" -- . | sort > "%TEMP%\actual-credential-paths.txt"
+          fc /b "%TEMP%\expected-credential-paths.txt" "%TEMP%\actual-credential-paths.txt"
+
+      - name: Full console regression 1 of 3
+        run: dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
+
+      - name: Full console regression 2 of 3
+        run: dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
+
+      - name: Full console regression 3 of 3
+        run: dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.Tests.dll
+
+      - name: Release tooling self-test
+        run: >-
+          dotnet tools\RimWorldAiTranslator.Tooling\bin\Release\net8.0\RimWorldAiTranslator.Tooling.dll
+          self-test --repository-root .
+
+      - name: Glossary tooling self-test
+        run: >-
+          dotnet tools\RimWorldAiTranslator.GlossaryTool\bin\Release\net8.0\RimWorldAiTranslator.GlossaryTool.dll
+          self-test
+
+      - name: Five-thousand-row benchmark
+        run: >-
+          dotnet tests\RimWorldAiTranslator.Benchmarks\bin\Release\net8.0\RimWorldAiTranslator.Benchmarks.dll
+          --rows 5000 --iterations 5
+
+  package:
+    name: Exact-RC artifact and smoke
+    needs: verify
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: cmd
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up pinned .NET SDK
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v4.3.1
+        with:
+          global-json-file: global.json
+
+      - name: Seed exact runtime packages for fail-closed verification
+        run: |
+          mkdir "%RUNNER_TEMP%\rimworld-runtime-seed"
+          if errorlevel 1 exit /b 1
+          cd /d "%RUNNER_TEMP%\rimworld-runtime-seed"
+          if errorlevel 1 exit /b 1
+          dotnet new classlib --framework net8.0 --no-restore
+          if errorlevel 1 exit /b 1
+          dotnet add package Microsoft.NETCore.App.Runtime.win-x64 --version 8.0.28 --source https://api.nuget.org/v3/index.json --no-restore
+          if errorlevel 1 exit /b 1
+          dotnet add package Microsoft.WindowsDesktop.App.Runtime.win-x64 --version 8.0.28 --source https://api.nuget.org/v3/index.json --no-restore
+          if errorlevel 1 exit /b 1
+          dotnet add package Microsoft.AspNetCore.App.Runtime.win-x64 --version 8.0.28 --source https://api.nuget.org/v3/index.json --no-restore
+          if errorlevel 1 exit /b 1
+          dotnet restore --source https://api.nuget.org/v3/index.json --disable-build-servers --nologo -p:NuGetAudit=false
+          if errorlevel 1 exit /b 1
+
+      - name: Build the C# package orchestrator
+        run: |
+          dotnet restore tools\RimWorldAiTranslator.Tooling\RimWorldAiTranslator.Tooling.csproj --configfile NuGet.config --disable-build-servers --nologo
+          if errorlevel 1 exit /b 1
+          dotnet build tools\RimWorldAiTranslator.Tooling\RimWorldAiTranslator.Tooling.csproj --configuration Release --no-restore --disable-build-servers --nologo -p:TreatWarningsAsErrors=true -p:AnalysisMode=Recommended -p:UseSharedCompilation=false
+
+      - name: Create and smoke-test the exact RC
+        run: >-
+          dotnet tools\RimWorldAiTranslator.Tooling\bin\Release\net8.0\RimWorldAiTranslator.Tooling.dll
+          package --repository-root .
+
+      - name: Verify manifest and shell-script-zero policy
+        run: |
+          for /f "usebackq delims=" %%V in ("VERSION") do set "RC_VERSION=%%V"
+          if not exist "dist\RimWorldAiTranslator-v%RC_VERSION%-win-x64.zip" exit /b 1
+          if not exist "dist\RimWorldAiTranslator-v%RC_VERSION%-win-x64.manifest.json" exit /b 1
+          dotnet tools\RimWorldAiTranslator.Tooling\bin\Release\net8.0\RimWorldAiTranslator.Tooling.dll verify-zero --repository-root . --package "dist\RimWorldAiTranslator-v%RC_VERSION%-win-x64.zip"
