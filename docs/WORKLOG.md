@@ -417,3 +417,12 @@
 - `Storage.SimpleRecoveryThreatModel`과 기존 회귀를 합쳐 새/기존 파일 저장, `.bak`, 두 번째 파일 실패·취소 rollback, 잠금·read-only, 허용 루트 밖·Workshop, XML 검증 실패, JSON 단일 정상 backup/이중 손상, 강제 종료 감지·무단 commit 금지·명시적 restore, 외부 편집 충돌, API key/원문 로그 redaction을 검증했다.
 - synthetic 100-target은 1.649초, 1,000-target은 20.673초로 기존 1,000-target 71.961초보다 71.3% 감소했다. 기존 60초 합격 계약은 제거하고 100개 소형 파일 수 초 이내를 일반 사용 관찰 기준으로 제안했다.
 - 최종 strict Release build는 경고/오류 0/0, 전체 회귀는 80/80 PASS(최종 59.025초)다. 실제 사용자 데이터·API·Workshop/RMK 구독본을 사용하지 않았고 패키지·Release·tag·PR·push·외부 배포는 수행하지 않았다.
+
+## 2026-07-15 - 명령 ToolTip과 검토 완료 후 다음 회귀 복구
+
+- Golden Master `4c7d11b`의 PowerShell UI는 화면당 단일 `System.Windows.Forms.ToolTip`으로 검색·필터, 저장, 원문 갱신, AI 번역, 중지, 검수 이동·상태, 적용, RMK와 설정 설명을 표시했다. 현재 C# `main`에는 명령 팔레트 목록 항목의 `ToolTipText` 외에 실제 컨트롤용 `ToolTip` 인스턴스가 없었고 `AccessibleDescription`만 남아 있어 시각 hover 설명이 전부 사라진 상태였다.
+- 폼 또는 화면별 단일 `CommandToolTipService`와 `UiCommandCatalog`를 추가했다. 설명, 실제 키 처리와 명령 팔레트의 단축키 표시는 같은 명령 정의를 사용하며, Enabled 변경 시 비활성 사유를 갱신한다. 비활성 WinForms 컨트롤도 hover 안내가 보이도록 앱 메시지 범위에서 해당 컨트롤만 탐지하고, 테마·화면·workspace 전환 및 동적 프로젝트 카드 재생성 뒤에도 등록을 유지한다.
+- 수정 전 실제 WinForms ToolTip은 주요 명령 0개였다. 수정 후 메인 프로젝트·활동·설정·명령 팔레트 4개, 대시보드 검색·모드·생성·폴더·새로고침과 동적 열기·삭제 7개 이상, 검수 화면의 프로젝트 목록·폴더·저장·원문 갱신·AI 번역·중지·검토/전체 적용·RMK·검색/필터·검수 이동/상태·품질 명령 35개 이상에 hover 설명을 제공한다. 같은 컨트롤의 등록 수는 모두 1이고 ToolTip과 `AccessibleDescription`은 같은 본문을 사용한다.
+- `검토 완료 후 다음`은 상태 변경 직후 다음 항목으로 이동했지만 2,000행 이상 비동기 필터가 완료되면서 이전 항목을 다시 선택하는 회귀였다. 필터 요청에 의도한 다음 항목과 fallback index를 전달해 비동기 완료 뒤에도 다음 선택을 유지하도록 수정했다.
+- 전용 50행 합성 `--command-tooltip-probe`는 주요 명령 범위, 단축키 정책 일치, 비활성 사유 추가/제거, 테마·대시보드·workspace 전환, 동적 카드, DPI 100/125/150%, 중복 등록 0, 접근성 설명 일치와 완료 후 다음을 모두 PASS했다. 5,000행 UI 하네스에서도 새 ToolTip 8개 검사와 완료 후 다음은 모두 PASS했지만 기존 검색 200ms 계약은 342.810ms로 실패했다. 같은 경로의 과거 작업 기록에도 290.480ms가 남아 있어 이 범위에서 임계치를 완화하거나 성능 코드를 변경하지 않았다.
+- 최종 strict Release build는 8개 프로젝트 경고/오류 0/0이고 전체 오프라인 회귀는 80/80 PASS다. 범위 파일 format verify와 `git diff --check`도 통과했다. 실제 사용자 데이터·API·외부 네트워크를 사용하지 않았고 패키지·VERSION·push·PR·tag·Release·asset·외부 배포는 수행하지 않았다.

@@ -47,6 +47,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
     private readonly Button folderButton;
     private readonly Button saveButton;
     private readonly CheckBox useRmk;
+    private readonly CommandToolTipService commandToolTips;
     private TextBox search = null!;
     private ComboBox searchField = null!;
     private ComboBox statusFilter = null!;
@@ -76,11 +77,14 @@ internal sealed class ReviewWorkspaceControl : UserControl
     private Label rmkStatus = null!;
     private Button rmkOpen = null!;
     private Button rmkBuild = null!;
+    private Button rmkRefresh = null!;
     private ListView issues = null!;
     private Label qualitySummary = null!;
     private Label selectedQuality = null!;
     private ComboBox qualityCategory = null!;
     private Button qualityJump = null!;
+    private Button qualityRefresh = null!;
+    private Button exportQuality = null!;
     private RichTextBox warnings = null!;
     private RichTextBox log = null!;
     private ListBox memory = null!;
@@ -119,6 +123,8 @@ internal sealed class ReviewWorkspaceControl : UserControl
     private string editBaselineOrigin = string.Empty;
     private string pendingEditOrigin = "local";
     private readonly Dictionary<Button, ReviewStatusFilter> statusButtons = [];
+    private Button[] utilityButtons = [];
+    private Button[] reviewStatusButtons = [];
 
     public ReviewWorkspaceControl(
         AppServices services,
@@ -133,6 +139,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         isWritableRmkWorkspace = ioHooks?.IsWritableRmkWorkspace
             ?? services.RmkWorkspace.IsWritableWorkspace;
         openDirectory = ioHooks?.OpenDirectory ?? SafeDirectoryLauncher.Open;
+        commandToolTips = new CommandToolTipService();
         Dock = DockStyle.Fill;
         TabStop = false;
 
@@ -245,6 +252,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         root.Controls.Add(header, 0, 0);
         root.Controls.Add(outerSplit, 0, 1);
         Controls.Add(root);
+        RegisterCommandToolTips();
 
         searchTimer = new System.Windows.Forms.Timer { Interval = 75 };
         searchTimer.Tick += (_, _) => { searchTimer.Stop(); RefreshFilter(true); };
@@ -262,6 +270,73 @@ internal sealed class ReviewWorkspaceControl : UserControl
             if (Visible && IsHandleCreated) BeginInvoke((Action)RefreshResponsiveLayout);
         };
         ResizeHeader(header, projectListButton, folderButton, saveButton);
+    }
+
+    private void RegisterCommandToolTips()
+    {
+        string? BusyOrUnavailable(bool available, string unavailableReason) => operationRunning
+            ? "현재 작업이 실행 중이라 사용할 수 없습니다."
+            : available ? null : unavailableReason;
+
+        commandToolTips.Register(projectListButton, UiCommand.Projects,
+            () => operationRunning ? "현재 작업이 실행 중이라 사용할 수 없습니다." : null);
+        commandToolTips.Register(folderButton, UiCommand.OpenModFolder,
+            () => BusyOrUnavailable(project is not null, "먼저 프로젝트를 여세요."));
+        commandToolTips.Register(saveButton, UiCommand.SaveReview,
+            () => BusyOrUnavailable(workspace is not null, "저장할 검수 작업이 없습니다."));
+        commandToolTips.Register(sourceRefresh, UiCommand.RefreshSource,
+            () => BusyOrUnavailable(project is not null, "먼저 프로젝트를 여세요."));
+        commandToolTips.Register(aiTranslate, UiCommand.AiTranslate,
+            () => BusyOrUnavailable(workspace is not null, "먼저 원문 분석을 완료하세요."));
+        commandToolTips.Register(stop, UiCommand.StopOperation,
+            () => stopRequested ? "중지 요청을 처리하고 있습니다." : "실행 중인 작업이 없습니다.");
+        commandToolTips.Register(useRmk, UiCommand.UseRmk,
+            () => operationRunning ? "현재 작업이 실행 중이라 변경할 수 없습니다." : null);
+        commandToolTips.Register(applyApproved, UiCommand.ApplyApproved,
+            () => BusyOrUnavailable(workspace is not null, "적용할 검수 작업이 없습니다."));
+        commandToolTips.Register(applyTranslated, UiCommand.ApplyAll,
+            () => BusyOrUnavailable(workspace is not null, "적용할 검수 작업이 없습니다."));
+
+        commandToolTips.Register(search, UiCommand.ReviewSearch);
+        commandToolTips.Register(searchField, UiCommand.SearchField);
+        commandToolTips.Register(statusFilter, UiCommand.StatusFilter);
+        commandToolTips.Register(sortMode, UiCommand.SortReview);
+        foreach (var (button, _) in statusButtons)
+            commandToolTips.Register(button, UiCommand.StatusFilter,
+                description: () => $"{button.Text} 상태의 문자열만 표시합니다.");
+
+        UiCommand[] utilityCommands =
+        [
+            UiCommand.PreviousReview,
+            UiCommand.NextReview,
+            UiCommand.UseCandidate,
+            UiCommand.UseExisting,
+            UiCommand.CopyTranslation,
+            UiCommand.UndoTranslation
+        ];
+        for (var index = 0; index < utilityButtons.Length; index++)
+            commandToolTips.Register(utilityButtons[index], utilityCommands[index]);
+
+        UiCommand[] reviewCommands =
+        [
+            UiCommand.MarkPending,
+            UiCommand.MarkTranslated,
+            UiCommand.MarkApproved,
+            UiCommand.MarkApprovedAndNext,
+            UiCommand.ApproveAll
+        ];
+        for (var index = 0; index < reviewStatusButtons.Length; index++)
+            commandToolTips.Register(reviewStatusButtons[index], reviewCommands[index]);
+
+        commandToolTips.Register(rmkRefresh, UiCommand.RefreshRmk);
+        commandToolTips.Register(rmkOpen, UiCommand.OpenRmk,
+            () => workspace is null ? "먼저 프로젝트를 여세요." : "사용 가능한 RMK 작업 클론이 없습니다.");
+        commandToolTips.Register(rmkBuild, UiCommand.BuildRmk,
+            () => workspace is null ? "먼저 프로젝트를 여세요." : "검증된 쓰기 가능한 RMK 작업 클론이 없습니다.");
+        commandToolTips.Register(qualityCategory, UiCommand.QualityFilter);
+        commandToolTips.Register(qualityRefresh, UiCommand.RefreshQuality);
+        commandToolTips.Register(exportQuality, UiCommand.ExportQuality,
+            () => workspace is null ? "먼저 프로젝트를 여세요." : null);
     }
 
     private void ResizeHeader(Control header, Control projects, Control folder, Control save)
@@ -366,6 +441,10 @@ internal sealed class ReviewWorkspaceControl : UserControl
     internal bool LastQualityUsedWorkerThreadForTesting => lastQualityUsedWorkerThread;
     internal bool TranslationTouchedForTesting => translationTouched;
     internal string PendingEditOriginForTesting => pendingEditOrigin;
+    internal string CommandToolTipTextForTesting(Control control) => commandToolTips.GetText(control);
+    internal int CommandToolTipRegistrationCountForTesting(Control control) => commandToolTips.RegistrationCount(control);
+    internal bool CommandToolTipFitsForTesting(Control control, int dpi, Size workingArea) =>
+        commandToolTips.FitsWorkingAreaForTesting(control, dpi, workingArea);
 
     public void SetGlossary(IReadOnlyList<GlossaryTerm> termsList) => glossary = termsList;
 
@@ -397,6 +476,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         operationStatus.Text = $"불러옴 · {loaded.Items.Count:N0}개 문자열";
         if (loaded.Dirty) SetSavePending();
         else SetSaveSucceeded(false);
+        commandToolTips.RefreshAll();
     }
 
     public void ClearWorkspace()
@@ -431,6 +511,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         rmkStatus.Text = "검수 작업을 열면 RMK 상태를 확인합니다.";
         SetRunning(false, "준비됨");
         SetSaveSucceeded(false);
+        commandToolTips.RefreshAll();
     }
 
     public void SetRunning(bool running, string message = "")
@@ -453,6 +534,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         operationProgress.Style = running ? ProgressBarStyle.Marquee : ProgressBarStyle.Blocks;
         operationProgress.MarqueeAnimationSpeed = running ? 24 : 0;
         if (!string.IsNullOrWhiteSpace(message)) operationStatus.Text = message;
+        commandToolTips.RefreshAll();
     }
 
     public void UpdateProgress(TranslationProgress progress)
@@ -506,6 +588,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         SaveEditor(false);
         list.Invalidate();
         if (current is not null) ShowCurrent();
+        commandToolTips.RefreshAll();
     }
 
     public void FocusSearch()
@@ -540,17 +623,16 @@ internal sealed class ReviewWorkspaceControl : UserControl
         if (operationRunning) return false;
         var key = keyData & Keys.KeyCode;
         var modifiers = keyData & Keys.Modifiers;
-        if (modifiers == Keys.Control && key == Keys.S) { CommitWithDuplicatePrompt(); return true; }
-        if (modifiers == Keys.Control && key == Keys.F) { FocusSearch(); return true; }
-        if (modifiers == (Keys.Control | Keys.Shift) && key == Keys.Enter) { SetCurrentStatus(ReviewStatuses.Approved, false); return true; }
-        if (modifiers == Keys.Control && key == Keys.Enter) { SetCurrentStatus(ReviewStatuses.Approved, true); return true; }
-        if (modifiers == Keys.Control && key is Keys.D1 or Keys.NumPad1) { SetCurrentStatus(ReviewStatuses.Pending, false); return true; }
-        if (modifiers == Keys.Control && key is Keys.D2 or Keys.NumPad2) { SetCurrentStatus(ReviewStatuses.Translated, false); return true; }
-        if (modifiers == Keys.Control && key is Keys.D3 or Keys.NumPad3) { SetCurrentStatus(ReviewStatuses.Approved, false); return true; }
-        if (modifiers == (Keys.Control | Keys.Shift) && key is Keys.D3 or Keys.NumPad3) { ApproveAllSafe(); return true; }
-        if (modifiers == Keys.Alt && key is Keys.D1 or Keys.NumPad1) { UseCandidate(); return true; }
-        if (modifiers == Keys.Alt && key is Keys.D2 or Keys.NumPad2) { UseExisting(); return true; }
-        if (modifiers == Keys.Alt && key is Keys.D0 or Keys.NumPad0) { UndoEdit(); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.SaveReview, keyData)) { CommitWithDuplicatePrompt(); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.ReviewSearch, keyData)) { FocusSearch(); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.MarkApprovedAndNext, keyData)) { SetCurrentStatus(ReviewStatuses.Approved, true); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.MarkApproved, keyData)) { SetCurrentStatus(ReviewStatuses.Approved, false); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.MarkPending, keyData)) { SetCurrentStatus(ReviewStatuses.Pending, false); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.MarkTranslated, keyData)) { SetCurrentStatus(ReviewStatuses.Translated, false); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.ApproveAll, keyData)) { ApproveAllSafe(); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.UseCandidate, keyData)) { UseCandidate(); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.UseExisting, keyData)) { UseExisting(); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.UndoTranslation, keyData)) { UndoEdit(); return true; }
         if (modifiers == Keys.None && key == Keys.F2)
         {
             if (translation.Enabled)
@@ -560,10 +642,8 @@ internal sealed class ReviewWorkspaceControl : UserControl
             }
             return true;
         }
-        if (modifiers == Keys.Shift && key == Keys.F3) { MoveSelection(-1); return true; }
-        if (modifiers == Keys.None && key == Keys.F3) { MoveSelection(1); return true; }
-        if (modifiers == Keys.Alt && key is Keys.Up or Keys.Left) { MoveSelection(-1); return true; }
-        if (modifiers == Keys.Alt && key is Keys.Down or Keys.Right) { MoveSelection(1); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.PreviousReview, keyData)) { MoveSelection(-1); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.NextReview, keyData)) { MoveSelection(1); return true; }
         if (modifiers == Keys.None && key == Keys.Escape)
         {
             if (search.TextLength == 0 && statusFilter.SelectedIndex <= 0) return false;
@@ -830,12 +910,12 @@ internal sealed class ReviewWorkspaceControl : UserControl
             panel.Controls.Add(button);
             return button;
         }
-        var utilityButtons = new[]
-        {
+        utilityButtons =
+        [
             Tool("‹", null, () => MoveSelection(-1)), Tool("›", null, () => MoveSelection(1)),
             Tool("AI 후보", "accent-soft", UseCandidate), Tool("기존", "accent-soft", UseExisting),
             Tool("복사", null, CopyTranslation), Tool("되돌리기", null, UndoEdit)
-        };
+        ];
         utilityButtons[0].AccessibleName = "이전 문자열";
         utilityButtons[0].AccessibleDescription = "이전 검색 결과로 이동합니다. 단축키 Shift+F3 또는 Alt+위쪽 화살표.";
         utilityButtons[1].AccessibleName = "다음 문자열";
@@ -844,14 +924,14 @@ internal sealed class ReviewWorkspaceControl : UserControl
         utilityButtons[3].AccessibleDescription = "기존 번역을 편집기에 넣습니다. 단축키 Alt+2.";
         utilityButtons[4].AccessibleDescription = "현재 번역문을 클립보드에 복사합니다.";
         utilityButtons[5].AccessibleDescription = "저장된 번역문으로 되돌립니다. 단축키 Alt+0.";
-        var statusButtons = new[]
-        {
+        reviewStatusButtons =
+        [
             Tool("미번역", null, () => SetCurrentStatus(ReviewStatuses.Pending, false)),
             Tool("번역됨", "accent-soft", () => SetCurrentStatus(ReviewStatuses.Translated, false)),
             Tool("검토 완료", "success", () => SetCurrentStatus(ReviewStatuses.Approved, false)),
             Tool("완료 후 다음", "success", () => SetCurrentStatus(ReviewStatuses.Approved, true)),
             Tool("전체 검토", "warm-soft", ApproveAllSafe)
-        };
+        ];
         string[] statusDescriptions =
         [
             "현재 문자열을 미번역 상태로 표시합니다. 단축키 Ctrl+1.",
@@ -861,10 +941,10 @@ internal sealed class ReviewWorkspaceControl : UserControl
             "경고가 없고 안전한 번역을 모두 검토 완료 상태로 표시합니다. 단축키 Ctrl+Shift+3."
         ];
         for (var index = 0; index < utilityButtons.Length; index++) utilityButtons[index].TabIndex = index + 3;
-        for (var index = 0; index < statusButtons.Length; index++)
+        for (var index = 0; index < reviewStatusButtons.Length; index++)
         {
-            statusButtons[index].AccessibleDescription = statusDescriptions[index];
-            statusButtons[index].TabIndex = utilityButtons.Length + index + 3;
+            reviewStatusButtons[index].AccessibleDescription = statusDescriptions[index];
+            reviewStatusButtons[index].TabIndex = utilityButtons.Length + index + 3;
         }
         var referenceLabel = Ui.Label("참고 번역", 8.5f, FontStyle.Bold);
         referenceLabel.AutoSize = false;
@@ -877,7 +957,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         existing.AccessibleDescription = "모드 또는 RMK에서 가져온 기존 한국어 번역입니다. 두 번 클릭하면 전체 번역이 복사됩니다.";
         existing.Dock = DockStyle.None;
         existing.Tag = "readonly";
-        existing.TabIndex = utilityButtons.Length + statusButtons.Length + 3;
+        existing.TabIndex = utilityButtons.Length + reviewStatusButtons.Length + 3;
         existing.DoubleClick += (_, _) => CopyEntireReadOnlyText(existing);
         candidate = NewRichText(true);
         candidate.AccessibleName = "AI 번역 후보";
@@ -960,9 +1040,9 @@ internal sealed class ReviewWorkspaceControl : UserControl
                 statusY = toolbarY + (ultraCompact ? 34 : 44);
                 toolbarBottom = statusY + toolbarHeight;
             }
-            for (var index = 0; index < statusButtons.Length; index++)
+            for (var index = 0; index < reviewStatusButtons.Length; index++)
             {
-                SetLogicalBounds(statusButtons[index], x, statusY, stateWidths[index], toolbarHeight);
+                SetLogicalBounds(reviewStatusButtons[index], x, statusY, stateWidths[index], toolbarHeight);
                 x += stateWidths[index] + gap;
             }
             var naturalReferenceTitleY = toolbarBottom + (ultraCompact ? 6 : 17);
@@ -1111,7 +1191,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         rmkStatus = Ui.Label("RMK 상태", 9f, FontStyle.Bold); rmkStatus.AutoSize = false;
         rmkStatus.AccessibleName = "RMK 작업공간 상태 요약";
         rmkStatus.AccessibleDescription = "현재 프로젝트의 RMK 구독본과 쓰기 가능한 작업 클론 상태를 표시합니다.";
-        var rmkRefresh = Ui.Button("상태 갱신", null, 120);
+        rmkRefresh = Ui.Button("상태 갱신", null, 120);
         rmkOpen = Ui.Button("폴더 열기", null, 120);
         rmkBuild = Ui.Button("LoadFolders 빌드", "warm-soft", 180);
         rmkInfo = NewRichText(true); rmkInfo.Dock = DockStyle.None; rmkInfo.Tag = "readonly";
@@ -1161,11 +1241,11 @@ internal sealed class ReviewWorkspaceControl : UserControl
         qualityCategory.AccessibleDescription = "표시할 품질 문제의 등급 또는 분류를 선택합니다.";
         qualityCategory.TabIndex = 0;
         qualityCategory.SelectedIndexChanged += (_, _) => RefreshQualityList();
-        var qualityRefresh = Ui.Button("다시 검사", null, 82);
+        qualityRefresh = Ui.Button("다시 검사", null, 82);
         qualityRefresh.AccessibleDescription = "현재 프로젝트의 품질 문제를 다시 계산합니다.";
         qualityRefresh.TabIndex = 1;
         qualityRefresh.Click += (_, _) => BuildQualityIssues();
-        var exportQuality = Ui.Button("보고서", "warm-soft", 78);
+        exportQuality = Ui.Button("보고서", "warm-soft", 78);
         exportQuality.AccessibleDescription = "원문이나 번역문을 포함하지 않는 집계 품질 보고서를 저장합니다.";
         exportQuality.TabIndex = 2;
         exportQuality.Click += (_, _) => QualityExportRequested?.Invoke(this, EventArgs.Empty);
@@ -1250,7 +1330,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         }
     }
 
-    private void RefreshFilter(bool keepCurrent)
+    private void RefreshFilter(bool keepCurrent, ReviewItem? preferredSelection = null, int fallbackIndex = 0)
     {
         if (workspace is null)
         {
@@ -1261,7 +1341,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
             return;
         }
         SaveEditor(false, false);
-        var selected = keepCurrent ? current : null;
+        var selected = keepCurrent ? preferredSelection ?? current : null;
         var query = new ReviewQuery(
             search.Text,
             (searchField.SelectedItem as Choice<ReviewSearchField>)?.Value ?? ReviewSearchField.All,
@@ -1274,13 +1354,14 @@ internal sealed class ReviewWorkspaceControl : UserControl
         var cancellation = new CancellationTokenSource();
         filterCancellation = cancellation;
         filterBusy = true;
-        _ = RefreshFilterAsync(targetWorkspace, query, selected, revision, cancellation);
+        _ = RefreshFilterAsync(targetWorkspace, query, selected, fallbackIndex, revision, cancellation);
     }
 
     private async Task RefreshFilterAsync(
         ReviewWorkspace targetWorkspace,
         ReviewQuery query,
         ReviewItem? selected,
+        int fallbackIndex,
         long revision,
         CancellationTokenSource cancellation)
     {
@@ -1303,7 +1384,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
 
                 filtered = result.Items;
                 lastFilterUsedWorkerThread = result.WorkerThread;
-                ApplyFilterResult(selected, result.Stats);
+                ApplyFilterResult(selected, fallbackIndex, result.Stats);
             }).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -1331,7 +1412,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         }
     }
 
-    private void ApplyFilterResult(ReviewItem? selected, ReviewWorkspaceStats stats)
+    private void ApplyFilterResult(ReviewItem? selected, int fallbackIndex, ReviewWorkspaceStats stats)
     {
         list.BeginUpdate();
         try
@@ -1349,7 +1430,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         {
             var index = IndexOfReference(filtered, selected);
             if (index >= 0) SelectFilteredIndex(index);
-            else if (filtered.Count > 0) SelectFilteredIndex(0);
+            else if (filtered.Count > 0) SelectFilteredIndex(Math.Clamp(fallbackIndex, 0, filtered.Count - 1));
             else ClearEditor();
         }
         else if (filtered.Count > 0) SelectFilteredIndex(0);
@@ -1543,6 +1624,9 @@ internal sealed class ReviewWorkspaceControl : UserControl
         if (current is null || workspace is null) return;
         var target = current;
         var targetIndex = Math.Max(0, IndexOfReference(filtered, target));
+        var nextTarget = moveNext && targetIndex + 1 < filtered.Count
+            ? filtered[targetIndex + 1]
+            : null;
         SaveEditor(true, false);
         if (status != ReviewStatuses.Pending && string.IsNullOrWhiteSpace(target.Decision.Text))
         {
@@ -1556,13 +1640,14 @@ internal sealed class ReviewWorkspaceControl : UserControl
         }
         services.Reviews.SetStatus(workspace, target, status);
         SetSavePending();
-        RefreshFilter(true);
+        RefreshFilter(true, moveNext ? nextTarget ?? target : target, targetIndex);
         SaveRequested?.Invoke(this, EventArgs.Empty);
         var retainedIndex = IndexOfReference(filtered, target);
-        if (retainedIndex < 0 && filtered.Count > 0)
+        var nextIndex = nextTarget is null ? -1 : IndexOfReference(filtered, nextTarget);
+        if (moveNext && nextIndex >= 0)
+            SelectFilteredIndex(nextIndex);
+        else if (retainedIndex < 0 && filtered.Count > 0)
             SelectFilteredIndex(Math.Min(targetIndex, filtered.Count - 1));
-        else if (moveNext)
-            MoveSelection(1);
     }
 
     private void ApproveAllSafe()
@@ -2227,6 +2312,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
             SuspendBackgroundUiWorkForClose();
             searchTimer?.Stop();
             searchTimer?.Dispose();
+            commandToolTips.Dispose();
         }
         base.Dispose(disposing);
     }

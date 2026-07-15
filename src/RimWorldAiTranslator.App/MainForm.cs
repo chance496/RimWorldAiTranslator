@@ -31,6 +31,7 @@ internal sealed class MainForm : Form
     private readonly Button activityNav;
     private readonly Button settingsNav;
     private readonly Button commandNav;
+    private readonly CommandToolTipService commandToolTips;
     private readonly System.Windows.Forms.Timer autoSaveTimer;
     private ThemePalette theme;
     private IReadOnlyList<RimWorldModInfo> mods = [];
@@ -189,10 +190,18 @@ internal sealed class MainForm : Form
         projectsNav.Click += (_, _) => ShowDashboard();
         activityNav.Click += (_, _) => TryStartUiWorkflow("활동 기록 열기", ShowActivityAsync);
         settingsNav.Click += (_, _) => ShowSettings();
-        commandNav = Ui.Button("명령  Ctrl+Shift+P", null, 156);
+        commandNav = Ui.Button("명령", null, 156);
         commandNav.TabIndex = 3;
         commandNav.SetBounds(996, 16, 156, 36);
         commandNav.Click += (_, _) => ShowCommandPalette();
+        commandToolTips = new CommandToolTipService();
+        commandToolTips.Register(projectsNav, UiCommand.Projects);
+        commandToolTips.Register(activityNav, UiCommand.Activity);
+        commandToolTips.Register(settingsNav, UiCommand.Settings);
+        commandToolTips.Register(
+            commandNav,
+            UiCommand.CommandPalette,
+            () => operationRunning ? "현재 작업이 실행 중이라 사용할 수 없습니다." : null);
         var headerAccent = new Panel { Tag = "accent" };
         headerAccent.SetBounds(0, 67, Width, 3);
         headerAccent.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
@@ -279,8 +288,8 @@ internal sealed class MainForm : Form
     {
         var key = keyData & Keys.KeyCode;
         var modifiers = keyData & Keys.Modifiers;
-        if (modifiers == (Keys.Control | Keys.Shift) && key == Keys.P && !operationRunning) { ShowCommandPalette(); return true; }
-        if (modifiers == Keys.Control && key == Keys.Home) { ShowDashboard(); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.CommandPalette, keyData) && !operationRunning) { ShowCommandPalette(); return true; }
+        if (UiCommandCatalog.Matches(UiCommand.Projects, keyData)) { ShowDashboard(); return true; }
         if (modifiers == Keys.Alt && key == Keys.C && workspace.Visible && workspace.Workspace is not null)
         {
             workspace.SelectSideTab("비교");
@@ -291,7 +300,8 @@ internal sealed class MainForm : Form
             workspace.SelectSideTab("품질");
             return true;
         }
-        if (modifiers == Keys.Control && key == Keys.F)
+        if ((workspace.Visible && UiCommandCatalog.Matches(UiCommand.ReviewSearch, keyData))
+            || (dashboard.Visible && UiCommandCatalog.Matches(UiCommand.ProjectSearch, keyData)))
         {
             if (workspace.Visible) workspace.FocusSearch();
             else if (dashboard.Visible) dashboard.FocusSearch();
@@ -299,18 +309,19 @@ internal sealed class MainForm : Form
             return true;
         }
         if (workspace.Visible && workspace.HandleShortcut(keyData)) return true;
-        if (modifiers == Keys.None && key == Keys.F5)
+        if ((dashboard.Visible && UiCommandCatalog.Matches(UiCommand.RefreshProjects, keyData))
+            || (workspace.Visible && UiCommandCatalog.Matches(UiCommand.RefreshSource, keyData)))
         {
             if (dashboard.Visible && !operationRunning) TryStartUiWorkflow("모드 목록 새로고침", token => RefreshModsAsync(true, token));
             else if (workspace.Visible && workspace.Project is not null && !operationRunning) TryStartUiWorkflow("원문 다시 분석", RefreshSourceAsync);
             return true;
         }
-        if (modifiers == Keys.Shift && key == Keys.F9)
+        if (UiCommandCatalog.Matches(UiCommand.StopOperation, keyData))
         {
             operationCancellation?.Cancel();
             return true;
         }
-        if (modifiers == Keys.None && key == Keys.F9)
+        if (UiCommandCatalog.Matches(UiCommand.AiTranslate, keyData))
         {
             if (workspace.Visible && workspace.Project is not null && !operationRunning) TryStartUiWorkflow("AI 번역", TranslateAsync);
             return true;
@@ -1658,6 +1669,7 @@ internal sealed class MainForm : Form
     {
         if (operationRunning) return;
         operationRunning = true;
+        commandNav.Enabled = false;
         operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetimeCancellation);
         lastRetryOperation = retry;
         workspace.SetRunning(true, title);
@@ -1724,6 +1736,7 @@ internal sealed class MainForm : Form
             operationCancellation?.Dispose();
             operationCancellation = null;
             operationRunning = false;
+            if (CanUpdateUi()) commandNav.Enabled = true;
         }
     }
 
@@ -1942,7 +1955,9 @@ internal sealed class MainForm : Form
             }
         }
         BackColor = theme.Background;
+        dashboard.RefreshCommandToolTips();
         workspace.RefreshThemeState();
+        commandToolTips.RefreshAll();
         Invalidate(true);
 
         void StyleHeader(Control parent)
@@ -1976,16 +1991,16 @@ internal sealed class MainForm : Form
         var hasProject = reviewVisible && workspace.Project is not null;
         var actions = new List<CommandPaletteAction>
         {
-            new("프로젝트 목록 열기", "이동", "Ctrl+Home", true, ShowDashboard),
-            new("현재 화면 검색", "이동", "Ctrl+F", true, () => { if (workspace.Visible) workspace.FocusSearch(); else dashboard.FocusSearch(); }),
+            new("프로젝트 목록 열기", "이동", UiCommandCatalog.Get(UiCommand.Projects).ShortcutText, true, ShowDashboard),
+            new("현재 화면 검색", "이동", UiCommandCatalog.Get(UiCommand.ReviewSearch).ShortcutText, true, () => { if (workspace.Visible) workspace.FocusSearch(); else dashboard.FocusSearch(); }),
             new("선택 문자열 비교 열기", "검수", "Alt+C", reviewVisible, () => workspace.SelectSideTab("비교")),
             new("프로젝트 품질 센터 열기", "검수", "Alt+Q", reviewVisible, () => workspace.SelectSideTab("품질")),
-            new("이전 문자열", "검수", "Shift+F3", reviewVisible, () => workspace.HandleShortcut(Keys.Alt | Keys.Left)),
-            new("다음 문자열", "검수", "F3", reviewVisible, () => workspace.HandleShortcut(Keys.Alt | Keys.Right)),
-            new("검토 완료 후 다음", "검수", "Ctrl+Enter", reviewVisible, () => workspace.HandleShortcut(Keys.Control | Keys.Enter)),
-            new("검수 내용 저장", "프로젝트", "Ctrl+S", reviewVisible, () => TryStartUiWorkflow("검수 저장", token => SaveReviewAsync(true, token))),
-            new("모드 원문 다시 분석", "프로젝트", "F5", reviewVisible, () => TryStartUiWorkflow("원문 다시 분석", RefreshSourceAsync)),
-            new("AI 초벌 번역 준비", "프로젝트", "F9", reviewVisible, () => TryStartUiWorkflow("AI 번역", TranslateAsync)),
+            new("이전 문자열", "검수", UiCommandCatalog.Get(UiCommand.PreviousReview).ShortcutText, reviewVisible, () => workspace.HandleShortcut(Keys.Shift | Keys.F3)),
+            new("다음 문자열", "검수", UiCommandCatalog.Get(UiCommand.NextReview).ShortcutText, reviewVisible, () => workspace.HandleShortcut(Keys.F3)),
+            new("검토 완료 후 다음", "검수", UiCommandCatalog.Get(UiCommand.MarkApprovedAndNext).ShortcutText, reviewVisible, () => workspace.HandleShortcut(Keys.Control | Keys.Enter)),
+            new("검수 내용 저장", "프로젝트", UiCommandCatalog.Get(UiCommand.SaveReview).ShortcutText, reviewVisible, () => TryStartUiWorkflow("검수 저장", token => SaveReviewAsync(true, token))),
+            new("모드 원문 다시 분석", "프로젝트", UiCommandCatalog.Get(UiCommand.RefreshSource).ShortcutText, reviewVisible, () => TryStartUiWorkflow("원문 다시 분석", RefreshSourceAsync)),
+            new("AI 초벌 번역 준비", "프로젝트", UiCommandCatalog.Get(UiCommand.AiTranslate).ShortcutText, reviewVisible, () => TryStartUiWorkflow("AI 번역", TranslateAsync)),
             new("개인정보 보호 품질 보고서", "도구", string.Empty, reviewVisible, () => TryStartUiWorkflow("품질 보고서 저장", ExportQualityReportAsync)),
             new("현재 모드 폴더 열기", "도구", string.Empty, hasProject, () => TryStartUiWorkflow("모드 폴더 열기", OpenCurrentModFolderAsync)),
             new("API 및 화면 설정 열기", "설정", string.Empty, true, ShowSettings),
@@ -2135,6 +2150,11 @@ internal sealed class MainForm : Form
         var message = default(Message);
         return ProcessCmdKey(ref message, keyData);
     }
+
+    internal string CommandToolTipTextForTesting(Control control) => commandToolTips.GetText(control);
+    internal int CommandToolTipRegistrationCountForTesting(Control control) => commandToolTips.RegistrationCount(control);
+    internal bool CommandToolTipFitsForTesting(Control control, int dpi, Size workingArea) =>
+        commandToolTips.FitsWorkingAreaForTesting(control, dpi, workingArea);
 
     private async Task RunTrackedUiWorkflowAsync(
         string label,
@@ -2675,6 +2695,7 @@ internal sealed class MainForm : Form
         {
             autoSaveTimer?.Stop();
             autoSaveTimer?.Dispose();
+            commandToolTips?.Dispose();
         }
         base.Dispose(disposing);
     }

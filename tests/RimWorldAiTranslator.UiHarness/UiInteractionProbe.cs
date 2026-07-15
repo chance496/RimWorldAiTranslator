@@ -13,6 +13,7 @@ namespace RimWorldAiTranslator.UiHarness;
 internal static class UiInteractionProbe
 {
     private const int ExpectedRows = 5_000;
+    private static readonly int[] ToolTipDpiValues = [96, 120, 144];
     private static readonly ProbeThresholds Thresholds = new(
         WorkspaceInitializationMilliseconds: 5_000,
         QualityCalculationMilliseconds: 2_000,
@@ -205,11 +206,13 @@ internal static class UiInteractionProbe
                 $"initialTopIndex={topBeforeNext};actualTopIndex={reviewList.TopIndex};maximumDrift=3");
 
             VerifyKeyboardRouting(checks, form, workspace, review, search, statusFilter, reviewList, translation, sideTabs);
+            VerifyApproveAndNextButton(checks, workspace, review, reviewList);
             VerifyProvenanceWorkflow(checks, workspace, review, reviewList, translation);
             timings = timings with
             {
                 StopFeedbackMilliseconds = VerifyImmediateStopFeedback(checks, workspace)
             };
+            VerifyCommandToolTips(checks, form, workspace, project, review);
             VerifyDashboardEscape(checks, form);
         }
         catch (Exception exception) when (exception is not OutOfMemoryException)
@@ -292,6 +295,133 @@ internal static class UiInteractionProbe
             && workspace.CurrentOriginalIndexForTesting == expectedIssues[issuePosition].Index
             && workspace.CurrentKeyForTesting.Equals(expectedIssues[issuePosition].Key, StringComparison.Ordinal),
             $"expectedIndex={expectedIssues[issuePosition].Index};actualIndex={workspace.CurrentOriginalIndexForTesting}");
+    }
+
+    private static void VerifyCommandToolTips(
+        ICollection<ProbeCheck> checks,
+        MainForm form,
+        ReviewWorkspaceControl workspace,
+        TranslationProject project,
+        ReviewWorkspace review)
+    {
+        var dashboard = form.DashboardControlForTesting;
+        var mainControls = SnapshotCapture.DescendantsOf(form)
+            .Where(control => !string.IsNullOrWhiteSpace(form.CommandToolTipTextForTesting(control)))
+            .ToArray();
+        var dashboardControls = SnapshotCapture.DescendantsOf(dashboard)
+            .Where(control => !string.IsNullOrWhiteSpace(dashboard.CommandToolTipTextForTesting(control)))
+            .ToArray();
+        var workspaceControls = SnapshotCapture.DescendantsOf(workspace)
+            .Where(control => !string.IsNullOrWhiteSpace(workspace.CommandToolTipTextForTesting(control)))
+            .ToArray();
+
+        Check(checks, "tooltip.major-command-coverage",
+            mainControls.Length >= 4 && dashboardControls.Length >= 5 && workspaceControls.Length >= 30,
+            $"main={mainControls.Length};dashboard={dashboardControls.Length};workspace={workspaceControls.Length}");
+        Check(checks, "tooltip.single-registration-per-control",
+            mainControls.All(control => form.CommandToolTipRegistrationCountForTesting(control) == 1)
+            && dashboardControls.All(control => dashboard.CommandToolTipRegistrationCountForTesting(control) == 1)
+            && workspaceControls.All(control => workspace.CommandToolTipRegistrationCountForTesting(control) == 1),
+            "expectedRegistrationCount=1");
+        Check(checks, "tooltip.accessible-description-shared-source",
+            mainControls.All(control => control.AccessibleDescription == form.CommandToolTipTextForTesting(control))
+            && dashboardControls.All(control => control.AccessibleDescription == dashboard.CommandToolTipTextForTesting(control))
+            && workspaceControls.All(control => control.AccessibleDescription == workspace.CommandToolTipTextForTesting(control)),
+            "accessibleDescriptionMustEqualToolTipText=true");
+
+        var ai = workspaceControls.OfType<Button>().Single(button => button.Text.Equals("AI 번역", StringComparison.Ordinal));
+        var save = workspaceControls.OfType<Button>().Single(button => button.Text.Equals("저장", StringComparison.Ordinal));
+        var next = workspaceControls.OfType<Button>().Single(button => button.Text.Equals("완료 후 다음", StringComparison.Ordinal));
+        var command = mainControls.OfType<Button>().Single(button => button.Text.Equals("명령", StringComparison.Ordinal));
+        Check(checks, "tooltip.shortcut-policy-exact",
+            HasCatalogShortcut(workspace.CommandToolTipTextForTesting(ai), UiCommand.AiTranslate)
+            && HasCatalogShortcut(workspace.CommandToolTipTextForTesting(save), UiCommand.SaveReview)
+            && HasCatalogShortcut(workspace.CommandToolTipTextForTesting(next), UiCommand.MarkApprovedAndNext)
+            && HasCatalogShortcut(form.CommandToolTipTextForTesting(command), UiCommand.CommandPalette)
+            && UiCommandCatalog.Matches(UiCommand.AiTranslate, Keys.F9)
+            && UiCommandCatalog.Matches(UiCommand.MarkApprovedAndNext, Keys.Control | Keys.Enter),
+            "tooltipAndKeyRoutingUseUiCommandCatalog=true");
+
+        workspace.SetRunning(true, "합성 ToolTip 작업");
+        Application.DoEvents();
+        var disabledText = workspace.CommandToolTipTextForTesting(ai);
+        workspace.RefreshThemeState();
+        var themedText = workspace.CommandToolTipTextForTesting(ai);
+        workspace.SetRunning(false, "준비됨");
+        Application.DoEvents();
+        var enabledText = workspace.CommandToolTipTextForTesting(ai);
+        Check(checks, "tooltip.disabled-reason-lifecycle",
+            disabledText.Contains("현재 작업이 실행 중", StringComparison.Ordinal)
+            && themedText.Equals(disabledText, StringComparison.Ordinal)
+            && !enabledText.Contains("현재 작업이 실행 중", StringComparison.Ordinal),
+            "disabledReasonAddedThenRemoved=true;themeRefreshPreserved=true");
+
+        var allControls = mainControls
+            .Select(control => (Control: control, Fits: (Func<int, bool>)(dpi => form.CommandToolTipFitsForTesting(control, dpi, new Size(1280, 720)))))
+            .Concat(dashboardControls.Select(control => (Control: control, Fits: (Func<int, bool>)(dpi => dashboard.CommandToolTipFitsForTesting(control, dpi, new Size(1280, 720))))))
+            .Concat(workspaceControls.Select(control => (Control: control, Fits: (Func<int, bool>)(dpi => workspace.CommandToolTipFitsForTesting(control, dpi, new Size(1280, 720))))))
+            .ToArray();
+        Check(checks, "tooltip.dpi-100-125-150-fit",
+            ToolTipDpiValues.All(dpi => allControls.All(item => item.Fits(dpi))),
+            "workingArea=1280x720;dpi=96,120,144");
+
+        dashboard.SetData(
+            [new RimWorldModInfo(project.Name, project.Name, project.ModRoot, project.SourceKind, Path.GetFileName(project.ModRoot), project.PackageId, project.WorkshopId, project.Name)],
+            [project]);
+        form.DispatchShortcutForTesting(Keys.Control | Keys.Home);
+        Application.DoEvents();
+        var dashboardSearch = FindControl<TextBox>(dashboard, "프로젝트 검색");
+        var visibleDashboardControls = SnapshotCapture.DescendantsOf(dashboard)
+            .Count(control => !string.IsNullOrWhiteSpace(dashboard.CommandToolTipTextForTesting(control)));
+        Check(checks, "tooltip.screen-transition-preserved",
+            dashboard.Visible
+            && visibleDashboardControls >= 7
+            && !string.IsNullOrWhiteSpace(dashboard.CommandToolTipTextForTesting(dashboardSearch))
+            && form.CommandToolTipTextForTesting(command).Contains(UiCommandCatalog.Get(UiCommand.CommandPalette).ShortcutText, StringComparison.Ordinal),
+            $"dashboardAndMainToolTipsPresentAfterTransition=true;dashboard={visibleDashboardControls}");
+        form.LoadWorkspaceForTesting(project, review);
+        Application.DoEvents();
+        Check(checks, "tooltip.workspace-reload-preserved",
+            workspace.Visible
+            && workspace.CommandToolTipTextForTesting(ai).Contains(UiCommandCatalog.Get(UiCommand.AiTranslate).ShortcutText, StringComparison.Ordinal),
+            "workspaceToolTipsPresentAfterReload=true");
+    }
+
+    private static bool HasCatalogShortcut(string toolTipText, UiCommand command) =>
+        toolTipText.Contains($"단축키: {UiCommandCatalog.Get(command).ShortcutText}", StringComparison.Ordinal);
+
+    private static void VerifyApproveAndNextButton(
+        ICollection<ProbeCheck> checks,
+        ReviewWorkspaceControl workspace,
+        ReviewWorkspace review,
+        ListBox reviewList)
+    {
+        var index = review.Items.FindIndex(item =>
+            item.OriginalIndex < review.Items.Count - 1
+            && !string.IsNullOrWhiteSpace(item.Decision.Text)
+            && !item.IsWarning);
+        if (index < 0)
+        {
+            Check(checks, "button.approve-and-next", false, "safeTranslatedFixtureRowRequired=true");
+            return;
+        }
+
+        reviewList.SelectedIndex = index;
+        Application.DoEvents();
+        var target = review.Items[index];
+        var expectedNextIndex = review.Items[index + 1].OriginalIndex;
+        var button = SnapshotCapture.DescendantsOf(workspace)
+            .OfType<Button>()
+            .Single(candidate => candidate.Text.Equals("완료 후 다음", StringComparison.Ordinal));
+        var becameEnabled = PumpUntil(() => button.Enabled, TimeSpan.FromSeconds(2));
+        button.PerformClick();
+        var moved = PumpUntil(
+            () => target.EffectiveStatus.Equals(ReviewStatuses.Approved, StringComparison.Ordinal)
+                && workspace.CurrentOriginalIndexForTesting == expectedNextIndex,
+            TimeSpan.FromSeconds(2));
+        Check(checks, "button.approve-and-next",
+            becameEnabled && moved,
+            $"enabled={becameEnabled};approved={target.EffectiveStatus};expectedNextIndex={expectedNextIndex};actualIndex={workspace.CurrentOriginalIndexForTesting}");
     }
 
     private static void VerifyKeyboardRouting(

@@ -16,11 +16,13 @@ internal sealed class ProjectDashboardControl : UserControl
     private readonly Button create;
     private readonly Button chooseFolder;
     private readonly Button refresh;
+    private readonly CommandToolTipService commandToolTips;
     private IReadOnlyList<RimWorldModInfo> mods = [];
     private IReadOnlyList<TranslationProject> projects = [];
     private IReadOnlyDictionary<string, ProjectCardStats> stats = new Dictionary<string, ProjectCardStats>();
     private bool dataInitialized;
     private bool renderingCards;
+    private bool busy;
     private int renderedCardsWidth = -1;
 
     public ProjectDashboardControl()
@@ -100,6 +102,24 @@ internal sealed class ProjectDashboardControl : UserControl
         refresh.AccessibleDescription = "모드 검색 결과와 저장된 프로젝트 상태를 다시 불러옵니다.";
         refresh.TabIndex = 4;
         refresh.Click += (_, _) => RefreshRequested?.Invoke(this, EventArgs.Empty);
+
+        commandToolTips = new CommandToolTipService();
+        commandToolTips.Register(search, UiCommand.ProjectSearch);
+        commandToolTips.Register(modPicker, UiCommand.ProjectCreate);
+        commandToolTips.Register(
+            create,
+            UiCommand.ProjectCreate,
+            () => busy
+                ? "현재 작업이 실행 중이라 사용할 수 없습니다."
+                : modPicker.SelectedItem is null ? "먼저 번역할 모드를 선택하세요." : null);
+        commandToolTips.Register(
+            chooseFolder,
+            UiCommand.ChooseProjectFolder,
+            () => busy ? "현재 작업이 실행 중이라 사용할 수 없습니다." : null);
+        commandToolTips.Register(
+            refresh,
+            UiCommand.RefreshProjects,
+            () => busy ? "현재 작업이 실행 중이라 사용할 수 없습니다." : null);
 
         cards = new BufferedFlowLayoutPanel
         {
@@ -206,10 +226,19 @@ internal sealed class ProjectDashboardControl : UserControl
 
     public void SetBusy(bool busy)
     {
+        this.busy = busy;
         create.Enabled = !busy && modPicker.SelectedItem is RimWorldModInfo;
         chooseFolder.Enabled = !busy;
         refresh.Enabled = !busy;
+        commandToolTips.RefreshAll();
     }
+
+    public void RefreshCommandToolTips() => commandToolTips.RefreshAll();
+
+    internal string CommandToolTipTextForTesting(Control control) => commandToolTips.GetText(control);
+    internal int CommandToolTipRegistrationCountForTesting(Control control) => commandToolTips.RegistrationCount(control);
+    internal bool CommandToolTipFitsForTesting(Control control, int dpi, Size workingArea) =>
+        commandToolTips.FitsWorkingAreaForTesting(control, dpi, workingArea);
 
     private void ResizeLayout(FlowLayoutPanel workflow, Panel divider)
     {
@@ -304,12 +333,22 @@ internal sealed class ProjectDashboardControl : UserControl
         start.TabIndex = 0;
         start.Enabled = modPicker.SelectedItem is RimWorldModInfo;
         start.Click += (_, _) => create.PerformClick();
+        commandToolTips.Register(
+            start,
+            UiCommand.ProjectCreate,
+            () => busy
+                ? "현재 작업이 실행 중이라 사용할 수 없습니다."
+                : modPicker.SelectedItem is null ? "먼저 번역할 모드를 선택하세요." : null);
         var find = Ui.Button("폴더에서 찾기", null, 118);
         find.SetBounds(382, 178, 118, 38);
         find.Margin = Padding.Empty;
         find.AccessibleDescription = "목록에 없는 로컬 RimWorld 모드 폴더를 선택합니다.";
         find.TabIndex = 1;
         find.Click += (_, _) => chooseFolder.PerformClick();
+        commandToolTips.Register(
+            find,
+            UiCommand.ChooseProjectFolder,
+            () => busy ? "현재 작업이 실행 중이라 사용할 수 없습니다." : null);
         panel.Controls.AddRange([radar, title, body, status, start, find]);
         return panel;
     }
@@ -370,6 +409,10 @@ internal sealed class ProjectDashboardControl : UserControl
         open.AccessibleDescription = $"{project.Name} 번역 프로젝트의 검수 작업 화면을 엽니다.";
         open.TabIndex = 1;
         open.Click += (_, _) => OpenProjectRequested?.Invoke(this, project);
+        commandToolTips.Register(
+            open,
+            UiCommand.OpenProject,
+            description: () => $"{project.Name} 번역 프로젝트의 검수 화면을 엽니다.");
         var delete = Ui.Button("삭제", "danger", 70);
         delete.SetBounds(width - 184, 158, 70, 36);
         delete.Margin = Padding.Empty;
@@ -377,6 +420,10 @@ internal sealed class ProjectDashboardControl : UserControl
         delete.AccessibleDescription = $"{project.Name} 로컬 번역 프로젝트를 삭제하기 위한 확인 절차를 시작합니다.";
         delete.TabIndex = 0;
         delete.Click += (_, _) => DeleteProjectRequested?.Invoke(this, project);
+        commandToolTips.Register(
+            delete,
+            UiCommand.DeleteProject,
+            description: () => $"{project.Name} 로컬 번역 프로젝트 삭제 확인을 시작합니다.");
         foreach (var control in new Control[] { card, accent, name, meta, total, coverage, pending, updated, track, recent })
         {
             control.Click += (_, _) => OpenProjectRequested?.Invoke(this, project);
@@ -411,6 +458,12 @@ internal sealed class ProjectDashboardControl : UserControl
         "japanese" => "일본어",
         _ => value
     };
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) commandToolTips?.Dispose();
+        base.Dispose(disposing);
+    }
 
     private sealed class RadarPanel : Panel
     {

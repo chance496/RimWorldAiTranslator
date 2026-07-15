@@ -102,9 +102,11 @@ internal static class Program
             }
             var fixtureRows = options.UiInteractionProbe
                 ? 5_000
+                : options.CommandToolTipProbe ? 50
                 : options.MetadataAccessibilityProbe ? 3 : options.SeedRows;
             var fixtureProfile = options.UiInteractionProbe
                 ? options.FixtureProfile
+                : options.CommandToolTipProbe ? "dashboard"
                 : options.MetadataAccessibilityProbe ? "dashboard" : options.FixtureProfile;
             if (fixtureRows > 0)
                 SyntheticUiFixture.Create(root, discoveryRoot, fixtureRows, fixtureProfile);
@@ -118,6 +120,11 @@ internal static class Program
             if (options.UiInteractionProbe)
             {
                 UiInteractionProbe.Run(root, discoveryRoot, options.ReportPath, fixtureProfile);
+                return;
+            }
+            if (options.CommandToolTipProbe)
+            {
+                CommandToolTipProbe.Run(root, discoveryRoot);
                 return;
             }
             if (options.MetadataAccessibilityProbe)
@@ -250,7 +257,7 @@ internal static class Program
                     forcePromptCount++;
                     return closeRacePendingChecked || closeRaceEmergencyForce;
                 }
-                : null;
+            : null;
 
             MainForm CreateHarnessForm()
             {
@@ -2180,6 +2187,7 @@ internal sealed record SnapshotOptions(
     bool CloseTimeoutRecover,
     bool CloseBehaviorProbe,
     bool UiInteractionProbe,
+    bool CommandToolTipProbe,
     bool MetadataAccessibilityProbe,
     bool CommandPaletteProbe,
     bool SingleInstanceProbe,
@@ -2236,6 +2244,7 @@ internal sealed record SnapshotOptions(
             Has("--close-timeout-recover"),
             Has("--close-behavior-probe"),
             Has("--ui-interaction-probe"),
+            Has("--command-tooltip-probe"),
             Has("--metadata-accessibility-probe"),
             Has("--command-palette-probe"),
             Has("--single-instance-probe"),
