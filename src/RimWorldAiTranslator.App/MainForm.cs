@@ -32,6 +32,7 @@ internal sealed class MainForm : Form
     private readonly Button settingsNav;
     private readonly Button commandNav;
     private readonly CommandToolTipService commandToolTips;
+    private readonly UiRenderDiagnostics renderDiagnostics;
     private readonly System.Windows.Forms.Timer autoSaveTimer;
     private ThemePalette theme;
     private IReadOnlyList<RimWorldModInfo> mods = [];
@@ -73,9 +74,15 @@ internal sealed class MainForm : Form
     private bool startupPreparationInProgress;
     private bool preparedForFirstShow;
     private bool firstFrameRevealed;
+    private bool firstFramePaintSettled;
     private bool deferredStartupWorkStarted;
+    private bool windowLayoutSuspended;
 
     internal event EventHandler<MainFormStartupFailureEventArgs>? StartupFailed;
+    internal bool FirstFramePaintSettledForTesting => firstFramePaintSettled;
+    internal string LastWindowResizeTraceForTesting => renderDiagnostics.LastReportForTesting;
+    internal void BeginWindowResizeForTesting() => OnResizeBegin(EventArgs.Empty);
+    internal void EndWindowResizeForTesting() => OnResizeEnd(EventArgs.Empty);
 
     public MainForm(
         string? dataRoot = null,
@@ -142,6 +149,8 @@ internal sealed class MainForm : Form
         this.unsavedCloseConfirmation = unsavedCloseConfirmation;
         this.ioHooks = ioHooks ?? new UiIoHooks();
         this.services = services ?? throw new ArgumentNullException(nameof(services));
+        renderDiagnostics = new UiRenderDiagnostics(message => this.services.Logger.Info(message));
+        firstFramePaintSettled = false;
         statsCache = usePreloadedProjectStats
             ? projectStats ?? throw new ArgumentNullException(nameof(projectStats))
             : services.ProjectStats.Load();
@@ -202,9 +211,7 @@ internal sealed class MainForm : Form
             commandNav,
             UiCommand.CommandPalette,
             () => operationRunning ? "현재 작업이 실행 중이라 사용할 수 없습니다." : null);
-        var headerAccent = new Panel { Tag = "accent" };
-        headerAccent.SetBounds(0, 67, Width, 3);
-        headerAccent.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+        var headerAccent = new Panel { Tag = "accent", Dock = DockStyle.Bottom, Height = 3 };
         header.Controls.AddRange([title, projectsNav, activityNav, settingsNav, commandNav, headerAccent]);
         header.Resize += (_, _) => commandNav.SetBounds(Math.Max(676, header.ClientSize.Width - 184), 16, 156, 36);
 
@@ -266,6 +273,35 @@ internal sealed class MainForm : Form
             }
         };
         Shown += MainFormShown;
+        ResizeBegin += (_, _) =>
+        {
+            if (!windowLayoutSuspended)
+            {
+                SuspendLayout();
+                contentHost.SuspendLayout();
+                windowLayoutSuspended = true;
+            }
+            dashboard.SetWindowResizeInProgress(true);
+            activity.SetWindowResizeInProgress(true);
+            settings.SetWindowResizeInProgress(true);
+            workspace.SetWindowResizeInProgress(true);
+            renderDiagnostics.Begin(this);
+        };
+        ResizeEnd += (_, _) =>
+        {
+            if (windowLayoutSuspended)
+            {
+                ResumeLayout(true);
+                contentHost.ResumeLayout(true);
+                windowLayoutSuspended = false;
+            }
+            dashboard.SetWindowResizeInProgress(false);
+            activity.SetWindowResizeInProgress(false);
+            settings.SetWindowResizeInProgress(false);
+            workspace.SetWindowResizeInProgress(false);
+            Invalidate(true);
+            renderDiagnostics.End();
+        };
         FormClosing += MainFormClosing;
         ApplyTheme();
         ShowControl(dashboard);
@@ -387,28 +423,37 @@ internal sealed class MainForm : Form
         }
     }
 
-    internal Task RevealPreparedFirstFrameAsync()
+    internal async Task RevealPreparedFirstFrameAsync()
     {
         if (!preparedForFirstShow || !startupComplete)
             throw new InvalidOperationException("The main form is not ready to be revealed.");
         if (!Visible)
             throw new InvalidOperationException("The main form must be shown before its first frame is revealed.");
-        if (firstFrameRevealed) return Task.CompletedTask;
+        if (firstFrameRevealed) return;
 
+        Enabled = true;
+        Opacity = 1;
+        Invalidate(true);
+        Update();
+        await WaitForUiIdleCycleAsync();
+        if (closing || IsDisposed) throw new OperationCanceledException("The main form closed during first-frame rendering.");
+
+        Invalidate(true);
+        Update();
+        await WaitForUiIdleCycleAsync();
+        if (closing || IsDisposed) throw new OperationCanceledException("The main form closed during first-frame rendering.");
+
+        firstFramePaintSettled = true;
+        firstFrameRevealed = true;
+    }
+
+    private static Task WaitForUiIdleCycleAsync()
+    {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         EventHandler? idleHandler = null;
         idleHandler = (_, _) =>
         {
             Application.Idle -= idleHandler;
-            if (closing || IsDisposed)
-            {
-                completion.TrySetCanceled();
-                return;
-            }
-
-            Enabled = true;
-            Opacity = 1;
-            firstFrameRevealed = true;
             completion.TrySetResult();
         };
         Application.Idle += idleHandler;
@@ -1168,7 +1213,10 @@ internal sealed class MainForm : Form
                     {
                         var safeProgress = OperationErrorPresentation.CreateSafeProgress(value);
                         UpdateOperationProgress(safeProgress);
-                        if (safeProgress.IsWarning) services.Logger.Warning(safeProgress.Message);
+                        if (safeProgress.IsWarning)
+                            services.Logger.Warning(safeProgress.Message);
+                        else
+                            services.Logger.Info(safeProgress.Message);
                     });
                     TranslationRunResult result;
                     try
@@ -1191,7 +1239,8 @@ internal sealed class MainForm : Form
                                 CancellationToken.None);
                             InvalidateProjectStats(project.Id);
                             await LoadReviewAsync(project, ex.PartialResult.ReviewRoot!, false, CancellationToken.None);
-                            services.Logger.Warning($"취소된 번역의 부분 검수 결과를 보존했습니다 · 번역 {ex.PartialResult.TranslatedEntries:N0}개");
+                            services.Logger.Warning(
+                                $"번역을 중지했습니다 · 완료 번역 {ex.PartialResult.TranslatedEntries:N0}개 · 전체 원문 {ex.PartialResult.Rows.Count:N0}개 보존");
                         }
                         throw;
                     }
@@ -1769,7 +1818,7 @@ internal sealed class MainForm : Form
     {
         if (title.Equals("초벌 번역 실행", StringComparison.Ordinal))
             return ("초벌 번역이 완료되었습니다", "문제 항목을 확인하고 검토를 시작할 수 있습니다.",
-                "완료된 배치는 가능한 경우 검수 프로젝트에 남아 있습니다.", "번역 작업에 실패했습니다");
+                "완료된 번역과 아직 번역하지 않은 전체 원문을 검수 프로젝트에 남겼습니다.", "번역 작업에 실패했습니다");
         if (title.Equals("원문 분석 중", StringComparison.Ordinal))
             return ("원문 분석이 완료되었습니다", "변경된 문자열과 검수 상태를 확인할 수 있습니다.",
                 "기존 검수 프로젝트와 완료된 분석 결과는 보존했습니다.", "원문 분석에 실패했습니다");
@@ -2696,6 +2745,7 @@ internal sealed class MainForm : Form
             autoSaveTimer?.Stop();
             autoSaveTimer?.Dispose();
             commandToolTips?.Dispose();
+            renderDiagnostics?.Dispose();
         }
         base.Dispose(disposing);
     }

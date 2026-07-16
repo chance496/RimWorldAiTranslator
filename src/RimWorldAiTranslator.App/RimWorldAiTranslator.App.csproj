@@ -21,7 +21,7 @@
 
   <ItemGroup>
     <Content Include="..\..\rimworld-def-field-rules.txt" Link="rimworld-def-field-rules.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
-    <Content Include="..\..\glossary.generated.ko.json" Link="glossary.generated.ko.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" ExcludeFromSingleFile="true" />
+    <Content Include="..\..\glossary.generated.ko.json" Link="glossary.generated.ko.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
 
 </Project>

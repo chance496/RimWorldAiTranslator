@@ -16,7 +16,13 @@ namespace RimWorldAiTranslator.UiHarness;
 
 internal static class Program
 {
+    private const int GwlExStyle = -20;
+    private const long WsExLayered = 0x00080000L;
+    private const long WsExComposited = 0x02000000L;
     private static readonly JsonSerializerOptions FailureJsonOptions = new() { WriteIndented = true };
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    private static extern nint GetWindowLongPtr(nint window, int index);
 
     [STAThread]
     private static void Main(string[] args)
@@ -1225,6 +1231,8 @@ internal static class Program
         var presentationChecked = false;
         var postRevealControlAdditions = 0;
         var deferredGlossaryCompleted = 0;
+        var previousUiTrace = Environment.GetEnvironmentVariable("RIMWORLD_TRANSLATOR_UI_TRACE");
+        Environment.SetEnvironmentVariable("RIMWORLD_TRANSLATOR_UI_TRACE", "1");
         using var deferredGlossaryStarted = new ManualResetEventSlim(false);
         using var releaseDeferredGlossary = new ManualResetEventSlim(false);
 
@@ -1262,6 +1270,15 @@ internal static class Program
             {
                 if (bootstrap.Visible || form.Opacity < 1 || !form.Enabled)
                     throw new InvalidOperationException("The first main-form frame was revealed before the bootstrap transition completed.");
+                if (!bootstrap.LoadingSurfaceCoveredMainForTesting)
+                    throw new InvalidOperationException("The completed loading surface did not cover the main window during its first paint.");
+                if (!form.FirstFramePaintSettledForTesting)
+                    throw new InvalidOperationException("The loading surface was removed before the first main-form paint settled.");
+                var mainWindowExtendedStyle = (long)GetWindowLongPtr(form.Handle, GwlExStyle);
+                if ((mainWindowExtendedStyle & WsExLayered) != 0)
+                    throw new InvalidOperationException("The revealed main window retained WS_EX_LAYERED and can ghost child controls while moving.");
+                if ((mainWindowExtendedStyle & WsExComposited) != 0)
+                    throw new InvalidOperationException("The main window enabled global WS_EX_COMPOSITED rendering.");
 
                 var firstLayout = CaptureVisibleControlLayout(form);
                 if (firstLayout.Length < 10)
@@ -1271,6 +1288,47 @@ internal static class Program
                     Interlocked.Increment(ref postRevealControlAdditions);
                 foreach (var control in new[] { form }.Concat(SnapshotCapture.DescendantsOf(form)))
                     control.ControlAdded += RecordControlAddition;
+
+                form.WindowState = FormWindowState.Normal;
+                form.SetBounds(80, 80, 1_520, 860);
+                Application.DoEvents();
+                form.BeginWindowResizeForTesting();
+                for (var step = 0; step < 12; step++)
+                {
+                    form.Width = 1_520 + step * 7;
+                    Application.DoEvents();
+                }
+                form.EndWindowResizeForTesting();
+                if (!form.LastWindowResizeTraceForTesting.Contains("UI window-drag trace", StringComparison.Ordinal))
+                    throw new InvalidOperationException("The opt-in window-drag paint/layout diagnostic trace was not recorded.");
+
+                var dashboardPage = SnapshotCapture.DescendantsOf(form)
+                    .OfType<ProjectDashboardControl>()
+                    .Single();
+                var settingsPage = SnapshotCapture.DescendantsOf(form)
+                    .OfType<SettingsControl>()
+                    .Single();
+                dashboardPage.Visible = false;
+                settingsPage.Visible = true;
+                settingsPage.BringToFront();
+                Application.DoEvents();
+                var layoutPassesBeforeSettingsResize = settingsPage.ResizeLayoutPassCountForTesting;
+                form.BeginWindowResizeForTesting();
+                for (var step = 0; step < 12; step++)
+                {
+                    form.Width = 1_600 + step * 7;
+                    Application.DoEvents();
+                    if (settingsPage.ResizeLayoutPassCountForTesting != layoutPassesBeforeSettingsResize)
+                        throw new InvalidOperationException("The settings page progressively recalculated child bounds during a window drag.");
+                }
+                form.EndWindowResizeForTesting();
+                if (settingsPage.ResizeLayoutPassCountForTesting != layoutPassesBeforeSettingsResize + 1)
+                    throw new InvalidOperationException("The settings page did not perform exactly one completed layout after a window drag.");
+                settingsPage.Visible = false;
+                dashboardPage.Visible = true;
+                dashboardPage.BringToFront();
+                form.WindowState = FormWindowState.Maximized;
+                Application.DoEvents();
 
                 form.BeginInvoke((Action)(() => form.BeginInvoke((Action)(async () =>
                 {
@@ -1325,6 +1383,7 @@ internal static class Program
         }
         finally
         {
+            Environment.SetEnvironmentVariable("RIMWORLD_TRANSLATOR_UI_TRACE", previousUiTrace);
             watchdog.Stop();
             bootstrap.DisposeAfterRunAsync().AsTask().GetAwaiter().GetResult();
         }

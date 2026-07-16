@@ -426,3 +426,112 @@
 - `검토 완료 후 다음`은 상태 변경 직후 다음 항목으로 이동했지만 2,000행 이상 비동기 필터가 완료되면서 이전 항목을 다시 선택하는 회귀였다. 필터 요청에 의도한 다음 항목과 fallback index를 전달해 비동기 완료 뒤에도 다음 선택을 유지하도록 수정했다.
 - 전용 50행 합성 `--command-tooltip-probe`는 주요 명령 범위, 단축키 정책 일치, 비활성 사유 추가/제거, 테마·대시보드·workspace 전환, 동적 카드, DPI 100/125/150%, 중복 등록 0, 접근성 설명 일치와 완료 후 다음을 모두 PASS했다. 5,000행 UI 하네스에서도 새 ToolTip 8개 검사와 완료 후 다음은 모두 PASS했지만 기존 검색 200ms 계약은 342.810ms로 실패했다. 같은 경로의 과거 작업 기록에도 290.480ms가 남아 있어 이 범위에서 임계치를 완화하거나 성능 코드를 변경하지 않았다.
 - 최종 strict Release build는 8개 프로젝트 경고/오류 0/0이고 전체 오프라인 회귀는 80/80 PASS다. 범위 파일 format verify와 `git diff --check`도 통과했다. 실제 사용자 데이터·API·외부 네트워크를 사용하지 않았고 패키지·VERSION·push·PR·tag·Release·asset·외부 배포는 수행하지 않았다.
+
+## 2026-07-15 - 설정 화면 DPI 레이아웃과 Workshop 버전 표기 복구
+
+- 사용자 제공 1920×944 설정 화면을 125% DPI 합성 fixture로 재현했다. 설정 자식 컨트롤은 WinForms DPI 확대를 받은 반면 `ResizeLayout`이 외곽 패널을 96-DPI 고정 좌표로 다시 배치해 API URL과 Temperature가 겹쳤고, API 안내·Dry run·진단 번들·RMK 체크박스 등 실제 컨트롤 7개가 부모 경계를 벗어났다.
+- 설정 화면은 대시보드와 동일하게 수동 레이아웃만 적용하도록 `AutoScaleMode.None`으로 통일했다. 헤더 강조선은 고정 폭과 anchor 조합 대신 아래쪽 dock을 사용해 장식 패널의 DPI 경계 이탈도 제거했다.
+- 버전별 Workshop 모드의 화면 태그는 한국어 Windows에서 원화 기호로 보이는 역슬래시 대신 `W:<id> / <version>`을 사용한다. 내부 모드 경로, Workshop ID와 검색 데이터는 변경하지 않았고 discovery 회귀에 화면 표기 계약을 추가했다.
+- 수정 전 125% 감사 결과는 컨트롤 잘림 7건이었다. 수정 후 같은 1920×944·125%와 DPI-unaware 100% snapshot 감사에서 컨트롤 잘림 0, 장식 잘림 0, 텍스트 잘림 0을 확인했다. strict Release build는 8개 프로젝트 경고/오류 0/0, 전체 오프라인 회귀는 80/80 PASS(108.1초), `git diff --check`도 통과했다. 실제 사용자 데이터·API·외부 네트워크를 사용하지 않았고 package·VERSION·commit·push·PR·tag·Release·asset·외부 배포는 수행하지 않았다.
+- 대시보드의 폭 126 버튼에서 `프로젝트 만들기` 마지막 글자가 잘려 보인다는 사용자 확인에 따라 버튼 표시를 `프로젝트 생성`으로 단축했다. 실행 중인 기존 Release EXE는 사용자 프로세스가 잠그고 있어 종료하지 않았고, 별도 TEMP 출력으로 경고/오류 0/0 빌드한 뒤 동일 1920×944·125% snapshot에서 버튼 전문과 컨트롤·텍스트 잘림 0건을 확인했다.
+- 실행 중인 구버전 프로세스를 종료하지 않고 `artifacts/local-builds/RimWorldAiTranslator-ui-clipping-fix/`에 self-contained single-file 로컬 실행본을 publish했다. EXE는 163,691,810 bytes, SHA-256 `C8B3B5F996CAD2D5E07670E6056D9EFCF8699B08F29D662836318975F343B04D`이며 ZIP·Release·asset·외부 배포는 만들지 않았다.
+
+## 2026-07-15 - startup 점진 렌더링 차단
+
+- 기존 시작 전환은 투명한 메인 창을 먼저 표시하고 첫 `Application.Idle`에서 불투명화와 로딩창 숨김을 함께 수행했다. 레이아웃 위치는 안정적이어도 자식 컨트롤의 실제 첫 paint 완료를 보장하지 않아 사용자가 버튼·패널이 순차적으로 나타나는 프레임을 볼 수 있는 경로였다. 기존 startup presentation 회귀에 `로딩 화면 제거 전 첫 paint 안정화` 조건을 추가했고 수정 전 실패를 재현했다.
+- startup 창을 현재 모니터 작업 영역 전체를 덮는 완성된 로딩 화면으로 바꿨다. 프로젝트·모드·통계와 최초 레이아웃을 준비한 뒤 메인 창을 최종 크기와 활성 상태로 로딩 화면 뒤에서 렌더링하고, 지연 타이머 없이 두 번의 UI idle/paint 안정화가 끝난 뒤 로딩 화면을 한 번에 숨긴다. 전환 동안만 로딩 화면의 z-order를 고정하며 완료 후 즉시 해제한다.
+- 강화된 Phase08 UI truthfulness는 로딩 화면의 메인 작업 영역 전체 차폐, 첫 paint 안정화, 최초/안정 레이아웃 동일, 공개 후 동적 컨트롤 추가 0건을 검증해 PASS했다. 느린 bootstrap, 시작 중 취소, 전환 실패 경로도 모두 PASS했다. 별도 TEMP 출력 strict Release build는 8개 프로젝트 경고/오류 0/0, 전체 오프라인 회귀는 80/80 PASS(88.1초), 변경 C# 범위 format verify와 `git diff --check`도 통과했다. 실행 중인 사용자 앱과 실제 데이터는 변경하지 않았고 commit·push·PR·tag·Release·asset·외부 배포는 수행하지 않았다.
+- 사용자 확인용 self-contained single-file 로컬 실행본을 `artifacts/local-builds/RimWorldAiTranslator-ui-startup-fix/`에 publish했다. EXE는 163,691,810 bytes, SHA-256 `B8C6AE9577F78B8D53548E14B26566665DFE93A5DF952BBBD7AF4CBBA91FE5FC`이며 ZIP이나 외부 배포물은 만들지 않았다.
+
+## 2026-07-15 - 창 이동·크기 변경 flicker 제거
+
+- App의 Paint/OnPaint/Resize/SizeChanged/LocationChanged/Layout/VisibleChanged와 `Refresh`·`Update`·`Invalidate`·`PerformLayout` 호출을 전수 조사했다. 핵심 원인은 대시보드 카드 영역이 너비가 1픽셀 바뀔 때마다 모든 프로젝트 카드를 제거·재생성하고 전체 테마를 다시 적용한 점, 검수 화면이 매 resize마다 루트 `PerformLayout`과 splitter 거리·방향을 다시 설정한 점, 메인·중첩 buffered panel의 `ResizeRedraw`가 전체 영역을 반복 무효화한 점이었다.
+- 프로젝트 카드는 데이터나 검색 조건이 바뀔 때만 재생성한다. 창 resize 중에는 기존 카드 컨트롤을 유지하고, drag 종료 후 실제 너비가 바뀐 경우에만 카드 내부 bounds를 한 번 재배치한다. 단순 창 이동에서는 카드와 splitter 계산을 수행하지 않는다. 검수 화면은 중복 루트 `PerformLayout`을 제거하고 resize 중 splitter 변경을 보류하며, 값이 실제로 달라질 때만 orientation·distance·bounds를 갱신한다.
+- 메인 폼, 대시보드, 활동 화면, 공용 panel/flow panel, 검수 ListBox/ListView와 SplitContainer에 해당 컨트롤 범위의 `OptimizedDoubleBuffer`와 `AllPaintingInWmPaint`를 적용하고 불필요한 `ResizeRedraw`를 제거했다. 투명 배경은 테마 적용 후 불투명 palette 색으로 치환되는 기존 동작을 유지했으며 전역 `WS_EX_COMPOSITED`는 사용하지 않았다.
+- `RIMWORLD_TRANSLATOR_UI_TRACE=1`일 때 window drag 구간의 paint/layout/resize 횟수를 컨트롤 타입별로 집계해 상위 8개를 안전한 앱 로그와 Debug 출력에 남기는 opt-in 진단을 추가했다. 사용자 문자열·경로·입력값은 기록하지 않는다. resize characterization은 수정 전 공개 후 동적 컨트롤 추가로 실패했고 수정 후 카드 추가 0, 최초 크기 복원 후 레이아웃 동일, 진단 trace 생성으로 PASS했다.
+- dashboard와 review의 1920×944·1280×720 snapshot은 컨트롤/텍스트 잘림 0건이고 ToolTip·startup 회귀도 PASS했다. 최종 strict Release build는 8개 프로젝트 경고/오류 0/0, 전체 오프라인 회귀는 80/80 PASS(63.6초), Phase08 UI truthfulness와 변경 범위 format verify·`git diff --check`도 PASS했다.
+- self-contained single-file 로컬 실행본은 `artifacts/local-builds/RimWorldAiTranslator-ui-resize-fix/`에 생성했다. EXE는 163,700,002 bytes, SHA-256 `0F054D0920C8344818CD6CDBD9E7083FC5C3F184024D37E5475942D0C7309327`이다. commit·push·PR·tag·Release·asset·ZIP·외부 배포는 수행하지 않았다.
+
+## 2026-07-15 - 창 이동 잔상 flicker 재교정
+
+- 사용자 화면에서 설정 페이지 위에 이전 대시보드 카드와 흰 띠가 남는 실제 잔상을 확인해 앞선 수정이 불충분하다고 판정했다. 공개 뒤 메인 창의 extended style을 직접 검사한 결과 `WS_EX_LAYERED`와 `WS_EX_COMPOSITED`는 모두 0이어서 전역 합성이나 opacity 잔류가 원인은 아니었다.
+- 직접 원인은 공용 buffered panel/flow panel에서 `ResizeRedraw`를 꺼 노출된 부모 배경을 다시 그리지 않은 상태로, 설정 화면이 연속 `Resize`마다 모든 API·화면·RMK 자식 bounds를 순차 변경한 것이었다. 최대화 창을 끌어 복원하거나 스냅 크기가 바뀔 때 이전 페이지 픽셀과 새 자식 HWND paint가 섞일 수 있었다.
+- 공용 컨테이너와 메인·대시보드·활동 화면의 resize background redraw를 복구했다. 창 이동/크기 변경 구간에는 MainForm과 content host 레이아웃을 보류하고 대시보드·활동·설정·검수의 수동 bounds/splitter 계산을 중단한 뒤, 종료 시 최종 크기로 한 번만 계산하고 전체 영역을 무효화한다. 정상 실행 중 전역 `WS_EX_COMPOSITED`는 사용하지 않는다.
+- 강화한 Phase08 UI truthfulness는 설정 화면에서 12단계 연속 크기 변경 동안 자식 bounds 계산 0회, 종료 뒤 정확히 1회, 공개 뒤 컨트롤 추가 0건, 정상 상태의 layered/composited style 0을 검증해 PASS했다. opt-in paint/layout/resize 진단 trace도 유지한다.
+- strict Release build는 8개 프로젝트 경고/오류 0/0이고 전체 오프라인 회귀는 80/80 PASS다. 이번 UI 파일 범위의 `dotnet format --verify-no-changes`와 `git diff --check`는 PASS했다. 솔루션 전체 format verify는 이번 변경 밖의 기존 `native/RimWorldTranslatorNative.cs` 및 기존 테스트 서식 때문에 실패했으며 해당 사용자 소유 파일은 수정하지 않았다.
+- 교정 실행본은 `artifacts/local-builds/RimWorldAiTranslator-window-move-fix/RimWorldAiTranslator.exe`, 163,700,002 bytes, SHA-256 `C00552652EB111A343328B1F78BA514470DAC31A029B74A2819A464096889FE2`다. commit·push·PR·tag·Release·asset·ZIP·외부 배포는 수행하지 않았다.
+
+## 2026-07-15 - AI 번역 처리량 회복
+
+- 현재 번역 경로를 다시 추적해 Cerebras의 고정 5 RPM·30,000 input TPM·일 1,000,000 token 제한, 완전 직렬 배치, 프로토콜 오류의 동일 요청 4회 재시도 후 광범위한 `catch (Exception)` 분할, 배치마다 누적 JSON/CSV 전체 체크포인트 저장을 실제 병목으로 확인했다.
+- Cerebras의 추측성 고정 제한을 제거하고 HTTP 429의 `Retry-After`를 최대 5분 범위에서 단조 시간으로 적용한다. 헤더가 없으면 해당 키만 15초 냉각하며 다른 키를 우선 사용한다. timeout·네트워크·HTTP 408/429/5xx만 API 내부 재시도하고 400/401/403과 내부 상태·프로그래밍 오류는 즉시 전파한다. 실행당 2,000회 요청 예산은 그대로 유지한다.
+- 앱 번역은 최대 2배치를 동시에 요청한다. 결과 반영과 체크포인트는 원래 배치 순서를 유지하고, 오류·취소 시 나머지 동시 요청을 취소한다. Google 무키 경로는 항목별 공개 endpoint 특성 때문에 직렬로 유지한다.
+- 전용 `ProviderProtocolException`과 error code를 도입해 malformed JSON, 응답 구조, 중복·누락·예상 외 ID, 요청·응답 크기를 구분한다. 프로토콜 오류만 배치 분할하며 유효한 부분 응답은 보존하고 누락 ID만 다시 요청한다. NullReference와 요청 예산·취소는 재시도나 분할로 변환하지 않는다. Google 배열/segment 구조도 같은 전용 오류로 정규화하고 예상된 전송·프로토콜 오류만 원문 유지로 처리한다.
+- 전체 체크포인트는 시작, 4배치 또는 15초 간격, 완료에 기록하며 취소·실패 시 현재 완료 지점을 즉시 기록한다. 6개 합성 배치는 기존 시작+매 배치+완료 8회 대신 3회만 전체 저장했다.
+- 합성 제공자 회귀에서 활성 요청 최대값 2, 부분 응답 뒤 재요청 ID 수 2→1, synthetic NullReference 요청 1회, 병렬 취소 요청 2회 후 추가 요청 0, 429 Retry-After 누적 대기 3초 이상, 408/429/5xx·timeout·network 재시도와 400/401/403 즉시 실패를 검증했다. 실제 외부 API와 실제 키는 사용하지 않았으므로 공급자 실측 처리량은 주장하지 않는다.
+- strict Release 솔루션 빌드는 8개 프로젝트 경고/오류 0/0, 전체 오프라인 회귀는 81/81 PASS다. 변경 범위 format verify와 `git diff --check`도 PASS했다. 기존 UI 미커밋 변경을 보존했고 commit·push·PR·tag·Release·asset·package·VERSION 변경·외부 배포는 수행하지 않았다.
+- 사용자 확인용 self-contained 실행본은 `artifacts/local-builds/RimWorldAiTranslator-translation-throughput-fix/RimWorldAiTranslator.exe`, 163,704,098 bytes, SHA-256 `0AA4329A9DCA40D49BF7E6A637EBCB7C63412E5A548E7E70A513414CEC04CE6D`다. 로컬 publish만 수행했으며 ZIP이나 배포 패키지는 만들지 않았다.
+
+## 2026-07-16 - 단일 API 키 동시 요청 및 누락 ID 번역 실패 회귀 복구
+
+- 사용자 화면의 번역 실패를 개인정보 제거 로그로 조사했다. 최신 실행은 40개 배치를 20개 이하로 반복 분할한 뒤 단일 항목 `InvalidOperationException`으로 종료됐고, 같은 시각에 두 배치의 요청과 재시도가 겹쳤다. 실제 응답 본문, API 키, 사용자 원문은 읽거나 기록하지 않았다.
+- `v0.1.0` PowerShell 안정판은 누락 ID를 배치 단위로 재요청하고 끝내 누락된 항목은 원문을 유지했다. 현재 C# 처리량 변경은 API 키가 하나여도 `MaxConcurrentBatches=2`를 그대로 적용했고, 단일 항목 응답의 ID가 누락되면 전체 실행을 실패시켰다.
+- 병렬 배치 수를 `min(설정값, 유효 API 키 수, 배치 수)`로 제한했다. 키 하나는 직렬로 요청하고 키가 둘 이상일 때만 제한 병렬 처리를 사용한다.
+- 공급자 응답의 누락 ID는 반환된 정상 번역을 보존한 채 누락 항목만 `MaxRetries` 범위에서 재요청한다. 단일 누락이 끝까지 반복되면 그 항목만 원문을 유지하고 경고하며, malformed JSON, 예상 외/중복 ID, 취소, 요청 예산 소진과 프로그래밍 오류의 기존 실패·전파 정책은 변경하지 않았다.
+- 수정 전 characterization 실행은 `Phase05.TranslationThroughputScheduling`의 단일 키 동시 요청 검사에서 실패해 80/81이었다. 수정 후 합성 전체 회귀는 81/81 PASS, strict Release 솔루션 빌드는 8개 프로젝트 경고 0/오류 0, 변경 파일 format verify와 `git diff --check`는 PASS했다. 실제 외부 API, 사용자 데이터, Workshop/RMK 원본은 테스트에 사용하지 않았다.
+- 사용자 확인용 실행본은 .NET 8 Desktop Runtime 의존 framework-dependent 단일 파일로 `artifacts/local-builds/RimWorldAiTranslator-translation-regression-fix/RimWorldAiTranslator.exe`에 생성했다. EXE는 2,265,357 bytes, SHA-256 `FF3F7509DDC7D8E150BDE384F68054F52CE91110324DA4F31048F07CD415BA56`이며 같은 폴더의 `rimworld-def-field-rules.txt`와 함께 사용한다. self-contained ZIP, Release, asset, VERSION, push, PR은 만들거나 변경하지 않았다.
+
+## 2026-07-16 - AI 번역 1.0 안정 동작 복원과 취소 원문 소실 수정
+
+- 실제 실패 로그와 현재 호출 경로를 대조해 API 키 파싱 실패가 아님을 확인했다. 두 키는 줄 단위로 정상 파싱됐지만 이후 추가된 병렬 배치 실행이 두 요청을 동시에 시작했고, 엄격한 protocol 분류와 누락-ID 재요청이 반복 분할로 이어졌다. 또한 UI가 내부 진행 메시지를 일반 `요청 한도 대기`로 치환해 실제 남은 대기 초와 재시도 진행이 보이지 않았다.
+- AI 번역 요청 경로만 PowerShell v1.0.0 안정판과 기존 C# 기준 동작으로 되돌렸다. 배치는 다시 완전 직렬 처리하고, 시작·매 완료 배치·완료 시 체크포인트를 기록하며, Cerebras 기본 제한은 키당 5 RPM·입력 30,000 TPM·일일 1,000,000토큰을 사용한다. 취소와 요청 한도 대기는 계속 취소 가능하다.
+- 후속 분류 작업의 `ProviderProtocolException`, 제한 병렬 배치, 주기식 체크포인트, adaptive 429 cooldown과 누락 ID 전용 재요청 정책을 번역 호출 경로에서 제거했다. 1.0처럼 malformed/incomplete 응답은 요청 재시도 후 배치를 반으로 나누며, 추가 응답 ID는 정상 기대 ID를 막지 않고 중복 ID는 마지막 값을 사용한다. API 키·원문·응답 본문 비노출과 bounded response는 유지했다.
+- 취소 체크포인트를 완료된 행만 가진 부분 프로젝트로 만들던 구조를 수정했다. 번역 시작 전에 검토 대상 전체 원문 행을 체크포인트에 넣고 완료 배치의 행만 제자리에서 번역 후보로 교체한다. 합성 7행 fixture에서 첫 배치 2행 완료 후 취소했을 때 완료 번역 2행과 미번역 원문 5행이 모두 남고, 재시작 시 완료 2행만 승계하며 나머지 5행만 번역하는 것을 확인했다.
+- 활동 로그는 내부 자유 텍스트를 그대로 노출하지 않고 안전한 숫자만 추출해 `Waiting 11.7s for API request/input-token limits.`처럼 실제 대기 시간을 표시한다. 번역 배치·재시도·대기 진행은 warning뿐 아니라 일반 진행도 로그에 남는다.
+- 최종 strict Release 솔루션 빌드는 8개 프로젝트 경고/오류 0/0이고 전체 합성 회귀는 80/80 PASS다. 변경 범위 whitespace format verify와 `git diff --check`도 PASS했다. 저장소 전체 format verify는 범위 밖 기존 `native/RimWorldTranslatorNative.cs` 등의 whitespace 부채 때문에 실패했으며 해당 파일은 변경하지 않았다.
+- 실행파일은 `src/RimWorldAiTranslator.App/bin/Release/net8.0-windows/RimWorldAiTranslator.exe`에 생성됐다. .NET 8 Desktop Runtime 의존 apphost이며 533,504 bytes이고 같은 출력 폴더의 DLL·데이터 파일과 함께 사용한다. 실제 외부 API, 실제 키와 사용자 작업 원본은 테스트에 사용하지 않았고 commit·push·PR·tag·Release·asset·package·VERSION 변경은 수행하지 않았다.
+
+## 2026-07-16 - 공급자 헤더 기반 호출 제한과 Gemini 진행률 복구
+
+- 고정 Cerebras 5 RPM·30,000 TPM·일일 1,000,000 token 값이 성공 응답에도 선제 대기를 만들고, 429에서 고정 60초 냉각과 일반 재시도 지연이 중복되는 경로를 확인했다. 프로필과 옵션의 고정 기본값은 0으로 내리고 legacy 필드는 호환성 때문에 남겼지만 런타임 제한 판단에는 사용하지 않는다.
+- 성공·실패 응답의 `Retry-After`, `x-ratelimit-remaining-*`, `x-ratelimit-reset-*` 및 일반 `ratelimit-*` 헤더를 대소문자와 무관하게 읽는다. 남은 요청·토큰이 0이고 reset을 알 수 있을 때만 다음 호출 시점을 늦추며, 헤더가 없으면 연속 성공 요청을 지연하지 않는다. 429는 `Retry-After`, reset header, 1·2·4초 지수 backoff 순으로 사용하고 일반 재시도 지연을 다시 더하지 않는다.
+- HTTP 408·429·5xx와 전송 timeout/network만 재시도하고 400·401·403은 원시 응답 본문 없이 즉시 실패하도록 분리했다. 전송 오류는 배치 분할하지 않고 malformed/incomplete JSON과 명시적 요청 크기 오류만 분할한다. 취소와 실행당 요청 예산은 wrapper나 항목별 원문 유지로 바꾸지 않고 그대로 전파한다.
+- 개인정보 제거 로그에는 과거 Gemini 실패의 HTTP 상태와 본문이 남지 않아 공급자 측 정확한 거부 코드는 사후 확정할 수 없었다. 다만 저장된 `gemini-2.5-flash` 요청이 `reasoning_effort`를 생략해 기본 thinking budget을 사용한 사실을 확인했다. 공식 OpenAI 호환 규칙에 맞춰 Gemini 2.5 Flash는 `none`, Gemini 3.5는 `low`를 보내고, HTTP 400은 모델/요청 형식 확인 안내를 표시하되 API key·URL credential·원시 응답은 노출하지 않는다.
+- AI 번역 진행은 배치 번호가 아니라 완료 항목 수를 전체 번역 대상 수에 매핑한다. 요청 재시도·rate-limit 대기·분할 중에도 동일한 전체 분모와 완료 수를 유지하고, 검수 상태줄과 로딩 overlay에 `완료 항목 / 전체 항목 · %`를 명시한다.
+- 합성 회귀는 헤더 없는 고정 RPM 무시, remaining=0과 compact reset `1m2s`, Retry-After 7초 정확 적용, headerless 429의 1·2초 backoff, 400/401/403 무재시도·본문 비노출, Gemini 2.5/3.5 reasoning 호환, 진행률 단조 증가와 100% 완료를 검증했다. 실제 외부 API나 실제 키는 사용하지 않았다.
+- strict Release 전체 솔루션 빌드는 8개 프로젝트 경고/오류 0/0이고 전체 오프라인 회귀는 81/81 PASS다. 변경 파일 범위 format verify와 `git diff --check`는 PASS했다. 저장소 전체 format verify는 범위 밖 기존 native/진단/테스트 whitespace 부채로 실패했으며 해당 사용자 소유 파일은 수정하지 않았다. commit·push·PR·tag·Release·asset·package·VERSION 변경·외부 배포는 수행하지 않았다.
+
+## 2026-07-16 - 로컬 공급자 오류 진단과 Gemini 모델 호환 복구
+
+- 실제 로컬 활동 로그를 읽기 전용으로 조사했다. 07:26 번역 실패는 `ProviderRequestException`과 안전한 stack만 남고 HTTP 상태·공급자 코드·요청 ID·오류 설명이 모두 빠져 사후 원인 판별이 불가능했다. 07:28 실행은 0→40→80 이상으로 진행됐으므로 키를 전혀 읽지 못한 상태는 아니었다. 기존 로그의 사용자 원문이나 키는 조사 결과에 복사하지 않았다.
+- HTTP 상태, 공급자 오류 코드, 공급자/모델 ID, 요청 ID는 개인정보가 아니므로 더 이상 버리지 않는다. 비성공 응답은 최대 64 KiB 안에서 JSON `error.status/code/message` 또는 bounded plain text만 추출하고, API 키·system prompt·배치 원문과 credential/path 패턴을 치환한 뒤 상세를 500자로 제한한다. 기본 UI와 로컬 활동 로그에는 이 정제된 진단이 표시되며 정상 응답·Authorization·원문 전체는 계속 기록하지 않는다.
+- Google 공식 모델·deprecation·OpenAI 호환 문서를 2026-07-16 기준으로 대조했다. 존재하지 않는 `gemini-3.5-pro`를 제거하고 일반 텍스트 Chat Completions에 맞는 `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, Gemini 2.5 Pro/Flash/Flash-Lite와 flash/pro latest alias를 선택 목록에 추가했다. 이미지·Live·TTS·embedding 전용 모델은 이 텍스트 번역 endpoint와 호환되지 않아 넣지 않았다.
+- Gemini 2.5 계열은 OpenAI 호환 계층에서 strict JSON Schema 대신 `json_object`를 사용하고 기존 parser가 translations 구조와 ID를 검증한다. 2.5 Flash/Flash-Lite는 공식 지원 값인 `reasoning_effort=none`으로 thinking을 끄고, thinking 비활성화가 허용되지 않는 2.5 Pro 및 Gemini 3 계열은 `low`를 유지한다.
+- 합성 회귀는 HTTP 400 `INVALID_ARGUMENT`, Google request ID와 정제된 공급자 설명이 UI/로그에 남고 API 키·원문이 남지 않는지 검증한다. 2.5의 `json_object`/`none`, 3.5의 JSON Schema/`low`, 전체 텍스트 모델 목록과 잘못된 3.5 Pro 제거도 고정했다. 전체 오프라인 회귀는 82/82 PASS, 변경 범위 format verify는 PASS다.
+- 실행 중인 사용자 앱(PID 7248)이 기본 Release DLL을 잠가 공식 출력 경로 strict build는 파일 잠금으로 실패했지만, 앱을 종료하지 않고 TEMP 출력으로 같은 strict Release 솔루션을 다시 빌드해 8개 프로젝트 경고/오류 0/0을 확인하고 임시 산출물을 제거했다. 실제 API 호출·사용자 데이터 수정·commit·push·PR·tag·Release·asset·package·VERSION 변경은 수행하지 않았다.
+- 사용자 요청에 따라 실행 중인 기존 앱을 종료하지 않고 `artifacts/local-builds/RimWorldAiTranslator-gemini-diagnostics-fix/`에 framework-dependent Release 실행본을 빌드했다. `RimWorldAiTranslator.exe`는 533,504 bytes, SHA-256 `D7F1019F91576178EB1A57244E52078BD785754E2AD42EFC80D4CB7388185396`이며 같은 폴더의 DLL·runtimeconfig·데이터 파일과 함께 사용한다. 경고/오류는 0/0이고 ZIP·Release·외부 배포는 만들지 않았다.
+
+## 2026-07-16 - 공급자 모델 목록 검증과 무료 등급 분리
+
+- 최신 로컬 활동 로그를 읽기 전용으로 조사했다. `gemini-2.5-flash` 실패는 키 파싱 문제가 아니라 신규 사용자에게 모델이 제공되지 않는다는 HTTP 404였고, `gemini-3-flash-preview` 실패는 실제 요청이 공급자에 도달한 뒤 무료 티어 20회 할당량을 소진한 HTTP 429였다. 실제 키나 사용자 원문은 기록하지 않았고 외부 API 요청도 보내지 않았다.
+- 2026-07-16 기준 공급자 공식 문서와 인증 없는 공개 Models API를 대조했다. Gemini 2.5와 변동형 latest alias, OpenRouter의 `~openai/gpt-latest`, 이전 GPT 별칭을 선택 목록에서 제거했다. Cerebras 공개 API의 `zai-glm-4.7`, Groq 프로덕션 모델, OpenRouter 무료 라우터와 현재 모델, Z.AI의 명시적 무료 Flash 모델을 추가·정리했다. 이미지·음성·embedding·전용 tool 모델은 번역용 Chat Completions 목록에서 제외했다.
+- 모델 메타데이터에 `무료`, `무료 티어`, `신규 무료 할당량`, `유료`를 도입했다. 설정 드롭다운은 무료 계열을 먼저 별도 표기하지만 실제 요청과 저장에는 장식 없는 정확한 모델 ID만 사용한다. 공급자 고정 목록은 편집할 수 없고 사용자 지정 공급자만 직접 모델명을 입력할 수 있다. Qwen의 신규 사용자 한도는 영구 무료로 오인하지 않도록 별도 등급으로 표시한다.
+- 저장된 구형·지원 종료 모델은 설정 파일을 열기만 할 때 수정하지 않고 메모리 draft에서 공급자 기본 모델로 대체하며 사용자에게 저장 시 반영된다고 알린다. 저장 후에만 교정 안내를 해제한다. Groq는 일부 모델만 strict JSON Schema를 지원하므로 모든 표시 모델에 공통으로 동작하는 JSON Object 모드로 맞췄다.
+- 모델 ID/표시 라벨 1:1 대응, 중복 0, 무료 우선 정렬, 기본 모델 유효성, Gemini 제거 목록, OpenRouter 무료 라우터, Z.AI 무료 모델과 Qwen 체험 할당량 분류를 회귀 테스트로 고정했다. strict Release 빌드는 8개 프로젝트 경고/오류 0/0, 전체 회귀는 첫 실행에서 범위 밖 동시 디렉터리 경쟁 테스트 1건이 일회성 실패한 뒤 동일 Release DLL 재실행에서 82/82 PASS, `--slow-bootstrap` UI 하네스와 변경 범위 format verify·`git diff --check`는 PASS했다. commit·push·PR·tag·Release·asset·package·VERSION 변경·외부 배포는 수행하지 않았다.
+- 사용자 확인용 framework-dependent Release 실행본은 `artifacts/local-builds/RimWorldAiTranslator-provider-model-catalog/`에 생성했다. apphost `RimWorldAiTranslator.exe`는 533,504 bytes, SHA-256 `D7F1019F91576178EB1A57244E52078BD785754E2AD42EFC80D4CB7388185396`이며 실제 변경 코드를 포함한 같은 폴더의 최종 `RimWorldAiTranslator.dll`은 788,992 bytes, SHA-256 `AD6DC693B71B7191DB57C7109637F57F5C9CBF1E748F5BEFD1880467D4DE5E2F`이다. EXE와 나머지 DLL·runtimeconfig·데이터 파일을 같은 폴더에 둔 채 실행한다.
+
+## 2026-07-16 - Gemini 503 과부하 안내와 오류 본문 정규화
+
+- 사용자 화면과 23:14 로컬 활동 로그를 읽기 전용으로 대조했다. `gemini-3.5-flash` 요청은 모델 ID나 키 오류가 아니라 공급자의 HTTP 503 `UNAVAILABLE`/high demand였고, 앱은 최초 요청 뒤 제한된 재시도를 수행한 뒤 실패했다. 실제 API 호출이나 설정 변경은 하지 않았다.
+- Gemini 오류 응답이 단일 원소 JSON 배열로 감싸진 경우 기존 파서가 `error.status/message`를 찾지 못하고 bounded JSON 전체를 진단 문자열로 사용했다. 단일 배열 wrapper를 정규화해 `UNAVAILABLE` 코드와 공급자의 짧은 메시지만 로컬 진단에 남기도록 수정했다.
+- 기본 UI는 408, 429, 5xx를 구분한다. 503에서는 공급자 원문이나 JSON을 붙이지 않고 “일시적 과부하/사용 불가”와 잠시 후 재시도 또는 다른 지원 모델 선택을 안내한다. 429는 호출 한도·무료 할당량 소진으로 안내하며 API 키나 URL 설정 오류로 오인시키지 않는다. 상세 공급자 메시지는 로컬 활동 로그에만 유지한다.
+- 429뿐 아니라 408/5xx 응답의 `Retry-After`도 우선 적용하고 같은 시도에 일반 재시도 지연을 중복하지 않는다. 헤더가 없는 503은 기존 제한된 재시도 후 사용자에게 제어를 돌려 무한 대기하지 않는다.
+- 합성 배열형 Gemini 503, `UNAVAILABLE` 추출, 기본 UI 원문 비노출, 503 `Retry-After` 9초 정확 적용을 회귀 테스트로 추가했다. strict Release 솔루션 빌드는 8개 프로젝트 경고/오류 0/0, 전체 회귀는 82/82 PASS, 변경 범위 format verify와 `git diff --check`도 PASS했다.
+
+## 2026-07-16 - v1.1.0 공개 패키지 준비
+
+- README, 릴리스 노트와 패키지 안내를 일반 사용자용 소개·주요 기능·다운로드·실행 방법·간단한 사용법·알려진 문제로 축약했다. VERSION, managed/native 파일 버전과 manifest를 `1.1.0`으로 일치시켰다.
+- 정식 SemVer 패키징을 허용하고 `glossary.generated.ko.json`을 publish 및 ZIP 허용 목록에 포함했다. 최종 ZIP에서 기본 용어집과 실행 파일을 포함한 정확한 15개 항목을 확인했다.
+- 전체 화면 시작 로딩창과 메인창의 제목 충돌로 package smoke가 로딩창 핸들을 메인창으로 오인하던 원인을 확인했다. 로딩창 제목을 `RimWorld AI Translator - 시작 중`으로 구분한 뒤 재실행했다.
+- strict Release 빌드 경고/오류 0/0, 전체 오프라인 회귀 82/82, tooling self-test 18/18, glossary self-test, slow-bootstrap 및 single-instance UI harness가 통과했다. 패키지 자체 restore/build/regression/publish/격리 cold·warm start/중복 실행/정상 종료 smoke도 PASS했다.
+- 생성 파일은 `dist/RimWorldAiTranslator-v1.1.0-win-x64.zip`(66,341,435 bytes, SHA-256 `3B87557754170040F4F7AF46391109986065E3FFE48A5DDE8DD0A36379B52613`)과 대응 manifest다. 저장소 전체 format verify는 기존 Native·진단·테스트 파일의 범위 밖 whitespace 부채로 실패했으며 자동 재서식하지 않았다.

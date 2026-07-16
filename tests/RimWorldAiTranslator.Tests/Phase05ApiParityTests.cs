@@ -2,6 +2,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using RimWorldAiTranslator.Core.Diagnostics;
 using RimWorldAiTranslator.Core.Models;
 using RimWorldAiTranslator.Core.Translation;
 
@@ -63,6 +64,8 @@ internal static partial class Program
             ("Phase05.ApiUrlAndTransport", Phase05ApiUrlAndTransport),
             ("Phase05.ApiValidationAndRetry", Phase05ApiValidationAndRetry),
             ("Phase05.ApiHttpErrorMatrix", Phase05ApiHttpErrorMatrix),
+            ("Phase05.ProviderErrorDiagnostics", Phase05ProviderErrorDiagnostics),
+            ("Phase05.HeaderDrivenRateLimitsAndGemini", Phase05HeaderDrivenRateLimitsAndGemini),
             ("Phase05.ApiConnectionAndEmptyRetry", Phase05ApiConnectionAndEmptyRetry),
             ("Phase05.BatchSplitAndFalseComplete", Phase05BatchSplitAndFalseComplete),
             ("Phase05.ApiResponseLimit", Phase05ApiResponseLimit),
@@ -175,9 +178,14 @@ internal static partial class Program
         AssertInvalidProviderData(structural, batch);
         AssertInvalidProviderData(nonObjectUsage, batch);
         AssertInvalidProviderData(nonStringDirectMap, batch);
-        AssertInvalidProviderData(duplicate, batch);
         AssertInvalidProviderData(missing, batch);
-        AssertInvalidProviderData(unexpected, batch);
+
+        var duplicateMap = TranslationPrompt.ParseResponse(duplicate, batch.Select(entry => entry.Id));
+        Assert(duplicateMap["id-1"] == "둘째" && duplicateMap["id-2"] == "셋째",
+            "The stable parser no longer accepts the provider's last value for a duplicate id.");
+        var unexpectedMap = TranslationPrompt.ParseResponse(unexpected, batch.Select(entry => entry.Id));
+        Assert(unexpectedMap["id-1"] == "첫째" && unexpectedMap["id-2"] == "둘째",
+            "An extra provider id caused valid expected translations to be rejected.");
 
         var handler = new SyntheticHttpHandler(
         [
@@ -186,20 +194,18 @@ internal static partial class Program
             () => SuccessResponse(structural),
             () => SuccessResponse(nonObjectUsage),
             () => SuccessResponse(nonStringDirectMap),
-            () => SuccessResponse(duplicate),
             () => SuccessResponse(missing),
-            () => SuccessResponse(unexpected),
             () => SuccessResponse(reordered)
         ]);
         using var client = CreateClient(handler);
         var result = client.TranslateOpenAiAsync(
-                CreateOptions("https://fixture.invalid", 9),
+                CreateOptions("https://fixture.invalid", 7),
                 batch,
                 "synthetic system prompt",
                 null,
                 CancellationToken.None)
             .GetAwaiter().GetResult();
-        Assert(handler.RequestUris.Count == 9, "Malformed, incomplete or over-complete model results were not retried within MaxRetries.");
+        Assert(handler.RequestUris.Count == 7, "Malformed or incomplete model results were not retried within MaxRetries.");
         Assert(result.Count == 2 && result["id-1"] == "첫째" && result["id-2"] == "둘째",
             "A complete reordered result was not accepted.");
 
@@ -218,16 +224,15 @@ internal static partial class Program
             "https://fixture.invalid",
             2,
             dailyTokenBudget: 5_000);
-        var budgetError = CaptureException<InvalidOperationException>(() => budgetClient.TranslateOpenAiAsync(
+        var budgetResult = budgetClient.TranslateOpenAiAsync(
                 budgetOptions,
                 batch,
                 "synthetic system prompt",
                 null,
                 CancellationToken.None)
-            .GetAwaiter().GetResult());
-        Assert(budgetHandler.RequestUris.Count == 1
-               && budgetError.Message.Contains("exhausted", StringComparison.OrdinalIgnoreCase),
-            "A malformed successful response was retried without charging its reported usage to the daily budget.");
+            .GetAwaiter().GetResult();
+        Assert(budgetHandler.RequestUris.Count == 2 && budgetResult["id-1"] == "첫째",
+            "A legacy fixed daily-token value blocked calls without a provider limit response.");
     }
 
     private static void Phase05ApiResponseLimit()
@@ -237,36 +242,30 @@ internal static partial class Program
             OversizedResponse
         ]);
         using var client = CreateClient(handler);
-        var error = CaptureException<InvalidOperationException>(() => client.TranslateOpenAiAsync(
+        var error = CaptureException<InvalidDataException>(() => client.TranslateOpenAiAsync(
                 CreateOptions("https://fixture.invalid", 1, maxResponseBytes: 64),
                 CreateBatch()[..1],
                 "synthetic system prompt",
                 null,
                 CancellationToken.None)
             .GetAwaiter().GetResult());
-        Assert(error.InnerException is InvalidDataException
-               && error.InnerException.Message.Contains("64 byte limit", StringComparison.Ordinal),
+        Assert(error.Message.Contains("64 byte limit", StringComparison.Ordinal),
             "An unknown-length oversized response did not fail explicitly at the configured byte cap.");
     }
 
     private static void Phase05ApiHttpErrorMatrix()
     {
-        var statuses = new[]
+        var retryableStatuses = new[]
         {
-            HttpStatusCode.BadRequest,
-            HttpStatusCode.Unauthorized,
-            HttpStatusCode.Forbidden,
             HttpStatusCode.RequestTimeout,
             HttpStatusCode.TooManyRequests,
             HttpStatusCode.InternalServerError,
             HttpStatusCode.BadGateway,
             HttpStatusCode.ServiceUnavailable
         };
-        foreach (var status in statuses)
+        foreach (var status in retryableStatuses)
         {
-            var rotatesKey = status is HttpStatusCode.Unauthorized
-                or HttpStatusCode.Forbidden
-                or HttpStatusCode.TooManyRequests;
+            var rotatesKey = status is HttpStatusCode.TooManyRequests;
             var handler = AssertProviderRetry(
                 $"HTTP {(int)status}",
                 () => StatusResponse(status),
@@ -279,6 +278,318 @@ internal static partial class Program
                     $"HTTP {(int)status} did not rotate away from the unavailable synthetic key.");
             }
         }
+
+        foreach (var status in new[] { HttpStatusCode.BadRequest, HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden })
+        {
+            const string rawBody = "SYNTHETIC_SECRET_PROVIDER_BODY";
+            var handler = new SyntheticHttpHandler(
+            [
+                () => new HttpResponseMessage(status)
+                {
+                    Content = new StringContent(rawBody, Encoding.UTF8, "text/plain")
+                },
+                () => SuccessResponse(ResponseWithContent(TranslationContent(("id-1", "should-not-run"))))
+            ]);
+            using var client = CreateClient(handler);
+            var error = CaptureException<ProviderRequestException>(() => client.TranslateOpenAiAsync(
+                    CreateOptions("https://fixture.invalid", 2),
+                    CreateBatch()[..1],
+                    "synthetic system prompt",
+                    null,
+                    CancellationToken.None)
+                .GetAwaiter().GetResult());
+            Assert(handler.RequestUris.Count == 1,
+                $"HTTP {(int)status} was retried even though the request must be corrected first.");
+            Assert(!error.Message.Contains(rawBody, StringComparison.Ordinal),
+                $"HTTP {(int)status} exposed the raw provider response body.");
+        }
+    }
+
+    private static void Phase05HeaderDrivenRateLimitsAndGemini()
+    {
+        var noHeaderHandler = new SyntheticHttpHandler(
+        [
+            () => SuccessResponse(ResponseWithContent(TranslationContent(("id-1", "first")))),
+            () => SuccessResponse(ResponseWithContent(TranslationContent(("id-1", "second"))))
+        ]);
+        var noHeaderDelays = new List<TimeSpan>();
+        using (var client = new TranslationApiClient(
+                   ["fixture-key-one"],
+                   noHeaderHandler,
+                   (delay, token) =>
+                   {
+                       token.ThrowIfCancellationRequested();
+                       noHeaderDelays.Add(delay);
+                       return Task.CompletedTask;
+                   }))
+        {
+            var options = CreateOptions("https://fixture.invalid", 1, requestsPerMinute: 1);
+            _ = client.TranslateOpenAiAsync(options, CreateBatch()[..1], "system", null, CancellationToken.None)
+                .GetAwaiter().GetResult();
+            _ = client.TranslateOpenAiAsync(options, CreateBatch()[..1], "system", null, CancellationToken.None)
+                .GetAwaiter().GetResult();
+        }
+        Assert(noHeaderDelays.Count == 0,
+            "A configured fixed RPM value delayed requests even though the provider sent no limit headers or 429.");
+
+        var timeProvider = new AdvancingTimeProvider();
+        var headerDelays = new List<TimeSpan>();
+        var headerHandler = new SyntheticHttpHandler(
+        [
+            () => ResponseWithRateHeaders(remaining: "0", reset: "1m2s"),
+            () => SuccessResponse(ResponseWithContent(TranslationContent(("id-1", "after-reset"))))
+        ]);
+        using (var client = CreateAdvancingClient(headerHandler, timeProvider, headerDelays))
+        {
+            var options = CreateOptions("https://fixture.invalid", 1);
+            _ = client.TranslateOpenAiAsync(options, CreateBatch()[..1], "system", null, CancellationToken.None)
+                .GetAwaiter().GetResult();
+            _ = client.TranslateOpenAiAsync(options, CreateBatch()[..1], "system", null, CancellationToken.None)
+                .GetAwaiter().GetResult();
+        }
+        Assert(headerDelays.Count == 1 && headerDelays[0] == TimeSpan.FromSeconds(62),
+            "A zero remaining-request header did not parse the provider's compact reset duration.");
+
+        timeProvider = new AdvancingTimeProvider();
+        var retryAfterDelays = new List<TimeSpan>();
+        var retryAfterHandler = new SyntheticHttpHandler(
+        [
+            () => ResponseWithRetryAfter(TimeSpan.FromSeconds(7)),
+            () => SuccessResponse(ResponseWithContent(TranslationContent(("id-1", "retry-after"))))
+        ]);
+        using (var client = CreateAdvancingClient(retryAfterHandler, timeProvider, retryAfterDelays))
+        {
+            var result = client.TranslateOpenAiAsync(
+                    CreateOptions("https://fixture.invalid", 2),
+                    CreateBatch()[..1],
+                    "system",
+                    null,
+                    CancellationToken.None)
+                .GetAwaiter().GetResult();
+            Assert(result["id-1"] == "retry-after", "The Retry-After fixture did not recover.");
+        }
+        Assert(retryAfterDelays.SequenceEqual([TimeSpan.FromSeconds(7)]),
+            "HTTP 429 did not honor Retry-After exactly or added a second generic retry delay.");
+
+        timeProvider = new AdvancingTimeProvider();
+        var unavailableDelays = new List<TimeSpan>();
+        var unavailableHandler = new SyntheticHttpHandler(
+        [
+            () => ResponseWithRetryAfter(TimeSpan.FromSeconds(9), HttpStatusCode.ServiceUnavailable),
+            () => SuccessResponse(ResponseWithContent(TranslationContent(("id-1", "after-overload"))))
+        ]);
+        using (var client = CreateAdvancingClient(unavailableHandler, timeProvider, unavailableDelays))
+        {
+            var result = client.TranslateOpenAiAsync(
+                    CreateOptions("https://fixture.invalid", 2),
+                    CreateBatch()[..1],
+                    "system",
+                    null,
+                    CancellationToken.None)
+                .GetAwaiter().GetResult();
+            Assert(result["id-1"] == "after-overload", "The temporary 503 fixture did not recover.");
+        }
+        Assert(unavailableDelays.SequenceEqual([TimeSpan.FromSeconds(9)]),
+            "HTTP 503 did not honor Retry-After exactly or added a second generic retry delay.");
+
+        timeProvider = new AdvancingTimeProvider();
+        var backoffDelays = new List<TimeSpan>();
+        var backoffHandler = new SyntheticHttpHandler(
+        [
+            () => StatusResponse(HttpStatusCode.TooManyRequests),
+            () => StatusResponse(HttpStatusCode.TooManyRequests),
+            () => SuccessResponse(ResponseWithContent(TranslationContent(("id-1", "backoff"))))
+        ]);
+        using (var client = CreateAdvancingClient(backoffHandler, timeProvider, backoffDelays))
+        {
+            _ = client.TranslateOpenAiAsync(
+                    CreateOptions("https://fixture.invalid", 3),
+                    CreateBatch()[..1],
+                    "system",
+                    null,
+                    CancellationToken.None)
+                .GetAwaiter().GetResult();
+        }
+        Assert(backoffDelays.SequenceEqual([TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)]),
+            "Headerless HTTP 429 responses did not use one exponential backoff sequence.");
+
+        var gemini = ApiProviderCatalog.Get("Gemini");
+        var gemini35 = CreateOptions(
+            "https://fixture.invalid",
+            1,
+            provider: gemini,
+            model: "gemini-3.5-flash",
+            reasoningEffort: gemini.ReasoningEffort);
+        var gemini35Body = TranslationPrompt.CreateRequestBody(gemini35, "system", "{}");
+        Assert(gemini35Body["reasoning_effort"]?.GetValue<string>() == "low",
+            "Gemini 3.5 Flash did not use the supported low reasoning level.");
+        Assert(gemini35Body["response_format"]?["type"]?.GetValue<string>() == "json_schema",
+            "Gemini 3.5 Flash lost strict structured output support.");
+
+        string[] expectedTextModels =
+        [
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview"
+        ];
+        Assert(gemini.Models.SequenceEqual(expectedTextModels, StringComparer.Ordinal),
+            "The Gemini selector did not match the active general text/chat model catalog.");
+        var removedModels = new[]
+        {
+            "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
+            "gemini-flash-latest", "gemini-pro-latest", "gemini-3.5-pro"
+        };
+        Assert(!gemini.Models.Intersect(removedModels, StringComparer.Ordinal).Any(),
+            "The Gemini selector still exposed a retired, unstable alias, or nonexistent model id.");
+
+        foreach (var profile in ApiProviderCatalog.All)
+        {
+            Assert(profile.Models.SequenceEqual(profile.ModelOptions.Select(option => option.Id), StringComparer.Ordinal),
+                $"{profile.Id} displayed a model label that did not map to its exact API id.");
+            Assert(profile.Models.Distinct(StringComparer.Ordinal).Count() == profile.Models.Count,
+                $"{profile.Id} contained a duplicate model id.");
+            Assert(profile.ModelOptions.Select(option => option.Access)
+                    .SequenceEqual(profile.ModelOptions.Select(option => option.Access).OrderBy(access => access)),
+                $"{profile.Id} did not list free/free-tier models before paid models.");
+            if (!profile.Id.Equals("Custom", StringComparison.OrdinalIgnoreCase))
+            {
+                Assert(profile.FindModel(profile.DefaultModel) is not null,
+                    $"{profile.Id} defaulted to a model outside its supported catalog.");
+            }
+        }
+
+        Assert(ApiProviderCatalog.Get("OpenRouter").ModelOptions[0] is
+        { Id: "openrouter/free", Access: ProviderModelAccess.Free },
+            "OpenRouter did not expose its free router separately from paid models.");
+        Assert(!ApiProviderCatalog.Get("OpenRouter").Models.Contains("~openai/gpt-latest", StringComparer.Ordinal),
+            "OpenRouter retained the unstable pseudo-model alias.");
+        Assert(ApiProviderCatalog.Get("ZAI").ModelOptions.Take(2)
+                .All(option => option.Access == ProviderModelAccess.Free),
+            "Z.AI free model variants were not separated from paid models.");
+        Assert(ApiProviderCatalog.Get("Qwen").ModelOptions
+                .All(option => option.Access == ProviderModelAccess.TrialCredit),
+            "Qwen's one-time new-user quota was mislabeled as a permanently free model.");
+    }
+
+    private static void Phase05ProviderErrorDiagnostics()
+    {
+        const string credential = "SYNTHETIC_GEMINI_KEY_4E91";
+        const string source = "SYNTHETIC_PRIVATE_SOURCE_37D8";
+        const string systemPrompt = "SYNTHETIC_PRIVATE_SYSTEM_8B12";
+        const string safeProviderDetail = "Unsupported field strict in response_format";
+        var responseBody = JsonSerializer.Serialize(new
+        {
+            error = new
+            {
+                code = 400,
+                message = $"{safeProviderDetail}; source={source}; key={credential}",
+                status = "INVALID_ARGUMENT"
+            }
+        });
+        var response = new HttpResponseMessage(HttpStatusCode.BadRequest)
+        {
+            Content = new StringContent(responseBody, Encoding.UTF8, "application/json")
+        };
+        response.Headers.TryAddWithoutValidation("x-goog-request-id", "request-abc-123");
+        var handler = new SyntheticHttpHandler([() => response]);
+        using var client = CreateClient(handler, [credential]);
+        var gemini = ApiProviderCatalog.Get("Gemini");
+        var options = CreateOptions(
+            "https://fixture.invalid",
+            1,
+            provider: gemini,
+            model: "gemini-3.5-flash",
+            reasoningEffort: gemini.ReasoningEffort);
+        var error = CaptureException<ProviderRequestException>(() => client.TranslateOpenAiAsync(
+                options,
+                [new SourceEntry { Id = "id-1", Key = "Synthetic.One", Kind = "Keyed", Text = source }],
+                systemPrompt,
+                null,
+                CancellationToken.None)
+            .GetAwaiter().GetResult());
+
+        Assert(error.StatusCode == HttpStatusCode.BadRequest
+               && error.Provider == "Gemini"
+               && error.Model == "gemini-3.5-flash"
+               && error.ErrorCode == "INVALID_ARGUMENT"
+               && error.RequestId == "request-abc-123"
+               && error.ProviderMessage.Contains(safeProviderDetail, StringComparison.Ordinal),
+            "The provider's structured diagnostic fields were discarded.");
+        Assert(!error.ProviderMessage.Contains(source, StringComparison.Ordinal)
+               && !error.ProviderMessage.Contains(credential, StringComparison.Ordinal),
+            "The provider diagnostic retained an API key or full source entry.");
+
+        var wrapped = new InvalidOperationException(
+            "synthetic wrapper",
+            new HttpRequestException("synthetic transport wrapper", error, HttpStatusCode.BadRequest));
+        var log = OperationErrorPresentation.CreateLogMessage("Gemini 번역", wrapped);
+        var user = OperationErrorPresentation.CreateUserDetail(wrapped);
+        foreach (var expected in new[]
+                 {
+                     "Provider=Gemini", "Model=gemini-3.5-flash", "HTTP=400",
+                     "Code=INVALID_ARGUMENT", "RequestId=request-abc-123", safeProviderDetail
+                 })
+        {
+            Assert(log.Contains(expected, StringComparison.Ordinal),
+                $"The local diagnostic log omitted '{expected}'.");
+        }
+        Assert(user.Contains("HTTP 400", StringComparison.Ordinal)
+               && user.Contains("INVALID_ARGUMENT", StringComparison.Ordinal)
+               && user.Contains("request-abc-123", StringComparison.Ordinal),
+            "The provider error UI omitted its actionable status, code, or request id.");
+        Assert(!log.Contains(source, StringComparison.Ordinal)
+               && !log.Contains(credential, StringComparison.Ordinal)
+               && !user.Contains(source, StringComparison.Ordinal)
+               && !user.Contains(credential, StringComparison.Ordinal),
+            "Provider diagnostics exposed an API key or full source entry.");
+
+        const string unavailableMessage = "This model is currently experiencing high demand. Please try again later.";
+        var unavailableBody = JsonSerializer.Serialize(new[]
+        {
+            new
+            {
+                error = new
+                {
+                    code = 503,
+                    message = unavailableMessage,
+                    status = "UNAVAILABLE"
+                }
+            }
+        });
+        var unavailableHandler = new SyntheticHttpHandler(
+        [
+            () => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+            {
+                Content = new StringContent(unavailableBody, Encoding.UTF8, "application/json")
+            }
+        ]);
+        using var unavailableClient = CreateClient(unavailableHandler, [credential]);
+        var unavailableError = CaptureException<InvalidOperationException>(() => unavailableClient.TranslateOpenAiAsync(
+                CreateOptions(
+                    "https://fixture.invalid",
+                    1,
+                    provider: gemini,
+                    model: "gemini-3.5-flash",
+                    reasoningEffort: gemini.ReasoningEffort),
+                [new SourceEntry { Id = "id-1", Key = "Synthetic.One", Kind = "Keyed", Text = source }],
+                systemPrompt,
+                null,
+                CancellationToken.None)
+            .GetAwaiter().GetResult());
+        var unavailableLog = OperationErrorPresentation.CreateLogMessage("Gemini 번역", unavailableError);
+        var unavailableUser = OperationErrorPresentation.CreateUserDetail(unavailableError);
+        Assert(unavailableLog.Contains("HTTP=503", StringComparison.Ordinal)
+               && unavailableLog.Contains("Code=UNAVAILABLE", StringComparison.Ordinal)
+               && unavailableLog.Contains(unavailableMessage, StringComparison.Ordinal)
+               && !unavailableLog.Contains("[{", StringComparison.Ordinal),
+            "The array-wrapped Gemini overload response was not normalized for local diagnostics.");
+        Assert(unavailableUser.Contains("일시적으로 과부하", StringComparison.Ordinal)
+               && unavailableUser.Contains("HTTP 503", StringComparison.Ordinal)
+               && unavailableUser.Contains("잠시 후 다시 시도", StringComparison.Ordinal)
+               && !unavailableUser.Contains(unavailableMessage, StringComparison.Ordinal)
+               && !unavailableUser.Contains("[{", StringComparison.Ordinal),
+            "The basic UI exposed the raw 503 provider body or omitted temporary-overload guidance.");
     }
 
     private static void Phase05ApiConnectionAndEmptyRetry()
@@ -351,8 +662,11 @@ internal static partial class Program
                    && checkpoint.GetProperty("completedBatches").GetInt32() == 1,
                 "A partially failed split batch was falsely marked complete or lost the last whole-batch checkpoint.");
             var rows = JsonSerializer.Deserialize<List<ReviewComparisonRow>>(File.ReadAllText(comparisonPath))!;
-            Assert(rows.Count == 2 && rows.Select(row => row.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2,
-                "The partial checkpoint lost or duplicated the previously completed batch.");
+            Assert(rows.Count == 7
+                   && rows.Select(row => row.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 7
+                   && rows.Count(row => !string.IsNullOrWhiteSpace(row.Candidate)) == 2
+                   && rows.All(row => !string.IsNullOrWhiteSpace(row.Source)),
+                "The failed run did not retain the completed batch together with every untranslated source row.");
             Assert(!ContainsFiles(Path.Combine(runRoot, "Languages")),
                 "A failed split batch committed partial language output.");
         });
@@ -465,32 +779,52 @@ internal static partial class Program
     private static TranslationApiClient CreateClient(HttpMessageHandler handler, IReadOnlyList<string> keys) =>
         new(keys, handler, static (_, _) => Task.CompletedTask);
 
+    private static TranslationApiClient CreateAdvancingClient(
+        HttpMessageHandler handler,
+        AdvancingTimeProvider timeProvider,
+        List<TimeSpan> delays) =>
+        new(
+            ["fixture-key-one"],
+            handler,
+            (delay, token) =>
+            {
+                token.ThrowIfCancellationRequested();
+                delays.Add(delay);
+                timeProvider.Advance(delay);
+                return Task.CompletedTask;
+            },
+            timeProvider);
+
     private static TranslationEngineOptions CreateOptions(
         string url,
         int maxRetries,
         int maxResponseBytes = TranslationEngineOptions.DefaultMaxResponseBytes,
         TimeSpan? timeout = null,
-        long dailyTokenBudget = 0) =>
+        long dailyTokenBudget = 0,
+        int requestsPerMinute = 0,
+        ApiProviderProfile? provider = null,
+        string model = "synthetic-model",
+        string reasoningEffort = "") =>
         new()
         {
             ModRoot = "synthetic-mod",
-            Provider = ApiProviderCatalog.Get("Custom"),
+            Provider = provider ?? ApiProviderCatalog.Get("Custom"),
             ProviderSettings = new ApiProviderSettings
             {
-                Name = "Synthetic",
+                Name = provider?.Name ?? "Synthetic",
                 Url = url,
-                Model = "synthetic-model",
+                Model = model,
                 Temperature = 0.1
             },
-            RequestsPerMinutePerKey = 0,
+            RequestsPerMinutePerKey = requestsPerMinute,
             InputTokensPerMinutePerKey = 0,
             DailyTokenBudgetPerKey = dailyTokenBudget,
             MaxRetries = maxRetries,
             MaxResponseBytes = maxResponseBytes,
             Timeout = timeout ?? TimeSpan.FromSeconds(2),
-            ResponseFormatMode = "JsonObject",
-            CompletionTokenParameter = "none",
-            ReasoningEffort = string.Empty
+            ResponseFormatMode = provider?.ResponseFormat ?? "JsonObject",
+            CompletionTokenParameter = provider?.TokenParameter ?? "none",
+            ReasoningEffort = reasoningEffort
         };
 
     private static SourceEntry[] CreateBatch() =>
@@ -528,6 +862,23 @@ internal static partial class Program
         {
             Content = new StringContent("synthetic provider error", Encoding.UTF8, "text/plain")
         };
+
+    private static HttpResponseMessage ResponseWithRateHeaders(string remaining, string reset)
+    {
+        var response = SuccessResponse(ResponseWithContent(TranslationContent(("id-1", "rate-header"))));
+        response.Headers.TryAddWithoutValidation("X-RateLimit-Remaining-Requests", remaining);
+        response.Headers.TryAddWithoutValidation("X-RateLimit-Reset-Requests", reset);
+        return response;
+    }
+
+    private static HttpResponseMessage ResponseWithRetryAfter(
+        TimeSpan delay,
+        HttpStatusCode status = HttpStatusCode.TooManyRequests)
+    {
+        var response = StatusResponse(status);
+        response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(delay);
+        return response;
+    }
 
     private static SyntheticHttpHandler AssertProviderRetry(
         string label,
@@ -612,6 +963,22 @@ internal static partial class Program
         }
     }
 
+    private sealed class AdvancingTimeProvider : TimeProvider
+    {
+        private long timestamp;
+        private DateTimeOffset utcNow = new(2026, 7, 16, 0, 0, 0, TimeSpan.Zero);
+
+        public override long TimestampFrequency => 1_000;
+        public override DateTimeOffset GetUtcNow() => utcNow;
+        public override long GetTimestamp() => timestamp;
+
+        public void Advance(TimeSpan duration)
+        {
+            timestamp += (long)Math.Ceiling(duration.TotalSeconds * TimestampFrequency);
+            utcNow += duration;
+        }
+    }
+
     private sealed class SplitFailureHandler : HttpMessageHandler
     {
         public int RequestCount { get; private set; }
@@ -637,7 +1004,7 @@ internal static partial class Program
             }
 
             return SuccessResponse(ResponseWithContent(TranslationContent(
-                ids.Select(id => (id, $"synthetic-{id}" )).ToArray())));
+                ids.Select(id => (id, $"synthetic-{id}")).ToArray())));
         }
     }
 }

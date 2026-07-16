@@ -344,7 +344,7 @@ public sealed partial class RimWorldModDiscoveryService
         var effectiveLeaf = Path.GetFileName(effectiveRoot);
         var workshopId = GetWorkshopId(fullModPath);
         var tag = !string.IsNullOrWhiteSpace(workshopId)
-            ? effectiveLeaf.Equals(folder, StringComparison.OrdinalIgnoreCase) ? $"W:{workshopId}" : $"W:{workshopId}\\{effectiveLeaf}"
+            ? effectiveLeaf.Equals(folder, StringComparison.OrdinalIgnoreCase) ? $"W:{workshopId}" : $"W:{workshopId} / {effectiveLeaf}"
             : source.Equals("Local", StringComparison.OrdinalIgnoreCase) ? "Local" : source;
         var displayName = name.Length > 44 ? name[..41] + "..." : name;
         var search = BuildBoundedSearch(name, folder, effectiveLeaf, packageId, workshopId, fullModPath, effectiveRoot);

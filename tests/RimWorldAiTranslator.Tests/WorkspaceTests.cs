@@ -38,6 +38,8 @@ internal static partial class Program
             Assert(info.Name == "Fixture Workshop Mod" && info.PackageId == "fixture.workshop", "About.xml metadata was not loaded.");
             Assert(info.Path == Path.GetFullPath(versionRoot), "Highest usable LoadFolders.xml content root was not selected.");
             Assert(info.WorkshopId == "1234567890", "Workshop id was not parsed.");
+            Assert(info.Display.EndsWith("[W:1234567890 / 1.6]", StringComparison.Ordinal),
+                "The versioned Workshop display tag must use a readable UI separator instead of a path separator.");
             var languages = service.GetSourceLanguageOptions(info.Path);
             Assert(languages.Count == 2 && languages[0].Folder == "English", "Source language choices were not ranked or counted.");
         });

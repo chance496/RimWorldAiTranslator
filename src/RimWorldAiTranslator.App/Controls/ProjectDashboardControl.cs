@@ -17,13 +17,17 @@ internal sealed class ProjectDashboardControl : UserControl
     private readonly Button chooseFolder;
     private readonly Button refresh;
     private readonly CommandToolTipService commandToolTips;
+    private readonly BufferedFlowLayoutPanel workflow;
+    private readonly Panel divider;
     private IReadOnlyList<RimWorldModInfo> mods = [];
     private IReadOnlyList<TranslationProject> projects = [];
     private IReadOnlyDictionary<string, ProjectCardStats> stats = new Dictionary<string, ProjectCardStats>();
     private bool dataInitialized;
     private bool renderingCards;
     private bool busy;
+    private bool windowResizeInProgress;
     private int renderedCardsWidth = -1;
+    private readonly Dictionary<Control, Action<int, int>> responsiveCardLayouts = [];
 
     public ProjectDashboardControl()
     {
@@ -46,7 +50,7 @@ internal sealed class ProjectDashboardControl : UserControl
         providerHint = FixedLabel("Cerebras 키 없음 · 설정에서 키 입력 가능", 760, 54, 380, 22, 8.1f, tag: "muted");
         providerHint.TextAlign = ContentAlignment.MiddleRight;
 
-        var workflow = new BufferedFlowLayoutPanel
+        workflow = new BufferedFlowLayoutPanel
         {
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
@@ -65,7 +69,7 @@ internal sealed class ProjectDashboardControl : UserControl
             workflow.Controls.Add(step);
         }
 
-        var divider = new Panel { Tag = "divider" };
+        divider = new Panel { Tag = "divider" };
         var searchLabel = FixedLabel("프로젝트 검색", 32, 166, 170, 20, 8.5f, FontStyle.Bold, "muted");
         search = Ui.TextBox("프로젝트 검색");
         search.Margin = Padding.Empty;
@@ -83,7 +87,7 @@ internal sealed class ProjectDashboardControl : UserControl
             AccessibleDescription = "새 번역 프로젝트를 만들 RimWorld 모드를 선택합니다.",
             TabIndex = 1
         };
-        create = Ui.Button("프로젝트 만들기", "primary", 126);
+        create = Ui.Button("프로젝트 생성", "primary", 126);
         create.Margin = Padding.Empty;
         create.AccessibleDescription = "선택한 모드와 원문 언어로 새 로컬 번역 프로젝트를 만듭니다.";
         create.TabIndex = 2;
@@ -131,13 +135,19 @@ internal sealed class ProjectDashboardControl : UserControl
             TabStop = false,
             TabIndex = 5
         };
-        cards.Resize += (_, _) => RenderCards();
+        cards.Resize += (_, _) =>
+        {
+            if (!windowResizeInProgress) ResizeExistingCards();
+        };
 
         Controls.AddRange([
             eyebrow, title, intro, providerStatus, providerHint, workflow, divider,
             searchLabel, search, modLabel, modPicker, create, chooseFolder, refresh, cards
         ]);
-        Resize += (_, _) => ResizeLayout(workflow, divider);
+        Resize += (_, _) =>
+        {
+            if (!windowResizeInProgress) ResizeLayout(workflow, divider);
+        };
         ResizeLayout(workflow, divider);
         ResumeLayout(false);
     }
@@ -235,6 +245,16 @@ internal sealed class ProjectDashboardControl : UserControl
 
     public void RefreshCommandToolTips() => commandToolTips.RefreshAll();
 
+    internal void SetWindowResizeInProgress(bool inProgress)
+    {
+        windowResizeInProgress = inProgress;
+        if (!inProgress)
+        {
+            ResizeLayout(workflow, divider);
+            ResizeExistingCards();
+        }
+    }
+
     internal string CommandToolTipTextForTesting(Control control) => commandToolTips.GetText(control);
     internal int CommandToolTipRegistrationCountForTesting(Control control) => commandToolTips.RegistrationCount(control);
     internal bool CommandToolTipFitsForTesting(Control control, int dpi, Size workingArea) =>
@@ -293,10 +313,11 @@ internal sealed class ProjectDashboardControl : UserControl
         {
             var previousCards = cards.Controls.Cast<Control>().ToArray();
             cards.Controls.Clear();
+            responsiveCardLayouts.Clear();
             foreach (var previousCard in previousCards) previousCard.Dispose();
             if (matching.Length == 0)
             {
-                cards.Controls.Add(CreateEmptyState(Math.Max(560, availableWidth - 24), projects.Count == 0));
+                cards.Controls.Add(CreateEmptyState(availableWidth, projects.Count == 0));
                 return;
             }
             foreach (var project in matching) cards.Controls.Add(CreateCard(project, cardWidth));
@@ -309,8 +330,31 @@ internal sealed class ProjectDashboardControl : UserControl
         }
     }
 
-    private Control CreateEmptyState(int width, bool noProjects)
+    private void ResizeExistingCards()
     {
+        if (!dataInitialized || renderingCards || cards.ClientSize.Width <= 0) return;
+        if (renderedCardsWidth == cards.ClientSize.Width) return;
+
+        renderedCardsWidth = cards.ClientSize.Width;
+        var availableWidth = Math.Max(320, cards.ClientSize.Width - 20);
+        var columns = Math.Clamp(availableWidth / 360, 1, 4);
+        var cardWidth = Math.Clamp(availableWidth / columns - 20, 320, 440);
+        cards.SuspendLayout();
+        try
+        {
+            foreach (var control in cards.Controls.Cast<Control>())
+                if (responsiveCardLayouts.TryGetValue(control, out var layout))
+                    layout(availableWidth, cardWidth);
+        }
+        finally
+        {
+            cards.ResumeLayout(true);
+        }
+    }
+
+    private Control CreateEmptyState(int availableWidth, bool noProjects)
+    {
+        var width = Math.Max(560, availableWidth - 24);
         var panel = new BufferedPanel
         {
             Size = new Size(width, 248),
@@ -350,6 +394,15 @@ internal sealed class ProjectDashboardControl : UserControl
             UiCommand.ChooseProjectFolder,
             () => busy ? "현재 작업이 실행 중이라 사용할 수 없습니다." : null);
         panel.Controls.AddRange([radar, title, body, status, start, find]);
+        responsiveCardLayouts[panel] = (newAvailableWidth, _) =>
+        {
+            var newWidth = Math.Max(560, newAvailableWidth - 24);
+            if (panel.Width != newWidth) panel.Width = newWidth;
+            var textWidth = Math.Max(280, newWidth - 250);
+            title.Width = textWidth;
+            body.Width = textWidth;
+            status.Width = textWidth;
+        };
         return panel;
     }
 
@@ -429,6 +482,24 @@ internal sealed class ProjectDashboardControl : UserControl
             control.Click += (_, _) => OpenProjectRequested?.Invoke(this, project);
         }
         card.Controls.AddRange([accent, name, meta, total, coverage, pending, updated, track, recent, delete, open]);
+        responsiveCardLayouts[card] = (_, newWidth) =>
+        {
+            if (card.Width != newWidth) card.Width = newWidth;
+            var newInnerWidth = newWidth - 44;
+            accent.Height = card.Height - 2;
+            name.Width = newInnerWidth;
+            meta.Width = newInnerWidth;
+            coverage.Width = Math.Max(140, newWidth - 176);
+            updated.Width = Math.Max(140, newWidth - 176);
+            track.Width = newInnerWidth;
+            var newFillWidth = current.Total > 0
+                ? (int)Math.Round(newInnerWidth * (current.Translated + current.Approved) / (double)current.Total)
+                : 0;
+            if (track.Controls.Count > 0) track.Controls[0].Width = Math.Clamp(newFillWidth, 0, newInnerWidth);
+            recent.Width = Math.Max(110, newWidth - 218);
+            delete.Left = newWidth - 184;
+            open.Left = newWidth - 106;
+        };
         return card;
     }
 
@@ -461,7 +532,11 @@ internal sealed class ProjectDashboardControl : UserControl
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) commandToolTips?.Dispose();
+        if (disposing)
+        {
+            responsiveCardLayouts.Clear();
+            commandToolTips?.Dispose();
+        }
         base.Dispose(disposing);
     }
 

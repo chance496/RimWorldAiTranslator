@@ -58,6 +58,24 @@ internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
     }
 }
 
+internal sealed class BufferedListBox : ListBox
+{
+    public BufferedListBox()
+    {
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+    }
+}
+
+internal sealed class BufferedListView : ListView
+{
+    public BufferedListView()
+    {
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+    }
+}
+
 internal sealed class LayoutSplitContainer : SplitContainer
 {
     public LayoutSplitContainer()
@@ -229,7 +247,7 @@ internal sealed class LoadingOverlay : BufferedPanel
         {
             var boundedCurrent = Math.Clamp(current, 0, total);
             var percent = Math.Clamp((int)Math.Round(boundedCurrent * 100d / total), 0, 100);
-            count.Text = $"{boundedCurrent:N0} / {total:N0} 배치  ·  {percent}%";
+            count.Text = $"{boundedCurrent:N0} / {total:N0} 항목  ·  {percent}%";
             progress.Style = ProgressBarStyle.Continuous;
             progress.MarqueeAnimationSpeed = 0;
             progress.Minimum = 0;

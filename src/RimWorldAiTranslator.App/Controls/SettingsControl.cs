@@ -37,6 +37,7 @@ internal sealed class SettingsControl : UserControl
     private readonly Func<string, bool> directoryExists;
     private readonly Dictionary<string, ApiProviderSettings> providerDrafts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> apiKeyDrafts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> replacedUnsupportedModelProviders = new(StringComparer.OrdinalIgnoreCase);
     private readonly ComboBox provider;
     private readonly Dictionary<string, Button> providerButtons = new(StringComparer.OrdinalIgnoreCase);
     private readonly FlowLayoutPanel providerList;
@@ -86,6 +87,9 @@ internal sealed class SettingsControl : UserControl
     private long rmkReferenceRevision;
     private int rmkReferenceAsyncUiApplicationCount;
     private bool providerSaveBlocked;
+    private bool windowResizeInProgress;
+    private bool windowResizePending;
+    private int resizeLayoutPassCount;
 
     public SettingsControl(
         AppServices services,
@@ -108,8 +112,10 @@ internal sealed class SettingsControl : UserControl
         Dock = DockStyle.Fill;
         TabStop = false;
         AutoScroll = true;
-        AutoScaleDimensions = new SizeF(96F, 96F);
-        AutoScaleMode = AutoScaleMode.Dpi;
+        // Every child bound in this control is recalculated by ResizeLayout.
+        // DPI autoscaling those bounds first leaves a mixture of scaled child
+        // coordinates and unscaled panel bounds at 125% and above.
+        AutoScaleMode = AutoScaleMode.None;
 
         var heading = FixedLabel("설정", 24, 20, 180, 30, 14f, FontStyle.Bold);
         apiPanel = new Panel();
@@ -201,10 +207,10 @@ internal sealed class SettingsControl : UserControl
         };
         url.Leave += (_, _) => Save(false);
         var modelLabel = FixedLabel("모델", 0, 234, 100, 20, 8.3f, FontStyle.Bold, "muted");
-        model = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, IntegralHeight = false, MaxDropDownItems = 12, Font = new Font("Malgun Gothic", 9.5f) };
+        model = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, DropDownWidth = 460, IntegralHeight = false, MaxDropDownItems = 12, Font = new Font("Malgun Gothic", 9.5f) };
         model.SetBounds(0, 256, 300, 30);
         model.AccessibleName = "번역 모델";
-        model.AccessibleDescription = "선택한 공급자에서 사용할 모델 이름입니다.";
+        model.AccessibleDescription = "선택한 공급자에서 현재 지원하는 모델입니다. 무료 여부와 실제 API 모델 ID를 함께 표시합니다.";
         model.TabIndex = 4;
         model.TextChanged += (_, _) => ValidateProvider();
         model.Leave += (_, _) => Save(false);
@@ -371,6 +377,11 @@ internal sealed class SettingsControl : UserControl
         Controls.AddRange([heading, apiPanel, appearancePanel, rmkPanel]);
         Resize += (_, _) =>
         {
+            if (windowResizeInProgress)
+            {
+                windowResizePending = true;
+                return;
+            }
             heading.Height = DeviceDpi > 96 ? 36 : 30;
             ResizeLayout();
         };
@@ -382,6 +393,25 @@ internal sealed class SettingsControl : UserControl
     public event EventHandler? SettingsSaved;
     public event EventHandler? AppearanceChanged;
     public event EventHandler? DiagnosticsRequested;
+    internal int ResizeLayoutPassCountForTesting => resizeLayoutPassCount;
+
+    internal void SetWindowResizeInProgress(bool inProgress)
+    {
+        windowResizeInProgress = inProgress;
+        if (inProgress)
+        {
+            windowResizePending = false;
+            return;
+        }
+
+        if (windowResizePending && !disposed && !IsDisposed)
+        {
+            SuspendLayout();
+            try { ResizeLayout(); }
+            finally { ResumeLayout(true); }
+        }
+        windowResizePending = false;
+    }
 
     public TranslationProviderSelection GetSelection()
     {
@@ -417,6 +447,7 @@ internal sealed class SettingsControl : UserControl
             unsafeEndpointRemovedOnLoad = false;
             unsafeExtensionDataRemovedOnLoad = services.StoredSettingsCredentialCorrectionRequired;
             providerDrafts.Clear();
+            replacedUnsupportedModelProviders.Clear();
             foreach (var pair in services.Settings.ApiProviders)
             {
                 var draft = CloneProviderSettings(pair.Value);
@@ -428,6 +459,15 @@ internal sealed class SettingsControl : UserControl
                 {
                     draft.Url = string.Empty;
                     unsafeEndpointRemovedOnLoad = true;
+                }
+                var profile = ApiProviderCatalog.All.FirstOrDefault(
+                    item => item.Id.Equals(pair.Key, StringComparison.OrdinalIgnoreCase));
+                if (profile is { ModelOptions.Count: > 0 }
+                    && !profile.Id.Equals("Custom", StringComparison.OrdinalIgnoreCase)
+                    && profile.FindModel(draft.Model) is null)
+                {
+                    draft.Model = profile.DefaultModel;
+                    replacedUnsupportedModelProviders.Add(profile.Id);
                 }
                 providerDrafts[pair.Key] = draft;
             }
@@ -469,16 +509,26 @@ internal sealed class SettingsControl : UserControl
         loading = true;
         try
         {
+            var isCustom = profile.Id.Equals("Custom", StringComparison.OrdinalIgnoreCase);
             keys.Text = profile.NeedsKey && apiKeyDrafts.TryGetValue(profile.Id, out var saved) ? saved : string.Empty;
             keys.Enabled = profile.NeedsKey;
             url.Text = settings.Url;
             model.Items.Clear();
-            foreach (var value in profile.Models) model.Items.Add(value);
-            model.Text = settings.Model;
+            model.DropDownStyle = isCustom ? ComboBoxStyle.DropDown : ComboBoxStyle.DropDownList;
+            foreach (var value in profile.ModelOptions) model.Items.Add(value);
+            if (isCustom)
+            {
+                model.Text = settings.Model;
+            }
+            else
+            {
+                var selectedModel = profile.FindModel(settings.Model) ?? profile.FindModel(profile.DefaultModel);
+                model.SelectedItem = selectedModel;
+                settings.Model = selectedModel?.Id ?? profile.DefaultModel;
+            }
             temperature.Text = settings.Temperature < 0
                 ? "모델 기본값"
                 : settings.Temperature.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
-            var isCustom = profile.Id.Equals("Custom", StringComparison.OrdinalIgnoreCase);
             var displayName = GetProviderDisplayName(profile, settings);
             providerTitle.Text = displayName;
             providerTitle.Visible = !isCustom;
@@ -516,7 +566,7 @@ internal sealed class SettingsControl : UserControl
             settings.Name = profile.Name;
         }
         settings.Url = url.Text.Trim();
-        settings.Model = model.Text.Trim();
+        settings.Model = GetSelectedModelId();
         settings.Temperature = ParseTemperature();
         UpdateProviderButtons(currentProviderId);
     }
@@ -531,7 +581,7 @@ internal sealed class SettingsControl : UserControl
         {
             Name = profile.Id.Equals("Custom", StringComparison.OrdinalIgnoreCase) ? providerName.Text.Trim() : profile.Name,
             Url = url.Text.Trim(),
-            Model = model.Text.Trim(),
+            Model = GetSelectedModelId(),
             Temperature = ParseTemperature()
         };
         var keyCount = profile.NeedsKey ? ProviderValidator.SplitKeys(keys.Text).Count : 0;
@@ -551,10 +601,32 @@ internal sealed class SettingsControl : UserControl
             ? "사용자 지정 공급자 표시 이름을 1자 이상 입력하세요."
             : !draftsValid
             ? "공급자 설정을 수정해야 저장할 수 있습니다: " + string.Join(", ", draftErrors.Distinct(StringComparer.Ordinal))
+            : replacedUnsupportedModelProviders.Contains(profile.Id)
+            ? $"저장된 모델은 현재 지원 목록에 없어 {profile.DefaultModel}(으)로 대체했습니다. 설정을 저장하면 반영됩니다.\r\n"
+              + GetSelectedModelAccessNotice(profile)
             : result.Valid
-            ? profile.NeedsKey ? $"사용 가능한 키 {result.KeyCount:N0}개 · {profile.Description}" : profile.Description
+            ? profile.NeedsKey
+                ? $"사용 가능한 키 {result.KeyCount:N0}개 · {GetSelectedModelAccessNotice(profile)} · {profile.Description}"
+                : $"{GetSelectedModelAccessNotice(profile)} · {profile.Description}"
             : string.Join(" · ", result.ErrorCodes);
         providerNotice.AccessibleDescription = providerNotice.Text;
+    }
+
+    private string GetSelectedModelId() => model.SelectedItem is ProviderModelOption option
+        ? option.Id
+        : model.Text.Trim();
+
+    private string GetSelectedModelAccessNotice(ApiProviderProfile profile)
+    {
+        var option = profile.FindModel(GetSelectedModelId());
+        if (option is null) return "사용자 지정 모델";
+        return option.Access switch
+        {
+            ProviderModelAccess.Free => "무료 모델",
+            ProviderModelAccess.FreeTier => "무료 티어 제공 모델 (호출 한도 적용)",
+            ProviderModelAccess.TrialCredit => "신규 사용자 무료 할당량 이후 유료",
+            _ => "유료 모델"
+        };
     }
 
     private double ParseTemperature() => temperature.Text.Equals("모델 기본값", StringComparison.OrdinalIgnoreCase)
@@ -771,6 +843,7 @@ internal sealed class SettingsControl : UserControl
 
         if (cancellationToken.IsCancellationRequested || disposed || sequence != settingsSaveSequence) return;
         unsafeExtensionDataRemovedOnLoad = services.StoredSettingsCredentialCorrectionRequired;
+        replacedUnsupportedModelProviders.Clear();
         ValidateProvider();
         var notifyAppearanceChanged = appearanceChangePending;
         appearanceChangePending = false;
@@ -809,6 +882,7 @@ internal sealed class SettingsControl : UserControl
 
     private void ResizeLayout()
     {
+        resizeLayoutPassCount++;
         var width = ClientSize.Width;
         var inner = Math.Max(620, width - 56);
         if (width >= 1080)
@@ -1074,8 +1148,21 @@ internal sealed class SettingsControl : UserControl
         var profile = ApiProviderCatalog.All.First(
             item => item.Id.Equals(providerId, StringComparison.OrdinalIgnoreCase));
         if (!ReferenceEquals(provider.SelectedItem, profile)) provider.SelectedItem = profile;
-        model.Text = value;
+        var option = profile.FindModel(value);
+        if (option is not null) model.SelectedItem = option;
+        else if (profile.Id.Equals("Custom", StringComparison.OrdinalIgnoreCase)) model.Text = value;
     }
+
+    internal IReadOnlyList<string> ProviderModelLabelsForTesting(string providerId)
+    {
+        var profile = ApiProviderCatalog.Get(providerId);
+        if (!ReferenceEquals(provider.SelectedItem, profile)) provider.SelectedItem = profile;
+        return model.Items.Cast<object>().Select(Convert.ToString).Where(value => value is not null).Cast<string>().ToArray();
+    }
+
+    internal string SelectedProviderModelForTesting => GetSelectedModelId();
+
+    internal bool UsesCuratedModelListForTesting => model.DropDownStyle == ComboBoxStyle.DropDownList;
 
     internal void SetApiKeysForTesting(string providerId, string value)
     {

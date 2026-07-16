@@ -63,10 +63,18 @@ internal static class SelfTest
 
     private static void PackageLayoutExactAllowlist()
     {
+        var stableVersion = SemanticVersion.Parse("1.1.0");
+        Assert(stableVersion.Prerelease is null && stableVersion.NumericFileVersion == "1.1.0.0",
+            "Stable SemVer must be accepted for public release packaging.");
+        var candidateVersion = SemanticVersion.Parse("1.1.0-rc.1");
+        Assert(candidateVersion.Prerelease == "rc.1",
+            "Prerelease SemVer must remain accepted for local candidate packaging.");
+
         string[] expectedRuntimeFiles =
         [
             PackageLayout.ApplicationFileName,
-            "rimworld-def-field-rules.txt"
+            "rimworld-def-field-rules.txt",
+            "glossary.generated.ko.json"
         ];
         string[] expectedDocumentationFiles =
         [
@@ -93,8 +101,8 @@ internal static class SelfTest
             "Package documentation files differ from the exact public-RC allowlist.");
         Assert(PackageLayout.AllFiles.SetEquals(expectedAllFiles),
             "Combined package files differ from the exact public-RC allowlist.");
-        Assert(!PackageLayout.AllFiles.Contains("glossary.generated.ko.json"),
-            "The rights-blocked generated glossary remained in the distribution allowlist.");
+        Assert(PackageLayout.RuntimeFiles.Contains("glossary.generated.ko.json"),
+            "The built-in glossary must be included in the public package runtime files.");
     }
 
     private static void OwnedPackageProcessWorkspace()

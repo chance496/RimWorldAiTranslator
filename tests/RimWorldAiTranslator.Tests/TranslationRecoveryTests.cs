@@ -33,7 +33,7 @@ internal static partial class Program
             Assert(cancellationError is OperationCanceledException
                    && cancellationError.CheckpointPersisted
                    && cancellationError.PartialResult.Cancelled
-                   && cancellationError.PartialResult.Rows.Count == 2
+                   && cancellationError.PartialResult.Rows.Count == 7
                    && cancellationError.PartialResult.TranslatedEntries == 2
                    && cancellationError.PartialResult.WrittenFiles.Count == 0,
                 "Cancellation did not expose the safe partial review result through the compatible exception contract.");
@@ -51,7 +51,11 @@ internal static partial class Program
             }
             var comparisonPath = Directory.EnumerateFiles(auditRoot, "*-comparison.json").Single();
             var partialRows = JsonSerializer.Deserialize<List<ReviewComparisonRow>>(File.ReadAllText(comparisonPath))!;
-            Assert(partialRows.Count == 2 && partialRows.All(row => !string.IsNullOrWhiteSpace(row.Candidate)), "Cancelled checkpoint did not preserve exactly one translated batch.");
+            Assert(partialRows.Count == 7
+                   && partialRows.Count(row => !string.IsNullOrWhiteSpace(row.Candidate)) == 2
+                   && partialRows.Count(row => string.IsNullOrWhiteSpace(row.Candidate)) == 5
+                   && partialRows.All(row => !string.IsNullOrWhiteSpace(row.Source)),
+                "Cancelled checkpoint did not preserve the completed batch together with every untranslated source row.");
             Assert(Path.GetFullPath(comparisonPath).Equals(Path.GetFullPath(cancellationError.PartialResult.ComparisonFile!), StringComparison.OrdinalIgnoreCase),
                 "Cancellation result did not identify its persisted comparison checkpoint.");
             var sourceKoreanRoot = Path.Combine(modRoot, "Languages", "Korean");
@@ -63,21 +67,23 @@ internal static partial class Program
             {
                 version = 2,
                 languageRoot = partialLanguageRoot,
-                items = partialRows.Select(row => new
-                {
-                    key = row.Key,
-                    kind = row.Kind,
-                    defClass = row.DefClass,
-                    @namespace = row.Kind == "Keyed" ? "Keyed" : row.DefClass,
-                    target = Path.GetRelativePath(partialLanguageRoot, row.Target),
-                    text = row.Candidate,
-                    origin = "ai",
-                    translationUpdatedAt = string.Empty,
-                    sourceChanged = false,
-                    sourceHash = RecoverySourceHash(row.Source),
-                    sourceText = row.Source,
-                    previousSourceText = string.Empty
-                }).ToArray()
+                items = partialRows
+                    .Where(row => !string.IsNullOrWhiteSpace(row.Candidate))
+                    .Select(row => new
+                    {
+                        key = row.Key,
+                        kind = row.Kind,
+                        defClass = row.DefClass,
+                        @namespace = row.Kind == "Keyed" ? "Keyed" : row.DefClass,
+                        target = Path.GetRelativePath(partialLanguageRoot, row.Target),
+                        text = row.Candidate,
+                        origin = "ai",
+                        translationUpdatedAt = string.Empty,
+                        sourceChanged = false,
+                        sourceHash = RecoverySourceHash(row.Source),
+                        sourceText = row.Source,
+                        previousSourceText = string.Empty
+                    }).ToArray()
             };
             File.WriteAllText(preservePath, JsonSerializer.Serialize(preserve), new UTF8Encoding(false));
 
@@ -366,32 +372,32 @@ internal static partial class Program
         string reviewRoot,
         string preservePath = "",
         bool translateMissingOnly = false) => new()
-    {
-        ModRoot = modRoot,
-        ApiKeys = ["test-key"],
-        SourceLanguageFolder = "English",
-        ReviewOnly = true,
-        ReviewRoot = reviewRoot,
-        BatchSize = 2,
-        MaxInputCharactersPerBatch = 100_000,
-        MaxInputTokensPerBatch = 100_000,
-        RequestsPerMinutePerKey = 0,
-        InputTokensPerMinutePerKey = 0,
-        DailyTokenBudgetPerKey = 0,
-        MaxRetries = 1,
-        Timeout = TimeSpan.FromSeconds(30),
-        AllowInsecureLoopback = true,
-        PreserveTranslationFile = preservePath,
-        TranslateMissingOnly = translateMissingOnly,
-        Provider = ApiProviderCatalog.Get("Custom"),
-        ProviderSettings = new ApiProviderSettings
         {
-            Name = "Loopback Fixture",
-            Url = "http://127.0.0.1:12345/v1/chat/completions",
-            Model = "fixture-model",
-            Temperature = 0.1
-        }
-    };
+            ModRoot = modRoot,
+            ApiKeys = ["test-key"],
+            SourceLanguageFolder = "English",
+            ReviewOnly = true,
+            ReviewRoot = reviewRoot,
+            BatchSize = 2,
+            MaxInputCharactersPerBatch = 100_000,
+            MaxInputTokensPerBatch = 100_000,
+            RequestsPerMinutePerKey = 0,
+            InputTokensPerMinutePerKey = 0,
+            DailyTokenBudgetPerKey = 0,
+            MaxRetries = 1,
+            Timeout = TimeSpan.FromSeconds(30),
+            AllowInsecureLoopback = true,
+            PreserveTranslationFile = preservePath,
+            TranslateMissingOnly = translateMissingOnly,
+            Provider = ApiProviderCatalog.Get("Custom"),
+            ProviderSettings = new ApiProviderSettings
+            {
+                Name = "Loopback Fixture",
+                Url = "http://127.0.0.1:12345/v1/chat/completions",
+                Model = "fixture-model",
+                Temperature = 0.1
+            }
+        };
 
     private static string RecoverySourceHash(string source) =>
         StableIdentity.Sha256(source.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n'));

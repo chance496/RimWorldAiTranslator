@@ -6,7 +6,7 @@ RimWorld AI Translator is an unofficial community tool. It is not developed, end
 
 | Version | Status |
 |---|---|
-| `v1.0.1-rc.1` | Local validation candidate only. It is not a public release and has no production support commitment. |
+| `v1.1.0` | Current public version. Security fixes are provided on a best-effort basis. |
 | `v1.0.0` | Existing public artifact. It is immutable; a security fix must be delivered as a distinct successor rather than by replacing its tag or asset. |
 | Older versions | No security-update commitment. |
 
@@ -27,9 +27,9 @@ A useful private report contains the affected version, a minimal synthetic repro
 ## Security-update policy
 
 - The project does not silently replace the existing `v1.0.0` tag, release, or asset.
-- Security fixes are prepared and verified in a new version candidate before any separately approved publication.
+- Security fixes are prepared and verified in a new version before publication.
 - This application is self-contained and carries .NET runtime code. Installing a newer system-wide .NET runtime does not update the runtime embedded in the application. A runtime security update requires a newly rebuilt and verified application package.
-- The local candidate pins .NET runtime packs at `8.0.28`. Runtime advisories and support status must be reviewed again for every future package.
-- Unsigned builds can trigger Microsoft SmartScreen. The local RC has no Authenticode signature; a warning is not proof of malware or proof of safety.
+- The package pins .NET runtime packs at `8.0.28`. Runtime advisories and support status must be reviewed again for every future package.
+- Unsigned builds can trigger Microsoft SmartScreen. The application has no Authenticode signature; a warning is not proof of malware or proof of safety.
 
-See [PRIVACY.md](PRIVACY.md) for data handling and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the local runtime and asset inventory.
+See [PRIVACY.md](PRIVACY.md) for data handling and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the runtime and asset inventory.

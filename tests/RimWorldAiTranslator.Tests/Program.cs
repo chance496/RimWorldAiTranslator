@@ -676,7 +676,7 @@ internal static partial class Program
             var service = new ProjectCleanupService();
             var plan = service.BuildPlan(project, [reviewRoot]);
             Assert(plan.SafePaths.SequenceEqual([Path.GetFullPath(run), Path.GetFullPath(swapRun), Path.GetFullPath(legacyMarker)]),
-                "Owned current and PowerShell v1 review paths were not isolated.");
+                "Owned current and legacy v1 review paths were not isolated.");
             Assert(plan.SafePathIdentities.Count == 3, "Confirmed cleanup paths were not pinned to stable directory identities.");
             Assert(plan.UnsafePaths.Count == 7, "Copied, marker-less, mismatched, malformed, or out-of-bound cleanup paths were not reported.");
 
@@ -1143,6 +1143,14 @@ internal static partial class Program
             Assert(handler.RequestCount == 5, $"Retry or batch count changed: {handler.RequestCount}");
             Assert(handler.AuthorizationValues.Contains("Bearer key-one") && handler.AuthorizationValues.Contains("Bearer key-two"), "Multiple API keys were not rotated.");
             Assert(progress.Count(item => item.Stage == "retry") == 1, "Transient failure was retried by nested loops.");
+            var workProgress = progress.Where(item => item.Stage is "translate" or "retry").ToArray();
+            Assert(workProgress.Length > 0
+                   && workProgress.All(item => item.Total == 7)
+                   && workProgress.Select(item => item.Current).SequenceEqual(
+                       workProgress.Select(item => item.Current).OrderBy(value => value)),
+                "AI translation progress was not reported as monotonic completed-entry percentages.");
+            Assert(workProgress.Last().Current == 7,
+                "AI translation progress did not explicitly reach 100 percent.");
             Assert(!ContainsFiles(Path.Combine(modRoot, "Languages", "Korean")), "Review-only API run modified the source mod.");
             var progressPath = Directory.EnumerateFiles(Path.Combine(result.ReviewRoot!, "_TranslationAudit"), "*-progress.json").Single();
             using var checkpoint = JsonDocument.Parse(File.ReadAllText(progressPath));

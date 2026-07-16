@@ -5,17 +5,26 @@ namespace RimWorldAiTranslator.App.Controls;
 internal sealed class ActivityControl : UserControl
 {
     private readonly ListView list;
+    private readonly Label heading;
+    private bool windowResizeInProgress;
+    private bool windowResizePending;
 
     public ActivityControl()
     {
+        SetStyle(
+            ControlStyles.UserPaint
+            | ControlStyles.AllPaintingInWmPaint
+            | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.ResizeRedraw,
+            true);
         Dock = DockStyle.Fill;
         TabStop = false;
         AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
-        var heading = Ui.Label("활동", 14f, FontStyle.Bold);
+        heading = Ui.Label("활동", 14f, FontStyle.Bold);
         heading.AutoSize = false;
         heading.SetBounds(24, 20, 180, 30);
-        list = new ListView
+        list = new BufferedListView
         {
             View = View.Details,
             FullRowSelect = true,
@@ -34,11 +43,29 @@ internal sealed class ActivityControl : UserControl
         Controls.AddRange([heading, list]);
         Resize += (_, _) =>
         {
-            heading.Height = DeviceDpi > 96 ? 36 : 30;
-            list.SetBounds(24, 66, Math.Max(320, ClientSize.Width - 48), Math.Max(220, ClientSize.Height - 90));
+            if (windowResizeInProgress) windowResizePending = true;
+            else ResizeLayout();
         };
         HandleCreated += (_, _) => BeginInvoke((Action)(() => heading.Height = DeviceDpi > 96 ? 36 : 30));
         list.SetBounds(24, 66, 1378, 606);
+    }
+
+    internal void SetWindowResizeInProgress(bool inProgress)
+    {
+        windowResizeInProgress = inProgress;
+        if (inProgress)
+        {
+            windowResizePending = false;
+            return;
+        }
+        if (windowResizePending) ResizeLayout();
+        windowResizePending = false;
+    }
+
+    private void ResizeLayout()
+    {
+        heading.Height = DeviceDpi > 96 ? 36 : 30;
+        list.SetBounds(24, 66, Math.Max(320, ClientSize.Width - 48), Math.Max(220, ClientSize.Height - 90));
     }
 
     public void SetEntries(IEnumerable<ActivityEntry> entries)

@@ -17,7 +17,8 @@ internal static class PackageLayout
     public static readonly IReadOnlySet<string> RuntimeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         ApplicationFileName,
-        "rimworld-def-field-rules.txt"
+        "rimworld-def-field-rules.txt",
+        "glossary.generated.ko.json"
     };
 
     public static readonly IReadOnlySet<string> DocumentationFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -51,7 +52,7 @@ internal sealed record SemanticVersion(
     int Major,
     int Minor,
     int Patch,
-    string Prerelease,
+    string? Prerelease,
     string? BuildMetadata,
     string Original)
 {
@@ -75,18 +76,20 @@ internal sealed record SemanticVersion(
             throw new InvalidDataException($"VERSION has invalid build metadata: {value}");
 
         var dash = withoutBuild.IndexOf('-');
-        if (dash <= 0 || dash == withoutBuild.Length - 1)
-            throw new InvalidDataException($"VERSION must be a SemVer prerelease, for example 1.0.1-rc.1: {value}");
+        if (dash == 0 || dash == withoutBuild.Length - 1)
+            throw new InvalidDataException($"VERSION has an invalid prerelease identifier: {value}");
 
-        var core = withoutBuild[..dash].Split('.');
-        var prerelease = withoutBuild[(dash + 1)..];
+        var coreText = dash >= 0 ? withoutBuild[..dash] : withoutBuild;
+        var core = coreText.Split('.');
+        var prerelease = dash >= 0 ? withoutBuild[(dash + 1)..] : null;
         if (core.Length != 3)
-            throw new InvalidDataException($"VERSION must have major.minor.patch before the prerelease: {value}");
+            throw new InvalidDataException($"VERSION must have major.minor.patch: {value}");
 
         var major = ParseNumericIdentifier(core[0], "major", value);
         var minor = ParseNumericIdentifier(core[1], "minor", value);
         var patch = ParseNumericIdentifier(core[2], "patch", value);
-        ValidateIdentifiers(prerelease, numericLeadingZeroForbidden: true, "prerelease", value);
+        if (prerelease is not null)
+            ValidateIdentifiers(prerelease, numericLeadingZeroForbidden: true, "prerelease", value);
         if (build is not null) ValidateIdentifiers(build, numericLeadingZeroForbidden: false, "build metadata", value);
         return new SemanticVersion(major, minor, patch, prerelease, build, value);
     }

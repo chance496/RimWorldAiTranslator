@@ -70,11 +70,10 @@ internal static partial class Program
             "The monotonic limiter did not preserve successful responses across a wall-clock regression.");
         Assert(handler.RequestUris.Count == 2,
             "The monotonic limiter did not issue exactly the two synthetic requests.");
-        Assert(delays.Count == 1 && delays[0] >= TimeSpan.FromMilliseconds(999)
-                                 && delays[0] <= TimeSpan.FromMilliseconds(1_001),
-            "The monotonic limiter did not enforce the expected one-second request interval.");
-        Assert(timeProvider.GetUtcNow() < RegressingWallClockTimeProvider.InitialUtcNow,
-            "The fixture did not actually regress its wall clock.");
+        Assert(delays.Count == 0,
+            "A legacy fixed RPM value throttled successful responses that contained no rate-limit headers.");
+        Assert(timeProvider.GetUtcNow() == RegressingWallClockTimeProvider.InitialUtcNow,
+            "The headerless request path unexpectedly invoked a rate-limit delay.");
 
         static HttpResponseMessage SyntheticSuccess() =>
             new(HttpStatusCode.OK)

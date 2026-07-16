@@ -132,6 +132,11 @@ internal static partial class Program
                                       && !safeHostileProgress.Stage.Contains(value, StringComparison.OrdinalIgnoreCase)),
             "The progress presentation exposed hostile stage or message content.");
 
+        var safeRateLimit = OperationErrorPresentation.CreateSafeProgress(
+            new TranslationProgress("rate-limit", "Waiting 11.7s for provider rate limit."));
+        Assert(safeRateLimit.Message == "Waiting 11.7s for the provider rate limit.",
+            "A safe rate-limit wait duration was hidden from the activity log.");
+
         WithTempRoot(root =>
         {
             var apiProgress = new List<TranslationProgress>();
@@ -292,10 +297,10 @@ internal static partial class Program
                 GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "glossary.generated.ko.json")
             }, new ProgressCollector(splitProgress)).GetAwaiter().GetResult());
             Assert(!splitError.Message.Contains(rawMessage, StringComparison.Ordinal)
-                   && splitProgress.Any(item => item.Stage == "retry")
+                   && splitProgress.All(item => item.Stage != "retry")
                    && splitProgress.All(item => forbidden.All(value =>
-                       !item.Message.Contains(value, StringComparison.OrdinalIgnoreCase))),
-                "Binary split progress or its outer failure exposed raw provider content.");
+                        !item.Message.Contains(value, StringComparison.OrdinalIgnoreCase))),
+                "A transport failure was split as a data-shape failure or exposed raw provider content.");
 
             var logRoot = Path.Combine(root, "logs");
             using (var logger = new AppLogger(logRoot))

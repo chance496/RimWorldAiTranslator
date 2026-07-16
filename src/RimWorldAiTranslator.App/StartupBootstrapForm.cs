@@ -1,4 +1,5 @@
 using RimWorldAiTranslator.Core.Diagnostics;
+using RimWorldAiTranslator.App.Controls;
 
 namespace RimWorldAiTranslator.App;
 
@@ -26,6 +27,7 @@ internal sealed class StartupBootstrapForm : Form
     private Exception? startupFailure;
     private bool closeRequested;
     private bool transitionCompleted;
+    private bool loadingSurfaceCoveredMain;
 
     internal StartupBootstrapForm(
         Func<CancellationToken, Task<AppStartupState>> startupFactory,
@@ -43,13 +45,14 @@ internal sealed class StartupBootstrapForm : Form
         this.startupFailurePresenter = startupFailurePresenter;
         this.mainFormFactoryForTesting = mainFormFactoryForTesting;
         this.startupFailureRecorder = startupFailureRecorder;
-        Text = "RimWorld AI Translator";
-        StartPosition = FormStartPosition.CenterScreen;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        Text = "RimWorld AI Translator - 시작 중";
+        StartPosition = FormStartPosition.Manual;
+        FormBorderStyle = FormBorderStyle.None;
         MaximizeBox = false;
         MinimizeBox = false;
         ShowIcon = false;
-        ClientSize = new Size(420, 136);
+        Bounds = Screen.FromPoint(Cursor.Position).WorkingArea;
+        BackColor = Color.FromArgb(29, 38, 42);
         SetStyle(
             ControlStyles.UserPaint
             | ControlStyles.OptimizedDoubleBuffer
@@ -57,22 +60,43 @@ internal sealed class StartupBootstrapForm : Form
             true);
         SuspendLayout();
 
+        var card = new BufferedPanel
+        {
+            AutoSize = false,
+            Size = new Size(520, 184),
+            BackColor = Color.FromArgb(245, 247, 248)
+        };
+        var title = new Label
+        {
+            AutoSize = false,
+            Bounds = new Rectangle(38, 28, 444, 34),
+            Font = new Font("Malgun Gothic", 14f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(19, 30, 35),
+            Text = "RimWorld AI Translator",
+            TextAlign = ContentAlignment.MiddleLeft
+        };
         var status = new Label
         {
             AutoSize = false,
-            Dock = DockStyle.Top,
-            Height = 82,
+            Bounds = new Rectangle(38, 72, 444, 54),
+            Font = new Font("Malgun Gothic", 9f),
+            ForeColor = Color.FromArgb(66, 85, 94),
             Text = "RimWorld AI Translator를 준비하고 있습니다.",
-            TextAlign = ContentAlignment.MiddleCenter
+            TextAlign = ContentAlignment.MiddleLeft
         };
         var progress = new ProgressBar
         {
-            Dock = DockStyle.Bottom,
-            Height = 8,
+            Bounds = new Rectangle(38, 142, 444, 8),
             Style = ProgressBarStyle.Marquee,
             MarqueeAnimationSpeed = 24
         };
-        Controls.AddRange([status, progress]);
+        card.Controls.AddRange([title, status, progress]);
+        Controls.Add(card);
+        void CenterCard() => card.Location = new Point(
+            Math.Max(0, (ClientSize.Width - card.Width) / 2),
+            Math.Max(0, (ClientSize.Height - card.Height) / 2));
+        Resize += (_, _) => CenterCard();
+        CenterCard();
         Shown += BootstrapShown;
         FormClosing += BootstrapClosing;
         ResumeLayout(false);
@@ -80,6 +104,7 @@ internal sealed class StartupBootstrapForm : Form
 
     internal event EventHandler<MainForm>? MainFormShownForTesting;
     internal bool TransitionCompletedForTesting => transitionCompleted;
+    internal bool LoadingSurfaceCoveredMainForTesting => loadingSurfaceCoveredMain;
     internal bool StartupFailed
     {
         get
@@ -232,8 +257,20 @@ internal sealed class StartupBootstrapForm : Form
             }
             created.Enabled = false;
             created.Show();
-            await created.RevealPreparedFirstFrameAsync();
-            Hide();
+            TopMost = true;
+            BringToFront();
+            Activate();
+            loadingSurfaceCoveredMain = Visible && Bounds.Contains(Screen.FromControl(created).WorkingArea);
+            try
+            {
+                await created.RevealPreparedFirstFrameAsync();
+                Hide();
+            }
+            finally
+            {
+                TopMost = false;
+            }
+            created.Activate();
             transitionCompleted = true;
             NotifyMainFormShown(created);
             created.CompleteFirstShow();

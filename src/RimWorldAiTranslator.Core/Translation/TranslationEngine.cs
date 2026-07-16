@@ -265,18 +265,18 @@ public sealed partial class TranslationEngine
         var translatedRows = runState.TranslatedRows;
         var tokenWarnings = runState.TokenWarnings;
         var outputGroups = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-        var pendingIds = pending.Select(entry => entry.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in reviewEntries.Where(entry => !pendingIds.Contains(entry.Id)))
+        var comparisonRowIndexes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in reviewEntries)
         {
+            comparisonRowIndexes[entry.Id] = comparisonRows.Count;
             comparisonRows.Add(CreateComparisonRow(entry, GetExisting(entry), string.Empty, string.Empty, outputLanguageRoot, history, currentRmkSources));
         }
 
+        void ReplaceComparisonRow(SourceEntry entry, ReviewComparisonRow row) =>
+            comparisonRows[comparisonRowIndexes[entry.Id]] = row;
+
         if (options.SourceOnly)
         {
-            foreach (var entry in pending)
-            {
-                comparisonRows.Add(CreateComparisonRow(entry, GetExisting(entry), string.Empty, string.Empty, outputLanguageRoot, history, currentRmkSources));
-            }
             WriteCheckpoint(
                 transactionRoot,
                 auditBase,
@@ -318,7 +318,7 @@ public sealed partial class TranslationEngine
         {
             var validation = TranslationValidator.Validate(entry.Text, entry.Text);
             tokenWarnings.Add(TokenWarningRow.Create(entry, entry.Text, "request_input_limit", validation));
-            comparisonRows.Add(CreateComparisonRow(
+            ReplaceComparisonRow(entry, CreateComparisonRow(
                 entry,
                 GetExisting(entry),
                 string.Empty,
@@ -348,12 +348,27 @@ public sealed partial class TranslationEngine
         using (var api = apiClientFactory(keys))
         {
             api.SetRequestAttemptLimit(options.MaxProviderRequestsPerRun);
+            var completedEntries = 0;
+            var overallTotal = requestable.Count;
             for (var batchIndex = 0; batchIndex < batches.Count; batchIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var batch = batches[batchIndex];
-                progress?.Report(new TranslationProgress("translate", $"Translating batch {batchIndex + 1}/{batches.Count} ({batch.Count} entries)", batchIndex + 1, batches.Count));
-                var map = await TranslateWithSplitAsync(api, options, glossary, batch, $"{batchIndex + 1}/{batches.Count}", progress, cancellationToken).ConfigureAwait(false);
+                progress?.Report(new TranslationProgress(
+                    "translate",
+                    $"Translating {completedEntries:N0} of {overallTotal:N0} entries.",
+                    completedEntries,
+                    overallTotal));
+                var overallProgress = new OverallTranslationProgress(progress, () => completedEntries, overallTotal);
+                var map = await TranslateWithSplitAsync(
+                        api,
+                        options,
+                        glossary,
+                        batch,
+                        $"{batchIndex + 1}/{batches.Count}",
+                        overallProgress,
+                        cancellationToken)
+                    .ConfigureAwait(false);
                 foreach (var entry in batch)
                 {
                     var translated = LanguageFileService.RemoveInvalidXmlCharacters(map.TryGetValue(entry.Id, out var value) ? value : entry.Text);
@@ -395,8 +410,16 @@ public sealed partial class TranslationEngine
                     }
 
                     translatedRows.Add(new TranslatedAuditRow(entry, target, translated));
-                    comparisonRows.Add(CreateComparisonRow(entry, existing, translated, "ai", outputLanguageRoot, history, currentRmkSources, validation, safe));
+                    ReplaceComparisonRow(
+                        entry,
+                        CreateComparisonRow(entry, existing, translated, "ai", outputLanguageRoot, history, currentRmkSources, validation, safe));
                 }
+                completedEntries += batch.Count;
+                progress?.Report(new TranslationProgress(
+                    "translate",
+                    $"Translated {completedEntries:N0} of {overallTotal:N0} entries.",
+                    completedEntries,
+                    overallTotal));
                 runState.CompletedBatches = batchIndex + 1;
                 WriteCheckpoint(
                     transactionRoot,
@@ -428,7 +451,7 @@ public sealed partial class TranslationEngine
                 cancellationToken);
         }
 
-        progress?.Report(new TranslationProgress("complete", "Done.", batches.Count, batches.Count));
+        progress?.Report(new TranslationProgress("complete", "Done.", requestable.Count, requestable.Count));
         return new TranslationRunResult(
             reviewRunRoot,
             auditBase + "-comparison.json",
@@ -468,8 +491,7 @@ public sealed partial class TranslationEngine
                             options.MaxRetries,
                             cancellationToken).ConfigureAwait(false);
                     }
-                    catch (Exception ex) when (ex is not OperationCanceledException
-                                               and not ProviderRequestBudgetExceededException)
+                    catch (Exception ex) when (IsExpectedGoogleItemFailure(ex))
                     {
                         progress?.Report(new TranslationProgress(
                             "warning",
@@ -492,9 +514,7 @@ public sealed partial class TranslationEngine
             }
             return map;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException
-                                   and not ProviderRequestBudgetExceededException
-                                   && batch.Count > 1)
+        catch (Exception ex) when (CanSplitBatchFailure(ex) && batch.Count > 1)
         {
             var leftCount = (int)Math.Ceiling(batch.Count / 2.0);
             var left = batch.Take(leftCount).ToArray();
@@ -512,9 +532,40 @@ public sealed partial class TranslationEngine
             }
             return merged;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (CanSplitBatchFailure(ex))
         {
             throw new InvalidOperationException($"Batch {label} failed at single-entry fallback.", ex);
+        }
+    }
+
+    private static bool CanSplitBatchFailure(Exception exception) => exception switch
+    {
+        InvalidDataException => true,
+        ProviderRequestException provider => provider.CanSplitBatch,
+        _ => false
+    };
+
+    private static bool IsExpectedGoogleItemFailure(Exception exception) => exception is
+        TimeoutException or HttpRequestException or JsonException or InvalidDataException;
+
+    private sealed class OverallTranslationProgress(
+        IProgress<TranslationProgress>? destination,
+        Func<int> current,
+        int total) : IProgress<TranslationProgress>
+    {
+        public void Report(TranslationProgress value)
+        {
+            if (destination is null) return;
+            if (value.Stage is "retry" or "rate-limit" or "warning")
+            {
+                destination.Report(value with
+                {
+                    Current = current(),
+                    Total = total
+                });
+                return;
+            }
+            destination.Report(value);
         }
     }
 

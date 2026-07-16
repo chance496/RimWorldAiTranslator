@@ -83,12 +83,13 @@ public static class TranslationPrompt
         {
             body[options.CompletionTokenParameter] = options.MaxCompletionTokens;
         }
-        if (!string.IsNullOrWhiteSpace(options.ReasoningEffort))
+        var reasoningEffort = ResolveReasoningEffort(options);
+        if (!string.IsNullOrWhiteSpace(reasoningEffort))
         {
-            body["reasoning_effort"] = options.ReasoningEffort.Trim();
+            body["reasoning_effort"] = reasoningEffort;
         }
 
-        var format = options.NoStructuredOutputs ? "JsonObject" : options.ResponseFormatMode;
+        var format = ResolveResponseFormat(options);
         if (format == "JsonSchema")
         {
             body["response_format"] = new JsonObject
@@ -130,6 +131,19 @@ public static class TranslationPrompt
             body["response_format"] = new JsonObject { ["type"] = "json_object" };
         }
         return body;
+    }
+
+    private static string ResolveReasoningEffort(TranslationEngineOptions options)
+    {
+        var configured = options.ReasoningEffort.Trim();
+        if (!options.Provider.Id.Equals("Gemini", StringComparison.OrdinalIgnoreCase)) return configured;
+        return string.IsNullOrWhiteSpace(configured) ? "low" : configured;
+    }
+
+    private static string ResolveResponseFormat(TranslationEngineOptions options)
+    {
+        if (options.NoStructuredOutputs) return "JsonObject";
+        return options.ResponseFormatMode;
     }
 
     public static Dictionary<string, string> ParseResponse(
@@ -251,8 +265,7 @@ public static class TranslationPrompt
                 {
                     throw new InvalidDataException("Model translation entries require string id and text properties.");
                 }
-                if (!map.TryAdd(id.GetString()!, Normalize(text.GetString())))
-                    throw new InvalidDataException("Model response contained a duplicate translation id.");
+                map[id.GetString()!] = Normalize(text.GetString());
             }
         }
         else
@@ -264,10 +277,7 @@ public static class TranslationPrompt
                 {
                     throw new InvalidDataException("Model direct-map entries require non-empty ids and string values.");
                 }
-                if (!map.TryAdd(property.Name, Normalize(property.Value.GetString())))
-                {
-                    throw new InvalidDataException("Model response contained a duplicate translation id.");
-                }
+                map[property.Name] = Normalize(property.Value.GetString());
             }
         }
         return map;
@@ -288,9 +298,6 @@ public static class TranslationPrompt
         var missing = expected.Count(id => !map.ContainsKey(id));
         if (missing > 0)
             throw new InvalidDataException($"Model response omitted {missing} translation id(s).");
-        var unexpected = map.Keys.Count(id => !expected.Contains(id));
-        if (unexpected > 0)
-            throw new InvalidDataException($"Model response contained {unexpected} unexpected translation id(s).");
     }
 
     private static void AppendProperty(StringBuilder builder, string name, string? value, bool comma)

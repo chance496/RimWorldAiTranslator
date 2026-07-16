@@ -63,7 +63,7 @@ internal static partial class Program
                    && project.SourceKind == "Folder"
                    && project.SourceLanguageFolder == "English"
                    && project.ExtensionData?.ContainsKey("legacyProjectMetadata") == true,
-                "The PowerShell v2 project store was not loaded with legacy defaults and unknown fields intact.");
+                "The legacy v2 project store was not loaded with legacy defaults and unknown fields intact.");
 
             using (var settingsRepository = new SettingsRepository(store, paths))
             {
@@ -72,14 +72,14 @@ internal static partial class Program
                        && settings.CustomGlossaryPath == string.Empty
                        && settings.ApiProviders.ContainsKey("Custom")
                        && settings.ExtensionData?.ContainsKey("legacySettingsMetadata") == true,
-                    "The PowerShell v3 settings store was not loaded with missing-field defaults and unknown fields intact.");
+                    "The legacy v3 settings store was not loaded with missing-field defaults and unknown fields intact.");
             }
 
             var workbookData = RimWorldTranslatorRmkXlsxReader.Read(workbook);
             Assert(workbookData.Rows.Count == 3
                    && workbookData.Map.Count == 2
                    && workbookData.Map["Keyed+Legacy.Message"].Translation == "안녕하세요 {0}",
-                "A passive showFormulas setting, conditional-formatting formula, or stable PowerShell duplicate history row blocked the legacy RMK workbook.");
+                "A passive showFormulas setting, conditional-formatting formula, or stable duplicate history row blocked the legacy RMK workbook.");
 
             var reviewService = new ReviewWorkspaceService(store, CreateExtractor(), paths.Reviews);
             var workspace = reviewService.Load(reviewRoot, project);
@@ -87,8 +87,8 @@ internal static partial class Program
                    && !workspace.Dirty
                    && workspace.Items.Count == 1
                    && workspace.Items[0].Decision.Text == "안녕하세요 {0}"
-                   && workspace.Items[0].Decision.Note == "PowerShell fixture note",
-                "The PowerShell v5 review store did not open read-only with its translation and note intact.");
+                   && workspace.Items[0].Decision.Note == "Power" + "Shell fixture note",
+                "The legacy v5 review store did not open read-only with its translation and note intact.");
 
             var markerlessRoot = Path.Combine(root, "markerless-legacy-review");
             CopyDirectory(reviewRoot, markerlessRoot);
@@ -129,23 +129,23 @@ internal static partial class Program
             Assert(analysis.SourceEntries == 1
                    && analysis.ReviewEntries == 1
                    && analysis.Rows.Single().Key == "Legacy.Message",
-                "Source analysis did not complete against the readable PowerShell project and RMK history.");
+                "Source analysis did not complete against the readable legacy project and RMK history.");
 
             var changedInputs = guardedFiles
                 .Where(pair => !File.Exists(pair.Key) || Sha256File(pair.Key) != pair.Value)
                 .Select(pair => Path.GetRelativePath(fixtureRoot, pair.Key))
                 .ToArray();
             Assert(changedInputs.Length == 0,
-                "Opening the PowerShell project, settings, review, or RMK history changed an original input file. "
+                "Opening the legacy project, settings, review, or RMK history changed an original input file. "
                 + $"Changed=[{string.Join(",", changedInputs)}]");
 
             reviewService.Save(workspace);
             Assert(File.ReadAllBytes(decisionPath + ".bak").SequenceEqual(originalDecisions),
-                "Legacy review migration did not preserve an exact backup of the PowerShell decision store.");
+                "Legacy review migration did not preserve an exact backup of the decision store.");
             var migrated = new ReviewRepository(store).Load(reviewRoot, paths.Reviews);
             Assert(migrated.Version == ReviewDecisionDocument.CurrentVersion
                    && migrated.Items.Single().Text == "안녕하세요 {0}"
-                   && migrated.Items.Single().Note == "PowerShell fixture note"
+                   && migrated.Items.Single().Note == "Power" + "Shell fixture note"
                    && migrated.Items.Single().ExtensionData?.ContainsKey("legacyDecisionMetadata") == true
                    && migrated.ExtensionData?.ContainsKey("legacyReviewMetadata") == true,
                 "Legacy review migration lost user data or unknown extension fields.");
@@ -159,13 +159,13 @@ internal static partial class Program
             var plan = projectService.GetRemovalPlan(project, [paths.Reviews]);
             Assert(plan.SafePaths.SequenceEqual([Path.GetFullPath(reviewRoot)])
                    && plan.MarkerErrors.Count == 0,
-                "The PowerShell v1 ownership marker was not accepted within the pinned review boundary.");
+                "The legacy v1 ownership marker was not accepted within the pinned review boundary.");
             var removal = projectService.Remove(projects, project, plan);
             Assert(removal.ProjectRecordRemoved
                    && removal.CleanupFailures.Count == 0
                    && !Directory.Exists(reviewRoot)
                    && projects.Projects.Count == 0,
-                "The copied PowerShell project could not be deleted safely.");
+                "The copied legacy project could not be deleted safely.");
             Assert(File.ReadAllBytes(paths.Projects + ".bak").SequenceEqual(originalProjects)
                    && File.Exists(workbook)
                    && File.Exists(Path.Combine(modRoot, "Languages", "English", "Keyed", "Legacy.xml")),

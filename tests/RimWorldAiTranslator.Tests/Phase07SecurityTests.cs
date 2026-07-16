@@ -1486,7 +1486,7 @@ internal static partial class Program
 
             var error = CaptureException<InvalidOperationException>(() =>
                 engine.RunAsync(options).GetAwaiter().GetResult());
-            Assert(error.InnerException is ProviderRequestBudgetExceededException budgetError
+            Assert(error is ProviderRequestBudgetExceededException budgetError
                    && budgetError.Message.Contains('2', StringComparison.Ordinal)
                    && transport.RequestCount == 2,
                 "The per-run provider request-attempt budget did not stop retries at the configured bound.");
@@ -1610,7 +1610,7 @@ internal static partial class Program
                     GeneratedGlossaryPath = Path.Combine(root, "missing-glossary.json")
                 }).GetAwaiter().GetResult());
 
-            Assert(error.InnerException is ProviderRequestBudgetExceededException
+            Assert(error is ProviderRequestBudgetExceededException
                    && transport.RequestCount == 2,
                 "Google fallback swallowed the terminal provider request budget or exceeded it.");
         });

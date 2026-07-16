@@ -18,9 +18,11 @@ public sealed class TranslationEngineOptions
     };
     public string LanguageFolderName { get; init; } = "Korean";
     public string SourceLanguageFolder { get; init; } = "Auto";
-    public int RequestsPerMinutePerKey { get; init; } = 5;
-    public int InputTokensPerMinutePerKey { get; init; } = 30_000;
-    public long DailyTokenBudgetPerKey { get; init; } = 1_000_000;
+    // Legacy configuration fields retained for project compatibility. Runtime throttling is
+    // learned from provider response headers and HTTP 429 rather than these fixed values.
+    public int RequestsPerMinutePerKey { get; init; }
+    public int InputTokensPerMinutePerKey { get; init; }
+    public long DailyTokenBudgetPerKey { get; init; }
     public int BatchSize { get; init; } = 40;
     public int MaxInputCharactersPerBatch { get; init; } = 12_000;
     public int MaxInputTokensPerBatch { get; init; } = 5_500;

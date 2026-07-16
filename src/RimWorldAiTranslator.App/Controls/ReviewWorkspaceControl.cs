@@ -108,6 +108,8 @@ internal sealed class ReviewWorkspaceControl : UserControl
     private bool operationRunning;
     private bool stopRequested;
     private bool disposed;
+    private bool windowResizeInProgress;
+    private bool windowResizePending;
     private long rmkStatusRevision;
     private long filterRevision;
     private long qualityRevision;
@@ -260,8 +262,8 @@ internal sealed class ReviewWorkspaceControl : UserControl
         {
             if (disposed || IsDisposed) return;
             ResizeHeader(header, projectListButton, folderButton, saveButton);
-            root.PerformLayout();
-            InitializeSplitters();
+            if (windowResizeInProgress) windowResizePending = true;
+            else InitializeSplitters();
         }
         Resize += (_, _) => RefreshResponsiveLayout();
         HandleCreated += (_, _) => BeginInvoke((Action)RefreshResponsiveLayout);
@@ -435,8 +437,22 @@ internal sealed class ReviewWorkspaceControl : UserControl
     private float DpiScaleFactor => Math.Max(1f, DeviceDpi / 96f);
     private int ToDevice(int logical) => (int)Math.Round(logical * DpiScaleFactor);
     private int ToLogical(int device) => Math.Max(0, (int)Math.Floor(device / DpiScaleFactor));
-    private void SetLogicalBounds(Control control, int x, int y, int width, int height) =>
-        control.SetBounds(ToDevice(x), ToDevice(y), ToDevice(width), ToDevice(height));
+    private void SetLogicalBounds(Control control, int x, int y, int width, int height)
+    {
+        var bounds = new Rectangle(ToDevice(x), ToDevice(y), ToDevice(width), ToDevice(height));
+        if (control.Bounds != bounds) control.Bounds = bounds;
+    }
+    internal void SetWindowResizeInProgress(bool inProgress)
+    {
+        windowResizeInProgress = inProgress;
+        if (inProgress)
+        {
+            windowResizePending = false;
+            return;
+        }
+        if (windowResizePending && !disposed && !IsDisposed) InitializeSplitters();
+        windowResizePending = false;
+    }
     internal bool LastFilterUsedWorkerThreadForTesting => lastFilterUsedWorkerThread;
     internal bool LastQualityUsedWorkerThreadForTesting => lastQualityUsedWorkerThread;
     internal bool TranslationTouchedForTesting => translationTouched;
@@ -539,11 +555,19 @@ internal sealed class ReviewWorkspaceControl : UserControl
 
     public void UpdateProgress(TranslationProgress progress)
     {
-        if (!stopRequested) operationStatus.Text = progress.Message;
+        var percent = progress.Total > 0
+            ? Math.Clamp((int)Math.Round(progress.Current * 100d / progress.Total), 0, 100)
+            : -1;
+        if (!stopRequested)
+        {
+            operationStatus.Text = percent >= 0
+                ? $"{progress.Message} · {percent}%"
+                : progress.Message;
+        }
         if (progress.Total > 0)
         {
             operationProgress.Style = ProgressBarStyle.Blocks;
-            operationProgress.Value = Math.Clamp((int)Math.Round(progress.Current * 100d / progress.Total), 0, 100);
+            operationProgress.Value = percent;
         }
     }
 
@@ -759,7 +783,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         }
         summary = Ui.Label("전체 0", 8.5f, FontStyle.Bold);
         summary.AutoSize = false;
-        list = new ListBox
+        list = new BufferedListBox
         {
             DrawMode = DrawMode.OwnerDrawFixed,
             ItemHeight = 94,
@@ -1249,7 +1273,7 @@ internal sealed class ReviewWorkspaceControl : UserControl
         exportQuality.AccessibleDescription = "원문이나 번역문을 포함하지 않는 집계 품질 보고서를 저장합니다.";
         exportQuality.TabIndex = 2;
         exportQuality.Click += (_, _) => QualityExportRequested?.Invoke(this, EventArgs.Empty);
-        issues = new ListView
+        issues = new BufferedListView
         {
             View = View.Details,
             FullRowSelect = true,
@@ -2203,36 +2227,40 @@ internal sealed class ReviewWorkspaceControl : UserControl
         if (outerSplit.ClientSize.Width <= 0 || innerSplit.ClientSize.Width <= 0) return;
         try
         {
-            outerSplit.SplitterWidth = Math.Max(2, ToDevice(2));
-            innerSplit.SplitterWidth = Math.Max(2, ToDevice(2));
+            var splitterWidth = Math.Max(2, ToDevice(2));
+            if (outerSplit.SplitterWidth != splitterWidth) outerSplit.SplitterWidth = splitterWidth;
+            if (innerSplit.SplitterWidth != splitterWidth) innerSplit.SplitterWidth = splitterWidth;
             outerSplit.Panel1MinSize = 0;
             outerSplit.Panel2MinSize = 0;
             var mainWidth = Math.Max(1, ToLogical(outerSplit.ClientSize.Width));
             var leftWidth = Math.Min(410, Math.Max(360, (int)(mainWidth * 0.24)));
             leftWidth = Math.Min(leftWidth, Math.Max(340, mainWidth - 740 - 2));
             var leftDevice = ToDevice(leftWidth);
-            outerSplit.SplitterDistance = Math.Clamp(leftDevice, 1, Math.Max(1, outerSplit.ClientSize.Width - outerSplit.SplitterWidth - 1));
+            var outerDistance = Math.Clamp(leftDevice, 1, Math.Max(1, outerSplit.ClientSize.Width - outerSplit.SplitterWidth - 1));
+            if (outerSplit.SplitterDistance != outerDistance) outerSplit.SplitterDistance = outerDistance;
 
             innerSplit.Panel1MinSize = 0;
             innerSplit.Panel2MinSize = 0;
             var rightWidth = Math.Max(1, ToLogical(innerSplit.ClientSize.Width));
             if (rightWidth < 1040)
             {
-                innerSplit.Orientation = Orientation.Horizontal;
+                if (innerSplit.Orientation != Orientation.Horizontal) innerSplit.Orientation = Orientation.Horizontal;
                 var rightHeight = Math.Max(1, ToLogical(innerSplit.ClientSize.Height));
                 var sideHeight = Math.Min(250, Math.Max(170, (int)(rightHeight * 0.28)));
-                innerSplit.SplitterDistance = Math.Clamp(
+                var innerDistance = Math.Clamp(
                     ToDevice(Math.Max(320, rightHeight - sideHeight - 2)),
                     1,
                     Math.Max(1, innerSplit.ClientSize.Height - innerSplit.SplitterWidth - 1));
+                if (innerSplit.SplitterDistance != innerDistance) innerSplit.SplitterDistance = innerDistance;
             }
             else
             {
-                innerSplit.Orientation = Orientation.Vertical;
+                if (innerSplit.Orientation != Orientation.Vertical) innerSplit.Orientation = Orientation.Vertical;
                 var sideWidth = Math.Min(370, Math.Max(330, (int)(rightWidth * 0.25)));
                 var centerWidth = Math.Max(420, rightWidth - sideWidth - 2);
                 centerWidth = Math.Min(centerWidth, Math.Max(420, rightWidth - 330 - 2));
-                innerSplit.SplitterDistance = Math.Clamp(ToDevice(centerWidth), 1, Math.Max(1, innerSplit.ClientSize.Width - innerSplit.SplitterWidth - 1));
+                var innerDistance = Math.Clamp(ToDevice(centerWidth), 1, Math.Max(1, innerSplit.ClientSize.Width - innerSplit.SplitterWidth - 1));
+                if (innerSplit.SplitterDistance != innerDistance) innerSplit.SplitterDistance = innerDistance;
             }
         }
         catch (InvalidOperationException exception)
