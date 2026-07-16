@@ -269,10 +269,10 @@ internal static class PackageCommand
                 PackageLayout.RuntimeFiles,
                 repository,
                 repository);
-            CopyAllowlistedFiles(
+            CopyMappedFiles(
                 buildRepository.Root,
                 packageRoot,
-                PackageLayout.DocumentationFiles,
+                PackageLayout.DocumentationSourceFiles,
                 buildRepository,
                 repository);
             repository.AssertNoReparseTree(packageRoot);
@@ -857,9 +857,15 @@ internal static class PackageCommand
             stagedRuntime,
             "published runtime and package staging");
 
-        var sourceDocumentation = sourceInputs.Snapshot
-            .Where(file => string.IsNullOrEmpty(Path.GetDirectoryName(file.RelativePath))
-                           && PackageLayout.DocumentationFiles.Contains(file.RelativePath))
+        var sourceDocumentation = PackageLayout.DocumentationSourceFiles
+            .Select(mapping =>
+            {
+                var source = sourceInputs.Snapshot.SingleOrDefault(file =>
+                    file.RelativePath.Equals(mapping.Value, StringComparison.OrdinalIgnoreCase));
+                if (source is null)
+                    throw new InvalidDataException($"Pinned package source is missing: {mapping.Value}");
+                return source with { RelativePath = mapping.Key };
+            })
             .ToArray();
         var stagedDocumentation = stagingInputs.Snapshot
             .Where(file => PackageLayout.DocumentationFiles.Contains(file.RelativePath))
@@ -917,6 +923,27 @@ internal static class PackageCommand
             if (!File.Exists(source)) throw new FileNotFoundException($"Allowlisted package file is missing: {name}", source);
             sourceRepository.AssertNoReparseComponents(source);
             var destination = destinationRepository.RequireRepositoryPath(Path.Combine(destinationRoot, name));
+            if (File.Exists(destination) || Directory.Exists(destination))
+                throw new IOException($"Package staging destination already exists: {destination}");
+            File.Copy(source, destination, overwrite: false);
+            destinationRepository.AssertNoReparseComponents(destination);
+        }
+    }
+
+    private static void CopyMappedFiles(
+        string sourceRoot,
+        string destinationRoot,
+        IReadOnlyDictionary<string, string> files,
+        RepositoryLayout sourceRepository,
+        RepositoryLayout destinationRepository)
+    {
+        foreach (var file in files.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var source = sourceRepository.RequireRepositoryPath(Path.Combine(sourceRoot, file.Value));
+            if (!File.Exists(source))
+                throw new FileNotFoundException($"Mapped package source is missing: {file.Value}", source);
+            sourceRepository.AssertNoReparseComponents(source);
+            var destination = destinationRepository.RequireRepositoryPath(Path.Combine(destinationRoot, file.Key));
             if (File.Exists(destination) || Directory.Exists(destination))
                 throw new IOException($"Package staging destination already exists: {destination}");
             File.Copy(source, destination, overwrite: false);

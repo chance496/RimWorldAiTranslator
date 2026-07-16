@@ -51,18 +51,18 @@ internal static partial class Program
     private static readonly List<(string Name, Action Body)> Tests =
     [
         ("Storage.RoundTrip", StorageRoundTrip),
-        ("Phase05.StorageCompatibility", Phase05StorageTests.RunAll),
-        ("Phase07.SecurityHardening", Phase07SecurityHardening),
-        ("Phase07.ResourceBoundaries", Phase07ResourceBoundaries),
-        ("Phase07.NativeArchiveAndWriteBoundary", Phase07NativeArchiveAndWriteBoundary),
-        ("Phase07.NativeActiveContentAndLimits", Phase07NativeActiveContentAndLimits),
-        ("Phase08.Reliability", Phase08Reliability),
-        ("Phase08.AtomicStorageFaults", Phase08AtomicStorageFaults),
-        ("Phase08.ProjectLoadCancellation", Phase08ProjectLoadCancellation),
-        ("Phase08.MonotonicRateLimiter", Phase08MonotonicRateLimiter),
+        ("Storage.Compatibility", Phase05StorageTests.RunAll),
+        ("Security.Hardening", Phase07SecurityHardening),
+        ("Security.ResourceBoundaries", Phase07ResourceBoundaries),
+        ("Native.ArchiveAndWriteBoundary", Phase07NativeArchiveAndWriteBoundary),
+        ("Native.ActiveContentAndLimits", Phase07NativeActiveContentAndLimits),
+        ("Reliability.Core", Phase08Reliability),
+        ("Storage.AtomicFaults", Phase08AtomicStorageFaults),
+        ("Project.LoadCancellation", Phase08ProjectLoadCancellation),
+        ("Translation.MonotonicRateLimiter", Phase08MonotonicRateLimiter),
         ("Storage.SimpleRecoveryThreatModel", SimpleStorageRecoveryThreatModel),
-        ("Phase05.XmlAndReadOnlyRoundTrip", Phase05XmlAndReadOnlyRoundTrip),
-        ("Phase05.RmkPackageRoundTrip", Phase05RmkPackageRoundTrip),
+        ("Compatibility.XmlAndReadOnlyRoundTrip", Phase05XmlAndReadOnlyRoundTrip),
+        ("Compatibility.RmkPackageRoundTrip", Phase05RmkPackageRoundTrip),
         ("Storage.BackupRecovery", StorageBackupRecovery),
         ("Storage.DoubleCorruptionBlocksWrite", StorageDoubleCorruptionBlocksWrite),
         ("Storage.SemanticRecovery", StorageSemanticRecovery),
@@ -110,7 +110,7 @@ internal static partial class Program
         ("Apply.WriteBoundaries", ApplyWriteBoundaries),
         ("Apply.PhysicalWorkshopBoundary", ApplyPhysicalWorkshopBoundary),
         ("Apply.IdentitySwapInjection", ApplyIdentitySwapInjection),
-        ("Phase10.OperationPlanFingerprintBinding", OperationPlanFingerprintBinding),
+        ("Safety.OperationPlanFingerprintBinding", OperationPlanFingerprintBinding),
         ("Export.RmkTransaction", RmkExportTransaction),
         ("Export.RmkSourceHistory", RmkSourceHistoryRoundTrip),
         ("Translation.RmkLanguageMismatch", TranslationRmkLanguageMismatch),
@@ -179,12 +179,12 @@ internal static partial class Program
             try
             {
                 Phase08AtomicStorageFaults();
-                Console.WriteLine("PASS Phase08.AtomicStorageFaults");
+                Console.WriteLine("PASS Storage.AtomicFaults");
                 return 0;
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine($"FAIL Phase08.AtomicStorageFaults: {exception}");
+                Console.Error.WriteLine($"FAIL Storage.AtomicFaults: {exception}");
                 return 1;
             }
         }
@@ -195,12 +195,12 @@ internal static partial class Program
             try
             {
                 Phase07NativeArchiveAndWriteBoundary();
-                Console.WriteLine("PASS Phase07.NativeArchiveAndWriteBoundary");
+                Console.WriteLine("PASS Native.ArchiveAndWriteBoundary");
                 return 0;
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine($"FAIL Phase07.NativeArchiveAndWriteBoundary: {exception}");
+                Console.Error.WriteLine($"FAIL Native.ArchiveAndWriteBoundary: {exception}");
                 return 1;
             }
         }
@@ -1085,7 +1085,7 @@ internal static partial class Program
                 BatchSize = 40,
                 MaxRetries = 1,
                 Timeout = TimeSpan.FromSeconds(5),
-                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "glossary.generated.ko.json")
+                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "src", "RimWorldAiTranslator.App", "Assets", "glossary.generated.ko.json")
             }).GetAwaiter().GetResult();
 
             var catalogEndpoint = new Uri(ApiProviderCatalog.Get("Google").Url);
@@ -1135,7 +1135,7 @@ internal static partial class Program
                 BatchSize = 2,
                 MaxRetries = 2,
                 Timeout = TimeSpan.FromSeconds(5),
-                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "glossary.generated.ko.json")
+                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "src", "RimWorldAiTranslator.App", "Assets", "glossary.generated.ko.json")
             };
             var progress = new List<TranslationProgress>();
             var result = engine.RunAsync(options, new ProgressCollector(progress)).GetAwaiter().GetResult();
@@ -1267,7 +1267,7 @@ internal static partial class Program
         }).GetAwaiter().GetResult();
     }
 
-    private static SourceExtractor CreateExtractor() => new(Path.Combine(RepositoryRoot(), "rimworld-def-field-rules.txt"));
+    private static SourceExtractor CreateExtractor() => new(Path.Combine(RepositoryRoot(), "src", "RimWorldAiTranslator.App", "Assets", "rimworld-def-field-rules.txt"));
 
     private static void WithFixture(string fixtureName, Action<string> action)
     {

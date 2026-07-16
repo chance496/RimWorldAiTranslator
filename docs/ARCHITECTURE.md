@@ -1,6 +1,6 @@
 # Architecture
 
-기준: v1.0.1-rc.1 로컬 C# 후보 (공개 v1.0.0 보존)
+기준: 공개 v1.1.0
 
 ## 실행 구조
 
@@ -29,10 +29,10 @@ RimWorldAiTranslator.exe (WinExe, net8.0-windows, self-contained win-x64)
 | App | `src/RimWorldAiTranslator.App` | WinForms 셸, 대시보드, 설정, 검수 작업실, 대화상자, 테마, 진행·취소·종료 흐름 |
 | Core | `src/RimWorldAiTranslator.Core` | UI 독립 저장·탐색·추출·번역·검수·품질·적용·RMK·진단 서비스 |
 | Native | `src/RimWorldAiTranslator.Native`, `native/RimWorldTranslatorNative.cs` | XML/XLSX 형식 보존, 크기 제한, 저수준 읽기·쓰기 |
-| Tests | `tests/RimWorldAiTranslator.Tests` | 임시 fixture 기반 오프라인 회귀 30개 |
+| Tests | `tests/RimWorldAiTranslator.Tests` | 임시 fixture 기반 전체 오프라인 회귀 |
 | UI harness | `tests/RimWorldAiTranslator.UiHarness` | 실제 WinForms 화면을 격리 데이터 루트로 실행 |
 | Benchmarks | `tests/RimWorldAiTranslator.Benchmarks` | 5,000행 추출·검수 로드·검색·필터·취소 측정 |
-| Tools | `tools/RimWorldAiTranslator.*` | 결정적 용어집 생성·self-test, 오프라인 로컬 RC package와 zero audit |
+| Tools | `tools/RimWorldAiTranslator.*` | 결정적 용어집 생성·self-test, 검증된 release package와 zero audit |
 
 `AppServices`가 저장소와 Core 서비스를 한 번 조립한다. `MainForm`은 화면 전환과 작업 수명만 관리하고, 실제 데이터 규칙은 Core에 둔다. 긴 작업은 `Task`와 `CancellationToken`을 사용하며 표시 중인 검수 화면과 중지 버튼을 유지한다.
 

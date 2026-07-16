@@ -4,7 +4,7 @@ This inventory applies to `v1.1.0`. External source links are recorded for attri
 
 ## Project code
 
-RimWorld AI Translator project code is offered under the repository [MIT License](LICENSE). That license covers only material for which the project has the necessary rights; it does not grant rights to RimWorld, third-party mods, translations, trademarks, or other third-party material.
+RimWorld AI Translator project code is offered under the repository [MIT License](https://github.com/chance496/RimWorldAiTranslator/blob/main/LICENSE). That license covers only material for which the project has the necessary rights; it does not grant rights to RimWorld, third-party mods, translations, trademarks, or other third-party material.
 
 The application has no direct or transitive NuGet `PackageReference` dependency. Its self-contained executable nevertheless redistributes Microsoft .NET runtime components.
 
@@ -29,7 +29,7 @@ Authoritative notice material recorded from the exact local packages:
 | `WindowsDesktop` `LICENSE` | `A89886665765362EB77E0F8E26602C924520041D1711B2EEDC136434FE4D01AB` |
 | `AspNetCore` `THIRD-PARTY-NOTICES.TXT` | `307D014F65D8482314F1400DDEAE7A0CBABB96C2207BCC77F6233CC10588E5D9` |
 
-The local RC ZIP also carries those exact bytes as `DOTNET_RUNTIME_LICENSE.txt`,
+The release ZIP also carries those exact bytes as `DOTNET_RUNTIME_LICENSE.txt`,
 `DOTNET_RUNTIME_THIRD_PARTY_NOTICES.txt`, `DOTNET_WINDOWSDESKTOP_LICENSE.txt`,
 and `DOTNET_ASPNETCORE_THIRD_PARTY_NOTICES.txt`, respectively.
 

@@ -20,7 +20,7 @@ Use the repository's private vulnerability-reporting form if it is available:
 
 `https://github.com/chance496/RimWorldAiTranslator/security/advisories/new`
 
-The availability of that external form has not been verified by this local RC audit. If it is unavailable, use a public channel only to ask the maintainer for a private contact method, without disclosing the vulnerability or any sensitive material. Do not upload a proof of concept or diagnostic archive until a private channel and the minimum necessary data have been agreed.
+If that form is unavailable, use a public channel only to ask the maintainer for a private contact method, without disclosing the vulnerability or any sensitive material. Do not upload a proof of concept or diagnostic archive until a private channel and the minimum necessary data have been agreed.
 
 A useful private report contains the affected version, a minimal synthetic reproduction, expected and actual behavior, and impact. Replace real paths, keys, mod text, and account details with clearly synthetic placeholders.
 
@@ -32,4 +32,4 @@ A useful private report contains the affected version, a minimal synthetic repro
 - The package pins .NET runtime packs at `8.0.28`. Runtime advisories and support status must be reviewed again for every future package.
 - Unsigned builds can trigger Microsoft SmartScreen. The application has no Authenticode signature; a warning is not proof of malware or proof of safety.
 
-See [PRIVACY.md](PRIVACY.md) for data handling and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the runtime and asset inventory.
+See the [privacy notice](https://github.com/chance496/RimWorldAiTranslator/blob/main/docs/PRIVACY.md) for data handling and [third-party notices](https://github.com/chance496/RimWorldAiTranslator/blob/main/docs/THIRD_PARTY_NOTICES.md) for the runtime and asset inventory.

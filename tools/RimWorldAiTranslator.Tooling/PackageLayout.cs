@@ -21,21 +21,26 @@ internal static class PackageLayout
         "glossary.generated.ko.json"
     };
 
-    public static readonly IReadOnlySet<string> DocumentationFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "PACKAGE_README.txt",
-        "RELEASE_NOTES.md",
-        "sample-glossary.txt",
-        "VERSION",
-        "LICENSE",
-        "SECURITY.md",
-        "PRIVACY.md",
-        "THIRD_PARTY_NOTICES.md",
-        "DOTNET_RUNTIME_LICENSE.txt",
-        "DOTNET_RUNTIME_THIRD_PARTY_NOTICES.txt",
-        "DOTNET_WINDOWSDESKTOP_LICENSE.txt",
-        "DOTNET_ASPNETCORE_THIRD_PARTY_NOTICES.txt"
-    };
+    public static readonly IReadOnlyDictionary<string, string> DocumentationSourceFiles =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["README.md"] = "README.md",
+            ["RELEASE_NOTES.md"] = Path.Combine("docs", "RELEASE_NOTES.md"),
+            ["sample-glossary.txt"] = Path.Combine("docs", "sample-glossary.txt"),
+            ["VERSION"] = "VERSION",
+            ["LICENSE"] = "LICENSE",
+            ["SECURITY.md"] = Path.Combine(".github", "SECURITY.md"),
+            ["PRIVACY.md"] = Path.Combine("docs", "PRIVACY.md"),
+            ["THIRD_PARTY_NOTICES.md"] = Path.Combine("docs", "THIRD_PARTY_NOTICES.md"),
+            ["DOTNET_RUNTIME_LICENSE.txt"] = Path.Combine("docs", "DOTNET_RUNTIME_LICENSE.txt"),
+            ["DOTNET_RUNTIME_THIRD_PARTY_NOTICES.txt"] = Path.Combine("docs", "DOTNET_RUNTIME_THIRD_PARTY_NOTICES.txt"),
+            ["DOTNET_WINDOWSDESKTOP_LICENSE.txt"] = Path.Combine("docs", "DOTNET_WINDOWSDESKTOP_LICENSE.txt"),
+            ["DOTNET_ASPNETCORE_THIRD_PARTY_NOTICES.txt"] = Path.Combine("docs", "DOTNET_ASPNETCORE_THIRD_PARTY_NOTICES.txt")
+        };
+
+    public static IReadOnlySet<string> DocumentationFiles { get; } = new HashSet<string>(
+        DocumentationSourceFiles.Keys,
+        StringComparer.OrdinalIgnoreCase);
 
     public static IReadOnlySet<string> AllFiles { get; } = new HashSet<string>(
         RuntimeFiles.Concat(DocumentationFiles),

@@ -411,7 +411,7 @@ internal static class Phase08PerformanceEvidence
             Sha256Text(string.Join('\n', manifestLines)),
             zipIdentity.Length,
             zipIdentity.Sha256,
-            "Sizes and hashes cover only caller-supplied local RC artifacts; no upload or network operation occurs.");
+            "Sizes and hashes cover only caller-supplied local package artifacts; no upload or network operation occurs.");
     }
 
     private static IEnumerable<string> EnumerateRegularFiles(string root)

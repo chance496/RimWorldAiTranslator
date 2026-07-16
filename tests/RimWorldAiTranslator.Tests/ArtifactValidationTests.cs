@@ -27,7 +27,7 @@ internal static class Phase05ArtifactValidationTests
             AddMultilineSource(modRoot);
 
             var reviewsRoot = Path.Combine(root, "reviews");
-            var extractor = new SourceExtractor(Path.Combine(RepositoryRoot(), "rimworld-def-field-rules.txt"));
+            var extractor = new SourceExtractor(Path.Combine(RepositoryRoot(), "src", "RimWorldAiTranslator.App", "Assets", "rimworld-def-field-rules.txt"));
             var result = new TranslationEngine(RepositoryRoot(), extractor).RunAsync(new TranslationEngineOptions
             {
                 ModRoot = modRoot,

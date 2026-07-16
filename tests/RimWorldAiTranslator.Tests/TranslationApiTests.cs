@@ -61,16 +61,16 @@ internal static partial class Program
     {
         Tests.AddRange(
         [
-            ("Phase05.ApiUrlAndTransport", Phase05ApiUrlAndTransport),
-            ("Phase05.ApiValidationAndRetry", Phase05ApiValidationAndRetry),
-            ("Phase05.ApiHttpErrorMatrix", Phase05ApiHttpErrorMatrix),
-            ("Phase05.ProviderErrorDiagnostics", Phase05ProviderErrorDiagnostics),
-            ("Phase05.HeaderDrivenRateLimitsAndGemini", Phase05HeaderDrivenRateLimitsAndGemini),
-            ("Phase05.ApiConnectionAndEmptyRetry", Phase05ApiConnectionAndEmptyRetry),
-            ("Phase05.BatchSplitAndFalseComplete", Phase05BatchSplitAndFalseComplete),
-            ("Phase05.ApiResponseLimit", Phase05ApiResponseLimit),
-            ("Phase05.GlossaryNullDefaults", Phase05GlossaryNullDefaults),
-            ("Phase05.CanonicalPrompt", Phase05CanonicalPrompt)
+            ("Translation.ApiUrlAndTransport", Phase05ApiUrlAndTransport),
+            ("Translation.ApiValidationAndRetry", Phase05ApiValidationAndRetry),
+            ("Translation.ApiHttpErrorMatrix", Phase05ApiHttpErrorMatrix),
+            ("Translation.ProviderErrorDiagnostics", Phase05ProviderErrorDiagnostics),
+            ("Translation.HeaderDrivenRateLimitsAndGemini", Phase05HeaderDrivenRateLimitsAndGemini),
+            ("Translation.ApiConnectionAndEmptyRetry", Phase05ApiConnectionAndEmptyRetry),
+            ("Translation.BatchSplitAndFalseComplete", Phase05BatchSplitAndFalseComplete),
+            ("Translation.ApiResponseLimit", Phase05ApiResponseLimit),
+            ("Translation.GlossaryNullDefaults", Phase05GlossaryNullDefaults),
+            ("Translation.CanonicalPrompt", Phase05CanonicalPrompt)
         ]);
     }
 
@@ -645,7 +645,7 @@ internal static partial class Program
                 ResponseFormatMode = "JsonObject",
                 CompletionTokenParameter = "none",
                 ReasoningEffort = string.Empty,
-                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "glossary.generated.ko.json")
+                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "src", "RimWorldAiTranslator.App", "Assets", "glossary.generated.ko.json")
             }).GetAwaiter().GetResult());
 
             Assert(error.Message.Contains("single-entry fallback", StringComparison.OrdinalIgnoreCase),

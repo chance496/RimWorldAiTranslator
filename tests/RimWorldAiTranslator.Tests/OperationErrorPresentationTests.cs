@@ -257,7 +257,7 @@ internal static partial class Program
                 InputTokensPerMinutePerKey = 0,
                 DailyTokenBudgetPerKey = 0,
                 Timeout = TimeSpan.FromSeconds(1),
-                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "glossary.generated.ko.json")
+                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "src", "RimWorldAiTranslator.App", "Assets", "glossary.generated.ko.json")
             }, new ProgressCollector(googleProgress)).GetAwaiter().GetResult();
             Assert(googleProgress.Any(item => item.Stage == "warning")
                    && googleProgress.All(item => forbidden.All(value =>
@@ -294,7 +294,7 @@ internal static partial class Program
                 InputTokensPerMinutePerKey = 0,
                 DailyTokenBudgetPerKey = 0,
                 Timeout = TimeSpan.FromSeconds(1),
-                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "glossary.generated.ko.json")
+                GeneratedGlossaryPath = Path.Combine(RepositoryRoot(), "src", "RimWorldAiTranslator.App", "Assets", "glossary.generated.ko.json")
             }, new ProgressCollector(splitProgress)).GetAwaiter().GetResult());
             Assert(!splitError.Message.Contains(rawMessage, StringComparison.Ordinal)
                    && splitProgress.All(item => item.Stage != "retry")

@@ -41,7 +41,7 @@ dotnet tests\RimWorldAiTranslator.Tests\bin\Release\net8.0\RimWorldAiTranslator.
 dotnet run --project .\tests\RimWorldAiTranslator.Benchmarks\RimWorldAiTranslator.Benchmarks.csproj -c Release --no-build -- --rows 5000 --iterations 5
 ```
 
-완료 조건: 추출·검수 로드 결과가 정확히 5,000행, 키 검색 1행, 상태 필터 5,000행이며 JSON 측정 결과와 종료 코드 0을 출력한다. Phase 08의 동등한 전후 측정에서 20%를 넘는 중대한 회귀, 반복되는 200ms 초과 UI 검색·필터 지연, 문서화된 취소 응답 목표 위반은 릴리스 게이트다. 서로 동등하지 않은 경로의 수치와 그 밖의 숫자는 설명용 참고치로만 사용한다.
+완료 조건: 추출·검수 로드 결과가 정확히 5,000행, 키 검색 1행, 상태 필터 5,000행이며 JSON 측정 결과와 종료 코드 0을 출력한다. 동등한 전후 측정에서 20%를 넘는 중대한 회귀, 반복되는 200ms 초과 UI 검색·필터 지연, 문서화된 취소 응답 목표 위반은 릴리스 게이트다. 서로 동등하지 않은 경로의 수치와 그 밖의 숫자는 설명용 참고치로만 사용한다.
 
 ## 격리 UI harness
 
@@ -54,7 +54,7 @@ dotnet run --project tests/RimWorldAiTranslator.UiHarness/RimWorldAiTranslator.U
 
 ## 자체 포함 패키지
 
-로컬 RC를 만드는 유일한 개발 명령:
+검증된 자체 포함 릴리스 패키지를 만드는 개발 명령:
 
 ```text
 dotnet run --project tools/RimWorldAiTranslator.Tooling -c Release --no-build --no-restore -- package
@@ -64,7 +64,7 @@ C# 도구는 다음을 순서대로 강제한다.
 
 1. 외부 package source가 없는 복원, Release 솔루션 빌드와 전체 회귀.
 2. `dotnet publish -r win-x64 --self-contained true` 단일 EXE.
-3. EXE `FileVersion=1.0.1.0`, `ProductVersion=1.0.1-rc.1`.
+3. EXE `FileVersion`과 `ProductVersion`이 `VERSION`에서 파생된 현재 버전과 일치.
 4. EXE, 원본+DLC 용어집, Def 규칙, 문서·라이선스·버전만 ZIP에 포함.
 5. `.ps1`, `.psm1`, `.cmd`, `.bat`, `powershell.exe`, `pwsh.exe` 패키지 유입 차단.
 6. 격리 data/discovery root에서 탐색 완료 ACK와 창 표시, 자식 프로세스 0개, 정상 종료와 ExitCode 0.
@@ -86,7 +86,7 @@ git diff --check
 - 키 검색 결과는 UI 라벨·테스트용 가짜 값·보안 규칙만 수동 판독한다. 실제 키 형태 값은 0개여야 한다.
 - `src`의 PowerShell 런타임 호출은 0개여야 한다.
 - `git diff --check` 오류는 0개여야 한다.
-- ZIP을 별도 임시 폴더에 풀어 EXE 버전, 필수 8개 항목, 금지 런타임 0개와 SHA-256을 다시 확인한다.
+- ZIP을 별도 임시 폴더에 풀어 EXE 버전, 현재 allowlist의 모든 필수 항목, 금지 런타임 0개와 SHA-256을 다시 확인한다.
 
 ## 2026-07-13 측정 스냅샷
 
@@ -114,5 +114,5 @@ git diff --check
 - 5,000행 벤치마크 행·검색 결과 일치.
 - UI harness 및 실제 배포 EXE 정상 표시·취소·종료.
 - ZIP 금지 런타임 0개, PowerShell 자식 0개, 정확한 버전과 SHA-256.
-- README, 패키지 안내, 릴리스 노트, VERSION, PE와 ZIP이 같은 로컬 후보 `v1.0.1-rc.1`을 가리킨다.
-- 공개 v1.0.0의 tag/Release/asset은 변경하지 않으며 로컬 RC 작업에서 외부 배포를 수행하지 않는다.
+- README, 패키지 안내, 릴리스 노트, VERSION, PE와 ZIP이 같은 현재 버전을 가리킨다.
+- 이미 공개된 tag/Release/asset은 조용히 교체하지 않으며 외부 배포는 사용자가 명시적으로 승인한 경우에만 수행한다.

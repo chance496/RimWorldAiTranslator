@@ -24,7 +24,7 @@ internal static class PackageArchivePolicy
             [PackageLayout.ApplicationFileName] = 160 * Mebibyte,
             ["rimworld-def-field-rules.txt"] = 2 * Mebibyte,
             ["glossary.generated.ko.json"] = 8 * Mebibyte,
-            ["PACKAGE_README.txt"] = 2 * Mebibyte,
+            ["README.md"] = 2 * Mebibyte,
             ["RELEASE_NOTES.md"] = 4 * Mebibyte,
             ["sample-glossary.txt"] = 2 * Mebibyte,
             ["VERSION"] = 4 * 1024,

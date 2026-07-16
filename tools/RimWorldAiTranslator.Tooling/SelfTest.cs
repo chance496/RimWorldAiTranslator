@@ -78,7 +78,7 @@ internal static class SelfTest
         ];
         string[] expectedDocumentationFiles =
         [
-            "PACKAGE_README.txt",
+            "README.md",
             "RELEASE_NOTES.md",
             "sample-glossary.txt",
             "VERSION",
@@ -96,11 +96,31 @@ internal static class SelfTest
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         Assert(PackageLayout.RuntimeFiles.SetEquals(expectedRuntimeFiles),
-            "Package runtime files differ from the exact public-RC allowlist.");
+            "Package runtime files differ from the exact release allowlist.");
         Assert(PackageLayout.DocumentationFiles.SetEquals(expectedDocumentationFiles),
-            "Package documentation files differ from the exact public-RC allowlist.");
+            "Package documentation files differ from the exact release allowlist.");
+        Dictionary<string, string> expectedDocumentationSources = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["README.md"] = "README.md",
+            ["RELEASE_NOTES.md"] = Path.Combine("docs", "RELEASE_NOTES.md"),
+            ["sample-glossary.txt"] = Path.Combine("docs", "sample-glossary.txt"),
+            ["VERSION"] = "VERSION",
+            ["LICENSE"] = "LICENSE",
+            ["SECURITY.md"] = Path.Combine(".github", "SECURITY.md"),
+            ["PRIVACY.md"] = Path.Combine("docs", "PRIVACY.md"),
+            ["THIRD_PARTY_NOTICES.md"] = Path.Combine("docs", "THIRD_PARTY_NOTICES.md"),
+            ["DOTNET_RUNTIME_LICENSE.txt"] = Path.Combine("docs", "DOTNET_RUNTIME_LICENSE.txt"),
+            ["DOTNET_RUNTIME_THIRD_PARTY_NOTICES.txt"] = Path.Combine("docs", "DOTNET_RUNTIME_THIRD_PARTY_NOTICES.txt"),
+            ["DOTNET_WINDOWSDESKTOP_LICENSE.txt"] = Path.Combine("docs", "DOTNET_WINDOWSDESKTOP_LICENSE.txt"),
+            ["DOTNET_ASPNETCORE_THIRD_PARTY_NOTICES.txt"] = Path.Combine("docs", "DOTNET_ASPNETCORE_THIRD_PARTY_NOTICES.txt")
+        };
+        Assert(PackageLayout.DocumentationSourceFiles.Count == expectedDocumentationSources.Count
+               && expectedDocumentationSources.All(expected =>
+                   PackageLayout.DocumentationSourceFiles.TryGetValue(expected.Key, out var actual)
+                   && actual.Equals(expected.Value, StringComparison.OrdinalIgnoreCase)),
+            "Package documentation source mapping differs from the repository layout.");
         Assert(PackageLayout.AllFiles.SetEquals(expectedAllFiles),
-            "Combined package files differ from the exact public-RC allowlist.");
+            "Combined package files differ from the exact release allowlist.");
         Assert(PackageLayout.RuntimeFiles.Contains("glossary.generated.ko.json"),
             "The built-in glossary must be included in the public package runtime files.");
     }

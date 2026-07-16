@@ -35,8 +35,8 @@ Exit the application before deleting files.
 - Reviews: use the application's project-delete action for an owned review directory, or delete `%LOCALAPPDATA%\RimWorldAiTranslator\reviews` after exit.
 - Logs: delete individual files or `%LOCALAPPDATA%\RimWorldAiTranslator\logs`.
 - All app-owned local data: delete `%LOCALAPPDATA%\RimWorldAiTranslator`.
-- Remove the application: delete the extracted local RC folder after the process exits.
+- Remove the application: delete the extracted application folder after the process exits.
 
 Project deletion can leave information in `projects.json.bak` and successful-operation logs. Reports, diagnostic ZIPs, local-mod translation output, and RMK work-clone output stored elsewhere must be deleted separately. Provider-side data is controlled by the selected provider and cannot be deleted by this application.
 
-Never attach real keys, private source text, user paths, logs, or diagnostics to a public issue. Follow [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+Never attach real keys, private source text, user paths, logs, or diagnostics to a public issue. Follow the [security policy](https://github.com/chance496/RimWorldAiTranslator/blob/main/.github/SECURITY.md) for private vulnerability reporting.

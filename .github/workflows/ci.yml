@@ -63,7 +63,7 @@ jobs:
 
       - name: Credential-pattern source policy
         run: |
-          (echo tests/RimWorldAiTranslator.Tests/Phase07SecurityTests.cs& echo tests/RimWorldAiTranslator.Tests/Program.cs& echo tests/RimWorldAiTranslator.Tests/SafetyIntegrationTests.cs& echo tests/RimWorldAiTranslator.UiHarness/Program.cs) | sort > "%TEMP%\expected-credential-paths.txt"
+          (echo tests/RimWorldAiTranslator.Tests/SecurityTests.cs& echo tests/RimWorldAiTranslator.Tests/Program.cs& echo tests/RimWorldAiTranslator.Tests/SafetyIntegrationTests.cs& echo tests/RimWorldAiTranslator.UiHarness/Program.cs) | sort > "%TEMP%\expected-credential-paths.txt"
           git grep -l -I -E -i "(csk|sk)-[A-Za-z0-9_-]{12,}|Authorization[[:space:]]*[=:][[:space:]]*[A-Za-z0-9._~-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----" -- . | sort > "%TEMP%\actual-credential-paths.txt"
           fc /b "%TEMP%\expected-credential-paths.txt" "%TEMP%\actual-credential-paths.txt"
 
@@ -92,7 +92,7 @@ jobs:
           --rows 5000 --iterations 5
 
   package:
-    name: Exact-RC artifact and smoke
+    name: Release package and smoke
     needs: verify
     runs-on: windows-2022
     timeout-minutes: 60
