@@ -1,6 +1,6 @@
 # Project State
 
-기준 시각: 2026-07-13, v1.0.1-rc.1 로컬 C# 릴리스 후보 (공개 v1.0.0 보존)
+기준 시각: 2026-07-17, 공개 v1.1.0
 
 ## 현재 구현
 
@@ -28,9 +28,9 @@
 ## 검증된 상태
 
 - Release 솔루션 빌드: 경고 0, 오류 0.
-- 이번 실행의 현재 오프라인 C# 회귀: 37/37 PASS. 합성 `%TEMP%` fixture와 loopback handler만 사용했다.
-- 실제 로컬 Workshop/RMK/사용자 앱 데이터는 이번 RC 증거에 사용하지 않는다. 모든 UI/package 탐색 증거는 marker가 있는 고유 합성 root로 격리한다.
-- win-x64 패키지 smoke는 최종 로컬 RC 단계에서 격리 탐색 ACK, 정상 창, 자식 프로세스 0, 정상 종료와 ExitCode 0을 새로 증명해야 한다.
+- v1.1.0 오프라인 C# 회귀: 82/82 PASS. 합성 `%TEMP%` fixture와 loopback handler만 사용했다.
+- 실제 로컬 Workshop/RMK/사용자 앱 데이터는 릴리스 검증에 사용하지 않았다. 모든 UI/package 탐색 증거는 marker가 있는 고유 합성 root로 격리했다.
+- win-x64 package smoke에서 격리 탐색 ACK, 정상 창, 중복 실행 차단, 자식 프로세스 0, cold/warm 시작과 정상 종료를 확인했다.
 - 5,000행 합성 측정은 `docs/QUALITY_GATES.md`에 기록한다.
 
 ## 알려진 제한과 기술 부채
@@ -43,4 +43,4 @@
 | P2 | `native/RimWorldTranslatorNative.cs`는 이전 구현 호환을 위해 nullable 검사를 끈 상태다. | Core 공개 경계에서 null·크기 검사를 수행하며 후속 정적 분석 대상으로 둔다. |
 | P3 | 코드 서명 인증서가 없다. | 해시와 공개 소스를 제공하지만 SmartScreen 경고는 남을 수 있다. |
 
-이 문서는 구현 상태를 설명하며 최종 PASS 선언이 아니다. Phase 05~10의 호환성·UI·보안·신뢰성·패키지·독립 감사가 끝날 때까지 남은 P0 여부와 RC 판정은 `docs/release-readiness/STATE.md`에서 추적한다.
+이 문서는 현재 공개 기준선의 구현 상태를 요약한다. 새 작업은 문서의 과거 수치보다 현재 코드와 실행 결과를 우선한다.

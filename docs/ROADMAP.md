@@ -1,6 +1,6 @@
 # Roadmap
 
-기준: 안정적인 v1.0 베타. 상태는 `DONE`, `OPEN`, `INVESTIGATE`, `DEFERRED`를 사용한다.
+기준: 공개 v1.1.0. 상태는 `DONE`, `OPEN`, `INVESTIGATE`, `DEFERRED`를 사용한다.
 
 ## P0 - 데이터와 실행 안전
 
